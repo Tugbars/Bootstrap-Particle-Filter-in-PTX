@@ -252,6 +252,74 @@ configure_file(
 )
 
 # ==============================================================================
+# Library: gpu_bpf_ptx_full (100% PTX for BPF, cuRAND only for APF)
+#
+# All 13 BPF kernels in hand-written PTX. PCG32 PRNG, ICDF normals.
+# Zero cuRAND in BPF path. APF/IMM still nvcc-compiled.
+# ==============================================================================
+
+add_library(gpu_bpf_ptx_full STATIC gpu_bpf/gpu_bpf_ptx_full.cu)
+
+target_link_libraries(gpu_bpf_ptx_full PRIVATE
+    CUDA::cuda_driver
+    CUDA::cudart
+    CUDA::curand
+)
+
+target_include_directories(gpu_bpf_ptx_full PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/gpu_bpf
+    ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+set_target_properties(gpu_bpf_ptx_full PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+)
+
+# ==============================================================================
+# Target: test_bpf_ptx_full (full PTX BPF + nvcc APF)
+#
+# Uses gpu_bpf_full.cuh (PCG32 RNG state) instead of gpu_bpf.cuh.
+# Requires bpf_kernels_full.cubin or bpf_kernels_full.ptx in cwd.
+# ==============================================================================
+
+add_executable(test_bpf_ptx_full test_bpf_matched_dgp.cu)
+
+target_compile_definitions(test_bpf_ptx_full PRIVATE USE_PTX_FULL=1)
+
+target_link_libraries(test_bpf_ptx_full PRIVATE
+    gpu_bpf_ptx_full
+    CUDA::cuda_driver
+    CUDA::cudart
+    CUDA::curand
+)
+
+target_include_directories(test_bpf_ptx_full PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/gpu_bpf
+)
+
+set_target_properties(test_bpf_ptx_full PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+# Copy full PTX/cubin to build dir
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bpf_kernels_full.ptx")
+    configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/bpf_kernels_full.ptx"
+        "${CMAKE_CURRENT_BINARY_DIR}/bpf_kernels_full.ptx"
+        COPYONLY
+    )
+endif()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bpf_kernels_full.cubin")
+    configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/bpf_kernels_full.cubin"
+        "${CMAKE_CURRENT_BINARY_DIR}/bpf_kernels_full.cubin"
+        COPYONLY
+    )
+endif()
+
+# ==============================================================================
 # Print summary
 # ==============================================================================
 

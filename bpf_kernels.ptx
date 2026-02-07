@@ -1,30 +1,30 @@
 // =============================================================================
-// bpf_kernels.ptx — Bootstrap Particle Filter in raw PTX
+// bpf_kernels.ptx -- Bootstrap Particle Filter in raw PTX
 // Target: SM_120 (Blackwell consumer / RTX 5080, 5090)
 //
 // Educational implementation showing the full BPF pipeline:
-//   1. bpf_propagate_weight  — SV observation log-likelihood weights
-//   2. bpf_set_scalar        — Initialize a device scalar
-//   3. bpf_reduce_max        — Block-parallel max reduction → atomicMax
-//   4. bpf_reduce_sum        — Block-parallel sum reduction → atomicAdd
-//   5. bpf_exp_sub           — w[i] = exp(log_w[i] - max_lw)
-//   6. bpf_scale_wh          — Normalize weights, compute w*h product
-//   7. bpf_compute_loglik    — log(sum_w / N) + max_lw
-//   8. bpf_resample          — Systematic resampling via binary search on CDF
+//   1. bpf_propagate_weight  -- SV observation log-likelihood weights
+//   2. bpf_set_scalar        -- Initialize a device scalar
+//   3. bpf_reduce_max        -- Block-parallel max reduction -> atomicMax
+//   4. bpf_reduce_sum        -- Block-parallel sum reduction -> atomicAdd
+//   5. bpf_exp_sub           -- w[i] = exp(log_w[i] - max_lw)
+//   6. bpf_scale_wh          -- Normalize weights, compute w*h product
+//   7. bpf_compute_loglik    -- log(sum_w / N) + max_lw
+//   8. bpf_resample          -- Systematic resampling via binary search on CDF
 //
 // Compile:
 //   ptxas -arch=sm_120 -o bpf_kernels.cubin bpf_kernels.ptx
 //
 // Load at runtime with cuModuleLoad / cuModuleGetFunction.
 //
-// NOTE: This PTX omits RNG/propagation noise for clarity — the propagate kernel
+// NOTE: This PTX omits RNG/propagation noise for clarity -- the propagate kernel
 // shows the weighting math. In production you'd integrate cuRAND device API
 // or implement your own PRNG in PTX (e.g., PCG32/xoshiro).
 //
 // All kernels use 256-thread blocks (8 warps), matching the CUDA version.
 // =============================================================================
 
-.version 8.8          // PTX ISA 8.8 (CUDA 13.x)
+.version 8.8          // PTX ISA 8.8 (CUDA 13.1)
 .target sm_120        // Blackwell consumer (RTX 5080/5090)
 .address_size 64
 
@@ -138,7 +138,7 @@ PROP_EXIT:
 // Size set at launch time (blockDim.x * 4 bytes).
 // =============================================================================
 
-// Extern shared memory — declared at module scope, used by reduce_max and reduce_sum
+// Extern shared memory -- declared at module scope, used by reduce_max and reduce_sum
 .extern .shared .align 4 .b8 smem_raw[];
 
 .visible .entry bpf_reduce_max(
@@ -323,7 +323,7 @@ REDUCE_SUM_EXIT:
 // Kernel 5: bpf_exp_sub
 //
 // w[i] = exp(log_w[i] - *d_max)
-// exp(x) = exp2(x * log2(e))  — this is what __expf() compiles to
+// exp(x) = exp2(x * log2(e))  -- this is what __expf() compiles to
 // =============================================================================
 
 .visible .entry bpf_exp_sub(
@@ -377,7 +377,7 @@ EXP_SUB_EXIT:
 // =============================================================================
 // Kernel 6: bpf_scale_wh
 //
-// inv_sum = 1.0 / *d_sum       (rcp.approx — hardware SFU reciprocal)
+// inv_sum = 1.0 / *d_sum       (rcp.approx -- hardware SFU reciprocal)
 // w[i]  *= inv_sum
 // wh[i]  = w[i] * h[i]
 // =============================================================================
@@ -482,7 +482,7 @@ SCALE_EXIT:
 //
 // Systematic resampling via binary search on CDF.
 //   target = u_base + i/N;  if target >= 1.0: target -= 1.0
-//   binary search cdf[] → ancestor index
+//   binary search cdf[] -> ancestor index
 //   h_out[i] = h_in[ancestor]
 // =============================================================================
 
