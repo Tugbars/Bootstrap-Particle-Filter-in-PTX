@@ -147,7 +147,7 @@ PROP_EXIT:
     .param .s32 param_n
 )
 {
-    .reg .u32   %tid, %idx, %r_ctaid;
+    .reg .u32   %r_tid, %idx, %r_ctaid;
     .reg .u32   %r_n, %r_s, %r_partner, %r_ntid;
     .reg .u64   %rd_in, %rd_out, %rd_off;
     .reg .u64   %rd_smem_base, %rd_smem, %rd_smem_partner;
@@ -158,10 +158,10 @@ PROP_EXIT:
     ld.param.u64    %rd_out,  [param_out];
     ld.param.s32    %r_n,     [param_n];
 
-    mov.u32         %tid,     %tid.x;
+    mov.u32         %r_tid,   %tid.x;
     mov.u32         %r_ntid,  %ntid.x;
     mov.u32         %r_ctaid, %ctaid.x;
-    mad.lo.u32      %idx,     %r_ctaid, %r_ntid, %tid;
+    mad.lo.u32      %idx,     %r_ctaid, %r_ntid, %r_tid;
 
     // Shared memory base address
     mov.u64         %rd_smem_base, smem_raw;
@@ -179,7 +179,7 @@ PROP_EXIT:
 RMAX_LOAD_DONE:
     // sdata[tid] = f_val
     .reg .u64 %rd_tid_off;
-    mul.wide.u32    %rd_tid_off, %tid, 4;
+    mul.wide.u32    %rd_tid_off, %r_tid, 4;
     add.u64         %rd_smem,    %rd_smem_base, %rd_tid_off;
     st.shared.f32   [%rd_smem],  %f_val;
 
@@ -192,10 +192,10 @@ REDUCE_MAX_LOOP:
     setp.eq.u32     %p_loop, %r_s, 0;
     @%p_loop bra    REDUCE_MAX_DONE;
 
-    setp.lt.u32     %p_active, %tid, %r_s;
+    setp.lt.u32     %p_active, %r_tid, %r_s;
     @!%p_active bra REDUCE_MAX_SKIP;
 
-    add.u32         %r_partner, %tid, %r_s;
+    add.u32         %r_partner, %r_tid, %r_s;
     mul.wide.u32    %rd_off,    %r_partner, 4;
     add.u64         %rd_smem_partner, %rd_smem_base, %rd_off;
     ld.shared.f32   %f_other,   [%rd_smem_partner];
@@ -210,7 +210,7 @@ REDUCE_MAX_SKIP:
 
 REDUCE_MAX_DONE:
     // Thread 0: atomicMax float via CAS loop
-    setp.eq.u32     %p_tid0, %tid, 0;
+    setp.eq.u32     %p_tid0, %r_tid, 0;
     @!%p_tid0 bra   REDUCE_MAX_EXIT;
 
     ld.shared.f32   %f_val,  [%rd_smem];
@@ -247,7 +247,7 @@ REDUCE_MAX_EXIT:
     .param .s32 param_n
 )
 {
-    .reg .u32   %tid, %idx, %r_ctaid;
+    .reg .u32   %r_tid, %idx, %r_ctaid;
     .reg .u32   %r_n, %r_s, %r_partner, %r_ntid;
     .reg .u64   %rd_in, %rd_out, %rd_off;
     .reg .u64   %rd_smem_base, %rd_smem, %rd_smem_partner;
@@ -258,10 +258,10 @@ REDUCE_MAX_EXIT:
     ld.param.u64    %rd_out,  [param_out];
     ld.param.s32    %r_n,     [param_n];
 
-    mov.u32         %tid,     %tid.x;
+    mov.u32         %r_tid,   %tid.x;
     mov.u32         %r_ntid,  %ntid.x;
     mov.u32         %r_ctaid, %ctaid.x;
-    mad.lo.u32      %idx,     %r_ctaid, %r_ntid, %tid;
+    mad.lo.u32      %idx,     %r_ctaid, %r_ntid, %r_tid;
 
     mov.u64         %rd_smem_base, smem_raw;
 
@@ -277,7 +277,7 @@ REDUCE_MAX_EXIT:
 
 RSUM_LOAD_DONE:
     .reg .u64 %rd_tid_off;
-    mul.wide.u32    %rd_tid_off, %tid, 4;
+    mul.wide.u32    %rd_tid_off, %r_tid, 4;
     add.u64         %rd_smem,    %rd_smem_base, %rd_tid_off;
     st.shared.f32   [%rd_smem],  %f_val;
 
@@ -289,10 +289,10 @@ REDUCE_SUM_LOOP:
     setp.eq.u32     %p_loop, %r_s, 0;
     @%p_loop bra    REDUCE_SUM_DONE;
 
-    setp.lt.u32     %p_active, %tid, %r_s;
+    setp.lt.u32     %p_active, %r_tid, %r_s;
     @!%p_active bra REDUCE_SUM_SKIP;
 
-    add.u32         %r_partner, %tid, %r_s;
+    add.u32         %r_partner, %r_tid, %r_s;
     mul.wide.u32    %rd_off,    %r_partner, 4;
     add.u64         %rd_smem_partner, %rd_smem_base, %rd_off;
     ld.shared.f32   %f_other,   [%rd_smem_partner];
@@ -306,7 +306,7 @@ REDUCE_SUM_SKIP:
     bra             REDUCE_SUM_LOOP;
 
 REDUCE_SUM_DONE:
-    setp.eq.u32     %p_tid0, %tid, 0;
+    setp.eq.u32     %p_tid0, %r_tid, 0;
     @!%p_tid0 bra   REDUCE_SUM_EXIT;
 
     ld.shared.f32   %f_val, [%rd_smem];

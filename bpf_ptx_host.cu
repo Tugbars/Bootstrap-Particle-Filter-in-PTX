@@ -290,7 +290,14 @@ int main(int argc, char** argv) {
     CUdevice dev;
     CUcontext ctx;
     cuDeviceGet(&dev, 0);
+
+    // CUDA 13.0+ cuCtxCreate_v4 requires CUctxCreateParams
+#if CUDA_VERSION >= 13000
+    CUctxCreateParams ctxCreateParams = {};
+    cuCtxCreate(&ctx, &ctxCreateParams, 0, dev);
+#else
     cuCtxCreate(&ctx, 0, dev);
+#endif
 
     // Print device info
     char name[256];

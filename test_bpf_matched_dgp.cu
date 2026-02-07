@@ -860,9 +860,8 @@ int main(int argc, char** argv) {
     cudaGetDeviceProperties(&prop, 0);
     printf("═══════════════════════════════════════════════════════════════════════════════\n");
     printf("  GPU BPF / APF / IMM — MATCHED-DGP TEST SUITE\n");
-    printf("  Device: %s (SM %d.%d, %d SMs, %.0f MHz)\n",
-           prop.name, prop.major, prop.minor, prop.multiProcessorCount,
-           prop.clockRate / 1000.0);
+    printf("  Device: %s (SM %d.%d, %d SMs)\n",
+           prop.name, prop.major, prop.minor, prop.multiProcessorCount);
     printf("  Zero model mismatch — all filters use TRUE DGP parameters\n");
     printf("═══════════════════════════════════════════════════════════════════════════════\n");
     printf("  Config: %d ticks, BPF=%dK, APF=%dK, IMM=27×%d, MC=%dK\n",
