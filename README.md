@@ -12,7 +12,7 @@ Stochastic Volatility tracking across 5000 ticks, true latent log-volatility (wh
 
 <img width="1907" height="587" alt="image" src="https://github.com/user-attachments/assets/00e8d2b3-b583-4594-b4bc-69504ec75023" />
 
-**Performance:** 50K particles, ~130 µs/tick on RTX 5080. Hand-written PTX runs 15% faster than nvcc-compiled CUDA C — `ex2.approx`, `rcp.approx`, no `cvta.to.global` overhead, tighter register allocation.
+**Performance:** 51M particles, ~89 µs/tick on RTX 5080. Hand-written PTX runs 15% faster than nvcc-compiled CUDA C — `ex2.approx`, `rcp.approx`, no `cvta.to.global` overhead, tighter register allocation.
 
 ## What This Is
 
