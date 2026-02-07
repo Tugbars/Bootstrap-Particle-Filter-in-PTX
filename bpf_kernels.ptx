@@ -1,0 +1,620 @@
+// =============================================================================
+// bpf_kernels.ptx — Bootstrap Particle Filter in raw PTX
+// Target: SM_100 (Blackwell / RTX 5080)
+//
+// Educational implementation showing the full BPF pipeline:
+//   1. bpf_propagate_weight  — SV state transition + log-likelihood weights
+//   2. bpf_set_scalar        — Initialize a device scalar
+//   3. bpf_reduce_max        — Block-parallel max reduction → atomicMax
+//   4. bpf_reduce_sum        — Block-parallel sum reduction → atomicAdd
+//   5. bpf_exp_sub           — w[i] = exp(log_w[i] - max_lw)
+//   6. bpf_scale_wh          — Normalize weights, compute w*h product
+//   7. bpf_compute_loglik    — log(sum_w / N) + max_lw
+//   8. bpf_resample          — Systematic resampling via binary search on CDF
+//
+// Compile:
+//   ptxas -arch=sm_100 -o bpf_kernels.cubin bpf_kernels.ptx
+//
+// Load at runtime with cuModuleLoad / cuModuleGetFunction.
+//
+// NOTE: This PTX omits RNG/propagation noise for clarity — the propagate kernel
+// shows the weighting math. In production you'd integrate cuRAND device API
+// or implement your own PRNG in PTX (e.g., PCG32/xoshiro).
+//
+// Register usage is annotated. Shared memory is declared extern.
+// All kernels use 256-thread blocks (8 warps), matching the CUDA version.
+// =============================================================================
+
+.version 8.5          // PTX ISA 8.5 (CUDA 12.x+)
+.target sm_100        // Blackwell
+.address_size 64
+
+// =============================================================================
+// Constants (read-only)
+// =============================================================================
+// LOG_2PI_HALF = 0.5 * log(2π) ≈ 0.9189385
+// Used in Gaussian log-likelihood: -0.5*log(2π) - 0.5*x² = -LOG_2PI_HALF - 0.5*x²
+
+// =============================================================================
+// Kernel 1: bpf_propagate_weight
+//
+// For each particle i:
+//   eta = y_t * exp(-h[i] * 0.5)
+//   log_w[i] = -0.9189385 - 0.5 * eta² - h[i] * 0.5    (Gaussian obs)
+//
+// This is the Gaussian-only variant. The Student-t branch would add
+// lgamma calls which are very verbose in PTX (better as a device function
+// linked from a .cu helper).
+//
+// Params (in order):
+//   %rd1 = h (float*)
+//   %rd2 = log_w (float*)
+//   %f1  = y_t (float)
+//   %r1  = n (int)
+// =============================================================================
+
+.visible .entry bpf_propagate_weight(
+    .param .u64 param_h,
+    .param .u64 param_log_w,
+    .param .f32 param_y_t,
+    .param .s32 param_n
+)
+{
+    // Register declarations
+    .reg .u32   %tid, %ctaid, %ntid, %idx;
+    .reg .u64   %rd_h, %rd_lw;           // base pointers
+    .reg .u64   %rd_off;                  // byte offset
+    .reg .u32   %r_n;
+    .reg .f32   %f_yt, %f_hi, %f_eta, %f_eta2;
+    .reg .f32   %f_half_h, %f_log_w, %f_neg_half, %f_log2pi;
+    .reg .pred  %p_inbound;
+
+    // Load parameters
+    ld.param.u64    %rd_h,    [param_h];
+    ld.param.u64    %rd_lw,   [param_log_w];
+    ld.param.f32    %f_yt,    [param_y_t];
+    ld.param.s32    %r_n,     [param_n];
+
+    // Global thread index: idx = blockIdx.x * blockDim.x + threadIdx.x
+    mov.u32         %tid,     %tid.x;
+    mov.u32         %ctaid,   %ctaid.x;
+    mov.u32         %ntid,    %ntid.x;
+    mad.lo.u32      %idx,     %ctaid, %ntid, %tid;
+
+    // Bounds check
+    setp.ge.u32     %p_inbound, %idx, %r_n;
+    @%p_inbound bra PROP_EXIT;
+
+    // Byte offset for float array: offset = idx * 4
+    mul.wide.u32    %rd_off,  %idx, 4;
+
+    // Load h[i]
+    add.u64         %rd_h,    %rd_h, %rd_off;
+    ld.global.f32   %f_hi,    [%rd_h];
+
+    // eta = y_t * exp(-h[i] * 0.5)
+    //   -h[i] * 0.5  →  mul then neg
+    mov.f32         %f_neg_half, 0fBF000000;     // -0.5f in IEEE 754
+    mul.f32         %f_half_h,   %f_hi, %f_neg_half;
+    // Use ex2.approx (base-2 exp) + scale: exp(x) = exp2(x * log2(e))
+    // log2(e) ≈ 1.4426950f = 0x3FB8AA3B
+    mul.f32         %f_half_h,   %f_half_h, 0f3FB8AA3B;  // x * log2(e)
+    ex2.approx.f32  %f_half_h,   %f_half_h;               // exp(-h/2)
+    mul.f32         %f_eta,      %f_yt, %f_half_h;        // eta = y * exp(-h/2)
+
+    // eta² 
+    mul.f32         %f_eta2,     %f_eta, %f_eta;
+
+    // log_w = -0.9189385 - 0.5 * eta² - 0.5 * h[i]
+    //   = -(LOG_2PI_HALF) + (-0.5) * eta² + (-0.5) * h[i]
+    mov.f32         %f_log2pi,   0fBF6B3F8E;     // -0.9189385f
+    mov.f32         %f_neg_half, 0fBF000000;     // -0.5f
+
+    // FMA chain: log_w = -0.9189385 + (-0.5)*eta² + (-0.5)*h
+    fma.rn.f32      %f_log_w,    %f_neg_half, %f_eta2, %f_log2pi;
+    fma.rn.f32      %f_log_w,    %f_neg_half, %f_hi,   %f_log_w;
+
+    // Store log_w[i]
+    add.u64         %rd_lw,      %rd_lw, %rd_off;
+    st.global.f32   [%rd_lw],    %f_log_w;
+
+PROP_EXIT:
+    ret;
+}
+
+
+// =============================================================================
+// Kernel 2: bpf_set_scalar
+//
+// *scalar = val
+// Single-thread kernel (launched <<<1,1>>>)
+// =============================================================================
+
+.visible .entry bpf_set_scalar(
+    .param .u64 param_ptr,
+    .param .f32 param_val
+)
+{
+    .reg .u64   %rd_ptr;
+    .reg .f32   %f_val;
+
+    ld.param.u64    %rd_ptr, [param_ptr];
+    ld.param.f32    %f_val,  [param_val];
+    st.global.f32   [%rd_ptr], %f_val;
+    ret;
+}
+
+
+// =============================================================================
+// Kernel 3: bpf_reduce_max
+//
+// Block-parallel max reduction using shared memory.
+// Each block reduces its chunk, then atomicMax to global output.
+//
+// This is the core pattern for GPU reductions:
+//   1. Each thread loads one element into shared mem
+//   2. Tree reduction in shared mem (log2 steps)
+//   3. Thread 0 does atomic op to global accumulator
+//
+// Params:
+//   param_in  = input array (float*, N elements)
+//   param_out = output scalar (float*, pre-initialized to -1e30)
+//   param_n   = array length
+//
+// Shared memory: blockDim.x * 4 bytes (extern)
+// =============================================================================
+
+.visible .entry bpf_reduce_max(
+    .param .u64 param_in,
+    .param .u64 param_out,
+    .param .s32 param_n
+)
+{
+    // Extern shared memory — size set at launch time
+    .extern .shared .f32 sdata[];
+
+    .reg .u32   %tid, %ctaid, %ntid, %idx;
+    .reg .u32   %r_n, %r_s, %r_partner;
+    .reg .u64   %rd_in, %rd_out, %rd_off;
+    .reg .u64   %rd_smem, %rd_smem_partner;
+    .reg .f32   %f_val, %f_other, %f_max;
+    .reg .pred  %p_bound, %p_active, %p_tid0, %p_loop;
+
+    ld.param.u64    %rd_in,   [param_in];
+    ld.param.u64    %rd_out,  [param_out];
+    ld.param.s32    %r_n,     [param_n];
+
+    mov.u32         %tid,     %tid.x;
+    mov.u32         %ctaid,   %ctaid.x;
+    mov.u32         %ntid,    %ntid.x;
+    mad.lo.u32      %idx,     %ctaid, %ntid, %tid;
+
+    // Load from global → shared
+    // sdata[tid] = (idx < n) ? in[idx] : -1e30
+    setp.lt.u32     %p_bound, %idx, %r_n;
+
+    // Default: -1e30 ≈ 0xF0BDC200  (actually let's use proper encoding)
+    mov.f32         %f_val,   0fF49A4F80;        // -1.0e30f approx
+
+    @%p_bound mul.wide.u32 %rd_off, %idx, 4;
+    .reg .u64 %rd_src;
+    @%p_bound add.u64      %rd_src, %rd_in, %rd_off;
+    @%p_bound ld.global.f32 %f_val, [%rd_src];
+
+    // Store to shared: sdata[tid]
+    mul.wide.u32    %rd_smem,  %tid, 4;
+    // sdata is at offset 0 in shared
+    mov.u64         %rd_off,   sdata;
+    add.u64         %rd_smem,  %rd_off, %rd_smem;
+    st.shared.f32   [%rd_smem], %f_val;
+
+    bar.sync        0;
+
+    // Tree reduction: for (s = blockDim.x/2; s > 0; s >>= 1)
+    shr.u32         %r_s,       %ntid, 1;        // s = blockDim.x / 2
+
+REDUCE_MAX_LOOP:
+    setp.eq.u32     %p_loop,    %r_s, 0;
+    @%p_loop bra    REDUCE_MAX_DONE;
+
+    setp.lt.u32     %p_active,  %tid, %r_s;
+    @!%p_active bra REDUCE_MAX_SKIP;
+
+    // partner = tid + s
+    add.u32         %r_partner, %tid, %r_s;
+    mul.wide.u32    %rd_smem_partner, %r_partner, 4;
+    add.u64         %rd_smem_partner, %rd_off, %rd_smem_partner;
+    ld.shared.f32   %f_other,   [%rd_smem_partner];
+    ld.shared.f32   %f_val,     [%rd_smem];
+    max.f32         %f_max,     %f_val, %f_other;
+    st.shared.f32   [%rd_smem], %f_max;
+
+REDUCE_MAX_SKIP:
+    bar.sync        0;
+    shr.u32         %r_s, %r_s, 1;               // s >>= 1
+    bra             REDUCE_MAX_LOOP;
+
+REDUCE_MAX_DONE:
+    // Thread 0: atomicMax to global output
+    setp.eq.u32     %p_tid0,    %tid, 0;
+    @!%p_tid0 bra   REDUCE_MAX_EXIT;
+
+    ld.shared.f32   %f_val,     [%rd_smem];       // sdata[0] = block max
+
+    // atomicMax for float via CAS loop
+    // Reinterpret float as int for CAS
+    .reg .u32 %r_old, %r_assumed, %r_new;
+    .reg .f32 %f_old, %f_cmp;
+    .reg .pred %p_cas;
+
+    ld.global.u32   %r_old, [%rd_out];
+
+ATOMIC_MAX_LOOP:
+    mov.u32         %r_assumed, %r_old;
+    mov.b32         %f_old,     %r_assumed;       // reinterpret as float
+    max.f32         %f_cmp,     %f_val, %f_old;
+    mov.b32         %r_new,     %f_cmp;           // reinterpret back to int
+    atom.global.cas.b32 %r_old, [%rd_out], %r_assumed, %r_new;
+    setp.ne.u32     %p_cas,     %r_old, %r_assumed;
+    @%p_cas bra     ATOMIC_MAX_LOOP;
+
+REDUCE_MAX_EXIT:
+    ret;
+}
+
+
+// =============================================================================
+// Kernel 4: bpf_reduce_sum
+//
+// Identical structure to reduce_max but with add instead of max,
+// and atomicAdd at the end (native for float on SM_100).
+// =============================================================================
+
+.visible .entry bpf_reduce_sum(
+    .param .u64 param_in,
+    .param .u64 param_out,
+    .param .s32 param_n
+)
+{
+    .extern .shared .f32 sdata[];
+
+    .reg .u32   %tid, %ctaid, %ntid, %idx;
+    .reg .u32   %r_n, %r_s, %r_partner;
+    .reg .u64   %rd_in, %rd_out, %rd_off;
+    .reg .u64   %rd_smem, %rd_smem_partner;
+    .reg .f32   %f_val, %f_other, %f_sum;
+    .reg .pred  %p_bound, %p_active, %p_tid0, %p_loop;
+
+    ld.param.u64    %rd_in,   [param_in];
+    ld.param.u64    %rd_out,  [param_out];
+    ld.param.s32    %r_n,     [param_n];
+
+    mov.u32         %tid,     %tid.x;
+    mov.u32         %ctaid,   %ctaid.x;
+    mov.u32         %ntid,    %ntid.x;
+    mad.lo.u32      %idx,     %ctaid, %ntid, %tid;
+
+    // Load: sdata[tid] = (idx < n) ? in[idx] : 0.0
+    mov.f32         %f_val,   0f00000000;         // 0.0f (identity for sum)
+    setp.lt.u32     %p_bound, %idx, %r_n;
+
+    .reg .u64 %rd_src;
+    @%p_bound mul.wide.u32 %rd_off, %idx, 4;
+    @%p_bound add.u64      %rd_src, %rd_in, %rd_off;
+    @%p_bound ld.global.f32 %f_val, [%rd_src];
+
+    mul.wide.u32    %rd_smem,  %tid, 4;
+    mov.u64         %rd_off,   sdata;
+    add.u64         %rd_smem,  %rd_off, %rd_smem;
+    st.shared.f32   [%rd_smem], %f_val;
+
+    bar.sync        0;
+
+    shr.u32         %r_s, %ntid, 1;
+
+REDUCE_SUM_LOOP:
+    setp.eq.u32     %p_loop, %r_s, 0;
+    @%p_loop bra    REDUCE_SUM_DONE;
+
+    setp.lt.u32     %p_active, %tid, %r_s;
+    @!%p_active bra REDUCE_SUM_SKIP;
+
+    add.u32         %r_partner, %tid, %r_s;
+    mul.wide.u32    %rd_smem_partner, %r_partner, 4;
+    add.u64         %rd_smem_partner, %rd_off, %rd_smem_partner;
+    ld.shared.f32   %f_other,   [%rd_smem_partner];
+    ld.shared.f32   %f_val,     [%rd_smem];
+    add.f32         %f_sum,     %f_val, %f_other;  // ← add, not max
+    st.shared.f32   [%rd_smem], %f_sum;
+
+REDUCE_SUM_SKIP:
+    bar.sync        0;
+    shr.u32         %r_s, %r_s, 1;
+    bra             REDUCE_SUM_LOOP;
+
+REDUCE_SUM_DONE:
+    setp.eq.u32     %p_tid0, %tid, 0;
+    @!%p_tid0 bra   REDUCE_SUM_EXIT;
+
+    ld.shared.f32   %f_val, [%rd_smem];
+
+    // atomicAdd — native float atomic on SM_100
+    atom.global.add.f32 %f_val, [%rd_out], %f_val;
+
+REDUCE_SUM_EXIT:
+    ret;
+}
+
+
+// =============================================================================
+// Kernel 5: bpf_exp_sub
+//
+// w[i] = exp(log_w[i] - *d_max)
+//
+// Uses ex2.approx for fast exp: exp(x) = exp2(x * log2(e))
+// This is what __expf() compiles to in CUDA — here you see it explicitly.
+// =============================================================================
+
+.visible .entry bpf_exp_sub(
+    .param .u64 param_w,
+    .param .u64 param_log_w,
+    .param .u64 param_d_max,
+    .param .s32 param_n
+)
+{
+    .reg .u32   %tid, %ctaid, %ntid, %idx;
+    .reg .u32   %r_n;
+    .reg .u64   %rd_w, %rd_lw, %rd_max, %rd_off;
+    .reg .f32   %f_lw, %f_max, %f_diff, %f_exp;
+    .reg .pred  %p_bound;
+
+    ld.param.u64    %rd_w,    [param_w];
+    ld.param.u64    %rd_lw,   [param_log_w];
+    ld.param.u64    %rd_max,  [param_d_max];
+    ld.param.s32    %r_n,     [param_n];
+
+    mov.u32         %tid,     %tid.x;
+    mov.u32         %ctaid,   %ctaid.x;
+    mov.u32         %ntid,    %ntid.x;
+    mad.lo.u32      %idx,     %ctaid, %ntid, %tid;
+
+    setp.ge.u32     %p_bound, %idx, %r_n;
+    @%p_bound bra   EXP_SUB_EXIT;
+
+    mul.wide.u32    %rd_off,  %idx, 4;
+
+    // Load log_w[i] and *d_max
+    .reg .u64 %rd_src;
+    add.u64         %rd_src,  %rd_lw, %rd_off;
+    ld.global.f32   %f_lw,    [%rd_src];
+    ld.global.f32   %f_max,   [%rd_max];          // broadcast scalar
+
+    // diff = log_w[i] - max
+    sub.f32         %f_diff,  %f_lw, %f_max;
+
+    // exp(diff) = exp2(diff * log2(e))
+    mul.f32         %f_diff,  %f_diff, 0f3FB8AA3B; // * 1.4426950f
+    ex2.approx.f32  %f_exp,   %f_diff;
+
+    // Store w[i]
+    .reg .u64 %rd_dst;
+    add.u64         %rd_dst,  %rd_w, %rd_off;
+    st.global.f32   [%rd_dst], %f_exp;
+
+EXP_SUB_EXIT:
+    ret;
+}
+
+
+// =============================================================================
+// Kernel 6: bpf_scale_wh
+//
+// inv_sum = 1.0 / *d_sum
+// w[i]  *= inv_sum       (normalize)
+// wh[i]  = w[i] * h[i]  (for weighted mean)
+//
+// Shows: rcp.approx for fast reciprocal — what the compiler uses for 1.0/x
+// =============================================================================
+
+.visible .entry bpf_scale_wh(
+    .param .u64 param_w,
+    .param .u64 param_wh,
+    .param .u64 param_h,
+    .param .u64 param_d_sum,
+    .param .s32 param_n
+)
+{
+    .reg .u32   %tid, %ctaid, %ntid, %idx;
+    .reg .u32   %r_n;
+    .reg .u64   %rd_w, %rd_wh, %rd_h, %rd_sum, %rd_off;
+    .reg .f32   %f_w, %f_h, %f_sum, %f_inv, %f_wh;
+    .reg .pred  %p_bound;
+
+    ld.param.u64    %rd_w,    [param_w];
+    ld.param.u64    %rd_wh,   [param_wh];
+    ld.param.u64    %rd_h,    [param_h];
+    ld.param.u64    %rd_sum,  [param_d_sum];
+    ld.param.s32    %r_n,     [param_n];
+
+    mov.u32         %tid,     %tid.x;
+    mov.u32         %ctaid,   %ctaid.x;
+    mov.u32         %ntid,    %ntid.x;
+    mad.lo.u32      %idx,     %ctaid, %ntid, %tid;
+
+    setp.ge.u32     %p_bound, %idx, %r_n;
+    @%p_bound bra   SCALE_EXIT;
+
+    mul.wide.u32    %rd_off,  %idx, 4;
+
+    // Load w[i], h[i], *d_sum
+    .reg .u64 %rd_src_w, %rd_src_h;
+    add.u64         %rd_src_w, %rd_w, %rd_off;
+    add.u64         %rd_src_h, %rd_h, %rd_off;
+    ld.global.f32   %f_w,      [%rd_src_w];
+    ld.global.f32   %f_h,      [%rd_src_h];
+    ld.global.f32   %f_sum,    [%rd_sum];
+
+    // rcp.approx: hardware fast reciprocal (~23-bit mantissa on Blackwell)
+    rcp.approx.f32  %f_inv,    %f_sum;
+
+    // w[i] = w[i] * inv_sum
+    mul.f32         %f_w,      %f_w, %f_inv;
+    st.global.f32   [%rd_src_w], %f_w;
+
+    // wh[i] = w[i] * h[i]
+    mul.f32         %f_wh,     %f_w, %f_h;
+    .reg .u64 %rd_dst_wh;
+    add.u64         %rd_dst_wh, %rd_wh, %rd_off;
+    st.global.f32   [%rd_dst_wh], %f_wh;
+
+SCALE_EXIT:
+    ret;
+}
+
+
+// =============================================================================
+// Kernel 7: bpf_compute_loglik
+//
+// d_scalars[3] = d_scalars[0] + log(max(d_scalars[1] / N, 1e-30))
+//
+// Single-thread kernel. Shows lg2.approx → scale pattern for log().
+// log(x) = log2(x) / log2(e) = log2(x) * ln(2)
+// =============================================================================
+
+.visible .entry bpf_compute_loglik(
+    .param .u64 param_scalars,
+    .param .s32 param_n
+)
+{
+    .reg .u64   %rd_s;
+    .reg .f32   %f_max_lw, %f_sum_w, %f_n, %f_ratio;
+    .reg .f32   %f_log2, %f_ln2, %f_loglik, %f_floor;
+    .reg .s32   %r_n;
+    .reg .pred  %p_tiny;
+
+    ld.param.u64    %rd_s,      [param_scalars];
+    ld.param.s32    %r_n,       [param_n];
+
+    // Load max_lw = scalars[0], sum_w = scalars[1]
+    ld.global.f32   %f_max_lw,  [%rd_s + 0];     // byte offset 0
+    ld.global.f32   %f_sum_w,   [%rd_s + 4];     // byte offset 4
+
+    // ratio = sum_w / N
+    cvt.rn.f32.s32  %f_n,       %r_n;
+    div.approx.f32  %f_ratio,   %f_sum_w, %f_n;
+
+    // Clamp: max(ratio, 1e-30)
+    mov.f32         %f_floor,   0f0D6BF94E;       // ~1e-30
+    max.f32         %f_ratio,   %f_ratio, %f_floor;
+
+    // log(ratio) = lg2(ratio) * ln(2)
+    // ln(2) ≈ 0.6931472f = 0x3F317218
+    lg2.approx.f32  %f_log2,    %f_ratio;
+    mov.f32         %f_ln2,     0f3F317218;
+    mul.f32         %f_loglik,  %f_log2, %f_ln2;
+
+    // loglik = max_lw + log(ratio)
+    add.f32         %f_loglik,  %f_loglik, %f_max_lw;
+
+    // Store to scalars[3] (byte offset 12)
+    st.global.f32   [%rd_s + 12], %f_loglik;
+
+    ret;
+}
+
+
+// =============================================================================
+// Kernel 8: bpf_resample
+//
+// Systematic resampling via binary search on CDF.
+//
+//   target = u_base + i/N
+//   if target >= 1.0: target -= 1.0
+//   binary search cdf[] for target → ancestor index
+//   h_out[i] = h_in[ancestor]
+//
+// Shows: integer arithmetic for binary search, predicated branches,
+// and the float→int→float dance for i/N computation.
+// =============================================================================
+
+.visible .entry bpf_resample(
+    .param .u64 param_h_out,
+    .param .u64 param_h_in,
+    .param .u64 param_cdf,
+    .param .f32 param_u_base,
+    .param .s32 param_n
+)
+{
+    .reg .u32   %tid, %ctaid, %ntid, %idx;
+    .reg .u32   %r_n;
+    .reg .u64   %rd_out, %rd_in, %rd_cdf, %rd_off;
+    .reg .f32   %f_u, %f_target, %f_idx_f, %f_n_f, %f_one, %f_cdf_mid;
+    .reg .s32   %r_lo, %r_hi, %r_mid;
+    .reg .pred  %p_bound, %p_ge1, %p_loop, %p_lt;
+
+    ld.param.u64    %rd_out,  [param_h_out];
+    ld.param.u64    %rd_in,   [param_h_in];
+    ld.param.u64    %rd_cdf,  [param_cdf];
+    ld.param.f32    %f_u,     [param_u_base];
+    ld.param.s32    %r_n,     [param_n];
+
+    mov.u32         %tid,     %tid.x;
+    mov.u32         %ctaid,   %ctaid.x;
+    mov.u32         %ntid,    %ntid.x;
+    mad.lo.u32      %idx,     %ctaid, %ntid, %tid;
+
+    setp.ge.u32     %p_bound, %idx, %r_n;
+    @%p_bound bra   RESAMPLE_EXIT;
+
+    // target = u_base + (float)i / (float)n
+    cvt.rn.f32.u32  %f_idx_f, %idx;
+    cvt.rn.f32.s32  %f_n_f,   %r_n;
+    div.approx.f32  %f_target, %f_idx_f, %f_n_f;
+    add.f32         %f_target, %f_target, %f_u;
+
+    // if target >= 1.0: target -= 1.0
+    mov.f32         %f_one,    0f3F800000;        // 1.0f
+    setp.ge.f32     %p_ge1,    %f_target, %f_one;
+    @%p_ge1 sub.f32 %f_target, %f_target, %f_one;
+
+    // Binary search: lo=0, hi=n-1
+    mov.s32         %r_lo,     0;
+    sub.s32         %r_hi,     %r_n, 1;
+
+BSEARCH_LOOP:
+    setp.ge.s32     %p_loop,   %r_lo, %r_hi;
+    @%p_loop bra    BSEARCH_DONE;
+
+    // mid = (lo + hi) >> 1
+    add.s32         %r_mid,    %r_lo, %r_hi;
+    shr.s32         %r_mid,    %r_mid, 1;
+
+    // Load cdf[mid]
+    .reg .u64 %rd_cdf_mid;
+    mul.wide.s32    %rd_off,   %r_mid, 4;
+    add.u64         %rd_cdf_mid, %rd_cdf, %rd_off;
+    ld.global.f32   %f_cdf_mid, [%rd_cdf_mid];
+
+    // if cdf[mid] < target: lo = mid + 1, else: hi = mid
+    setp.lt.f32     %p_lt,     %f_cdf_mid, %f_target;
+    @%p_lt  add.s32 %r_lo,     %r_mid, 1;
+    @!%p_lt mov.s32 %r_hi,     %r_mid;
+
+    bra             BSEARCH_LOOP;
+
+BSEARCH_DONE:
+    // h_out[idx] = h_in[lo]
+    .reg .u64 %rd_src, %rd_dst;
+    .reg .f32 %f_h;
+
+    mul.wide.s32    %rd_off,   %r_lo, 4;
+    add.u64         %rd_src,   %rd_in, %rd_off;
+    ld.global.f32   %f_h,      [%rd_src];
+
+    mul.wide.u32    %rd_off,   %idx, 4;
+    add.u64         %rd_dst,   %rd_out, %rd_off;
+    st.global.f32   [%rd_dst], %f_h;
+
+RESAMPLE_EXIT:
+    ret;
+}
