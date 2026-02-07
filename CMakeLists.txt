@@ -318,6 +318,34 @@ if(TARGET ptx_cubin_full)
 endif()
 
 # ==============================================================================
+# Target: bench_particle_scaling (latency vs particle count)
+# ==============================================================================
+
+add_executable(bench_particle_scaling tests/bench_particle_scaling.cu)
+
+target_compile_definitions(bench_particle_scaling PRIVATE USE_PTX_FULL=1)
+
+target_link_libraries(bench_particle_scaling PRIVATE
+    gpu_bpf_ptx_full
+    CUDA::cuda_driver
+    CUDA::cudart
+    CUDA::curand
+)
+
+target_include_directories(bench_particle_scaling PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/gpu_bpf
+)
+
+set_target_properties(bench_particle_scaling PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+if(TARGET ptx_cubin_full)
+    add_dependencies(bench_particle_scaling ptx_cubin_full)
+endif()
+
+# ==============================================================================
 # Print summary
 # ==============================================================================
 
