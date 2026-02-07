@@ -1,2 +1,11 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Exclude data files from linguist statistics
+*.csv linguist-generated
+*.bin linguist-generated binary
+*.ipynb linguist-vendored
+
+# Ensure line endings for scripts
+*.sh text eol=lf
+market_data/** linguist-vendored

@@ -1,2 +1,5 @@
 /build
 /.cache
+csv_bank/bpf_output.csv
+csv_bank/.ipynb_checkpoints/plot_bpf_analysis-checkpoint.ipynb
+csv_bank/.ipynb_checkpoints/plot_bpf_results-checkpoint.ipynb

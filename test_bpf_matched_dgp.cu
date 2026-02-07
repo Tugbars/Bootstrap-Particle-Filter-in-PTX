@@ -587,7 +587,9 @@ static void test_full_comparison(int n_ticks, int bpf_n, int apf_n,
 
         FilterMetrics bpf = run_bpf_metrics(data, bpf_n, base_seed + 100 + i);
         FilterMetrics apf = run_apf_metrics(data, apf_n, base_seed + 200 + i);
-        ImmMetrics    imm = run_imm_metrics(data, imm_per_model, base_seed + 300 + i);
+        ImmMetrics    imm = {0};
+        if (imm_per_model > 0)
+            imm = run_imm_metrics(data, imm_per_model, base_seed + 300 + i);
 
         double ew  = ewma_rmse(data, 0.94);
         double ga  = garch_best_rmse(data);
@@ -829,6 +831,200 @@ static void test_throughput(int base_seed) {
 }
 
 // =============================================================================
+// CSV Export — per-tick filtered output for all estimators
+// =============================================================================
+//
+// Columns:
+//   tick, scenario, true_h, true_vol, return,
+//   bpf_h, bpf_loglik, apf_h, apf_loglik, imm_h, imm_best_model, imm_best_prob,
+//   ewma_h, garch_h
+//
+// Usage: --csv <filename> [--csv-scenario N]  (0 = all scenarios, default)
+//
+
+static void export_csv(
+    const char* csv_path, int n_ticks,
+    int bpf_particles, int apf_particles, int imm_per_model,
+    int base_seed, int csv_scenario
+) {
+    FILE* fp = fopen(csv_path, "w");
+    if (!fp) {
+        // Try creating parent directory (csv_bank/)
+#ifdef _WIN32
+        // Extract directory from path and create it
+        char dir[512];
+        strncpy(dir, csv_path, sizeof(dir) - 1);
+        dir[sizeof(dir) - 1] = '\0';
+        char* last_sep = strrchr(dir, '\\');
+        if (!last_sep) last_sep = strrchr(dir, '/');
+        if (last_sep) {
+            *last_sep = '\0';
+            CreateDirectoryA(dir, NULL);
+        }
+        fp = fopen(csv_path, "w");
+#else
+        // POSIX: mkdir -p on parent
+        char dir[512];
+        strncpy(dir, csv_path, sizeof(dir) - 1);
+        dir[sizeof(dir) - 1] = '\0';
+        char* last_sep = strrchr(dir, '/');
+        if (last_sep) {
+            *last_sep = '\0';
+            char cmd[600];
+            snprintf(cmd, sizeof(cmd), "mkdir -p %s", dir);
+            system(cmd);
+        }
+        fp = fopen(csv_path, "w");
+#endif
+    }
+    if (!fp) {
+        fprintf(stderr, "ERROR: Cannot open %s for writing\n", csv_path);
+        return;
+    }
+
+    // Header
+    fprintf(fp, "tick,scenario_id,scenario_name,"
+                "true_h,true_vol,return,"
+                "bpf_h,bpf_loglik,"
+                "apf_h,apf_loglik,"
+                "imm_h,imm_best_model,imm_best_prob,"
+                "ewma_h,garch_h\n");
+
+    for (int si = 0; si < N_SCENARIOS; si++) {
+        MatchedTestData* data = ALL_SCENARIOS[si].gen(n_ticks, base_seed);
+
+        // Filter by scenario if requested (1-indexed)
+        if (csv_scenario > 0 && data->scenario_id != csv_scenario) {
+            free_matched_data(data);
+            continue;
+        }
+
+        printf("  CSV: exporting scenario %d/%d [%s] ...\n",
+               data->scenario_id, N_SCENARIOS, data->scenario_name);
+
+        // --- Create filters ---
+        GpuBpfState* bpf = gpu_bpf_create(
+            bpf_particles,
+            (float)data->dgp_rho, (float)data->dgp_sigma_z, (float)data->dgp_mu,
+            (float)data->dgp_nu_state, (float)data->dgp_nu_obs, base_seed);
+
+        GpuApfState* apf = gpu_apf_create(
+            apf_particles,
+            (float)data->dgp_rho, (float)data->dgp_sigma_z, (float)data->dgp_mu,
+            (float)data->dgp_nu_state, (float)data->dgp_nu_obs, base_seed + 1);
+
+        // IMM grid (skip if imm_per_model == 0)
+        GpuImmState* imm = NULL;
+        if (imm_per_model > 0) {
+            float rho_true = (float)data->dgp_rho;
+            float sz_true  = (float)data->dgp_sigma_z;
+            float mu_true  = (float)data->dgp_mu;
+            float rhos[]   = { fmaxf(rho_true - 0.01f, 0.80f), rho_true, fminf(rho_true + 0.01f, 0.999f) };
+            float sigmas[] = { fmaxf(sz_true  - 0.05f, 0.05f), sz_true,  sz_true + 0.05f };
+            float mus[]    = { mu_true - 0.5f,                  mu_true,  mu_true + 0.5f };
+            int n_models;
+            ImmModelParams* grid = gpu_imm_build_grid(
+                rhos, 3, sigmas, 3, mus, 3,
+                (float)data->dgp_nu_state, (float)data->dgp_nu_obs, &n_models);
+            imm = gpu_imm_create(grid, n_models, imm_per_model, NULL, base_seed + 2);
+            free(grid);
+        }
+
+        // --- EWMA state (lambda=0.94) ---
+        double ewma_var = 0.0;
+        {
+            int init_n = (n_ticks < 20) ? n_ticks : 20;
+            for (int t = 0; t < init_n; t++)
+                ewma_var += data->returns[t] * data->returns[t];
+            ewma_var /= init_n;
+            if (ewma_var < 1e-10) ewma_var = 1e-10;
+        }
+
+        // --- GARCH state: grid-search best params first ---
+        double garch_omega = 0.0, garch_alpha = 0.05, garch_beta = 0.90;
+        {
+            double best_rmse = 1e10;
+            double alphas[] = {0.02, 0.05, 0.08, 0.10, 0.15, 0.20};
+            double betas[]  = {0.75, 0.80, 0.85, 0.90, 0.93, 0.95};
+            int na = sizeof(alphas) / sizeof(alphas[0]);
+            int nb = sizeof(betas)  / sizeof(betas[0]);
+            double sv = 0.0;
+            for (int t = 0; t < n_ticks; t++)
+                sv += data->returns[t] * data->returns[t];
+            sv /= n_ticks;
+            for (int ia = 0; ia < na; ia++) {
+                for (int ib = 0; ib < nb; ib++) {
+                    double a = alphas[ia], b = betas[ib];
+                    if (a + b >= 0.999) continue;
+                    double omega = sv * (1.0 - a - b);
+                    double r = garch_rmse(data, omega, a, b);
+                    if (r < best_rmse) {
+                        best_rmse    = r;
+                        garch_omega  = omega;
+                        garch_alpha  = a;
+                        garch_beta   = b;
+                    }
+                }
+            }
+        }
+        double garch_var = (garch_alpha + garch_beta < 0.999)
+            ? garch_omega / (1.0 - garch_alpha - garch_beta) : 0.01;
+        if (garch_var < 1e-10) garch_var = 1e-10;
+
+        // --- Tick loop ---
+        for (int t = 0; t < n_ticks; t++) {
+            float obs = (float)data->returns[t];
+
+            // BPF
+            BpfResult br = gpu_bpf_step(bpf, obs);
+
+            // APF
+            BpfResult ar = gpu_apf_step(apf, obs);
+
+            // IMM
+            ImmResult ir = {0};
+            if (imm) ir = gpu_imm_step(imm, obs);
+
+            // EWMA
+            double ewma_h = log(ewma_var);
+            double y2 = (double)obs * (double)obs;
+            ewma_var = 0.94 * ewma_var + 0.06 * y2;
+            if (ewma_var < 1e-10) ewma_var = 1e-10;
+
+            // GARCH
+            double garch_h = log(garch_var);
+            garch_var = garch_omega + garch_alpha * y2 + garch_beta * garch_var;
+            if (garch_var < 1e-10) garch_var = 1e-10;
+
+            // Write row
+            fprintf(fp, "%d,%d,\"%s\","
+                        "%.8f,%.8f,%.8f,"
+                        "%.8f,%.6f,"
+                        "%.8f,%.6f,"
+                        "%.8f,%d,%.6f,"
+                        "%.8f,%.8f\n",
+                    t, data->scenario_id, data->scenario_name,
+                    data->true_h[t], data->true_vol[t], data->returns[t],
+                    (double)br.h_mean, (double)br.log_lik,
+                    (double)ar.h_mean, (double)ar.log_lik,
+                    imm ? (double)ir.h_mean : 0.0,
+                    imm ? ir.best_model : -1,
+                    imm ? (double)ir.best_prob : 0.0,
+                    ewma_h, garch_h);
+        }
+
+        // Cleanup
+        gpu_bpf_destroy(bpf);
+        gpu_apf_destroy(apf);
+        if (imm) gpu_imm_destroy(imm);
+        free_matched_data(data);
+    }
+
+    fclose(fp);
+    printf("  CSV written: %s\n", csv_path);
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -839,6 +1035,10 @@ int main(int argc, char** argv) {
     int imm_per_model = 2000;
     int mc_particles  = 10000;
     int base_seed     = 42;
+    const char* csv_path = "csv_bank/bpf_output.csv";
+    int csv_scenario     = 0;    // 0 = all
+    int csv_only         = 0;    // if --csv-only, skip tests
+    int no_imm           = 1;    // if --no-imm, skip IMM everywhere
 
     for (int i = 1; i < argc; i++) {
         if      (strcmp(argv[i], "--ticks") == 0 && i+1 < argc)
@@ -853,6 +1053,14 @@ int main(int argc, char** argv) {
             mc_particles = atoi(argv[++i]);
         else if (strcmp(argv[i], "--seed") == 0 && i+1 < argc)
             base_seed = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--csv") == 0 && i+1 < argc)
+            csv_path = argv[++i];
+        else if (strcmp(argv[i], "--csv-scenario") == 0 && i+1 < argc)
+            csv_scenario = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--csv-only") == 0)
+            csv_only = 1;
+        else if (strcmp(argv[i], "--no-imm") == 0)
+            no_imm = 1;
     }
 
     // Print GPU info
@@ -864,15 +1072,35 @@ int main(int argc, char** argv) {
            prop.name, prop.major, prop.minor, prop.multiProcessorCount);
     printf("  Zero model mismatch — all filters use TRUE DGP parameters\n");
     printf("═══════════════════════════════════════════════════════════════════════════════\n");
-    printf("  Config: %d ticks, BPF=%dK, APF=%dK, IMM=27×%d, MC=%dK\n",
-           n_ticks, bpf_particles / 1000, apf_particles / 1000,
-           imm_per_model, mc_particles / 1000);
+    if (no_imm)
+        printf("  Config: %d ticks, BPF=%dK, APF=%dK, IMM=OFF, MC=%dK\n",
+               n_ticks, bpf_particles / 1000, apf_particles / 1000,
+               mc_particles / 1000);
+    else
+        printf("  Config: %d ticks, BPF=%dK, APF=%dK, IMM=27x%d, MC=%dK\n",
+               n_ticks, bpf_particles / 1000, apf_particles / 1000,
+               imm_per_model, mc_particles / 1000);
+    if (csv_path)
+        printf("  CSV output: %s (scenario=%s)\n",
+               csv_path, csv_scenario ? "filtered" : "all");
+
+    // Export CSV if requested (runs BEFORE tests — independent)
+    if (csv_path) {
+        export_csv(csv_path, n_ticks, bpf_particles, apf_particles,
+                   no_imm ? 0 : imm_per_model, base_seed, csv_scenario);
+        if (csv_only) {
+            printf("\n--csv-only: skipping test suite.\n");
+            return 0;
+        }
+    }
 
     // Run all tests
-    test_full_comparison(n_ticks, bpf_particles, apf_particles, imm_per_model, base_seed);
+    test_full_comparison(n_ticks, bpf_particles, apf_particles,
+                         no_imm ? 0 : imm_per_model, base_seed);
     test_bpf_particle_sweep(n_ticks, base_seed);
     test_apf_vs_bpf(n_ticks, base_seed);
-    test_imm_selection(n_ticks, imm_per_model, base_seed);
+    if (!no_imm)
+        test_imm_selection(n_ticks, imm_per_model, base_seed);
     test_mc_variance(n_ticks, mc_particles, base_seed);
     test_throughput(base_seed);
 
