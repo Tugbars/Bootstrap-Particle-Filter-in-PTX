@@ -44,6 +44,11 @@ typedef struct {
     float* d_scalars;        // [4]: max_lw, sum_w, h_est, log_lik
     float* d_noise;          // [N]: standard normal samples for Silverman
     float* d_var;            // [1]: variance accumulator
+    float* d_chi2;           // [N]: pre-generated chi2 variates (or NULL)
+    float* d_chi2_normals;   // [N*nu_int]: temp normals for chi2 gen
+    void* curand_gen;        // curandGenerator_t (void* for header compat)
+    float C_obs;             // precomputed lgamma constant for Student-t obs
+    int nu_int;              // integer nu_state for chi2 generation
     int n_particles;
     int block, grid;
     cudaStream_t stream;

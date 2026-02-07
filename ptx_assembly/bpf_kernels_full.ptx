@@ -219,27 +219,31 @@ INIT_P_EXIT:
 // =============================================================================
 // Kernel 3: bpf_propagate_weight
 //   Propagate (OU + optional Student-t noise) + compute observation log-weight
+//   chi2 variates pre-generated on host (param_chi2 array)
+//   Student-t obs constant precomputed on host (param_C_obs)
 // =============================================================================
 
 .visible .entry bpf_propagate_weight(
     .param .u64 param_h,
     .param .u64 param_log_w,
     .param .u64 param_rng,
+    .param .u64 param_chi2,
     .param .f32 param_rho,
     .param .f32 param_sigma_z,
     .param .f32 param_mu,
     .param .f32 param_nu_state,
     .param .f32 param_nu_obs,
+    .param .f32 param_C_obs,
     .param .f32 param_y_t,
     .param .s32 param_n,
     .param .s32 param_do_prop
 )
 {
     .reg .u32   %idx, %r_tid, %r_ctaid, %r_ntid, %r_n, %r_do_prop;
-    .reg .u64   %rd_h, %rd_lw, %rd_rng, %rd_off, %rd_rng_addr;
+    .reg .u64   %rd_h, %rd_lw, %rd_rng, %rd_chi2, %rd_off, %rd_rng_addr;
     .reg .u64   %rd_state, %rd_inc, %rd_old, %rd_mul, %rd_tmp;
     .reg .u32   %r_pcg, %r_xsh, %r_rot, %r_neg_rot, %r_lo, %r_hi;
-    .reg .f32   %f_rho, %f_sigma_z, %f_mu, %f_nu_state, %f_nu_obs, %f_yt;
+    .reg .f32   %f_rho, %f_sigma_z, %f_mu, %f_nu_state, %f_nu_obs, %f_yt, %f_C_obs;
     .reg .f32   %f_hi, %f_eps, %f_u, %f_z, %f_eta, %f_eta2, %f_log_w;
     .reg .f32   %f_q, %f_r, %f_num, %f_den, %f_abs_q;
     .reg .f32   %f_p, %f_log_p, %f_r_tail, %f_sqrt_tmp;
@@ -249,11 +253,13 @@ INIT_P_EXIT:
     ld.param.u64    %rd_h,       [param_h];
     ld.param.u64    %rd_lw,      [param_log_w];
     ld.param.u64    %rd_rng,     [param_rng];
+    ld.param.u64    %rd_chi2,    [param_chi2];
     ld.param.f32    %f_rho,      [param_rho];
     ld.param.f32    %f_sigma_z,  [param_sigma_z];
     ld.param.f32    %f_mu,       [param_mu];
     ld.param.f32    %f_nu_state, [param_nu_state];
     ld.param.f32    %f_nu_obs,   [param_nu_obs];
+    ld.param.f32    %f_C_obs,    [param_C_obs];
     ld.param.f32    %f_yt,       [param_y_t];
     ld.param.s32    %r_n,        [param_n];
     ld.param.s32    %r_do_prop,  [param_do_prop];
@@ -350,94 +356,19 @@ PW_TAIL:
 PW_ICDF_OK:
     mov.f32         %f_eps, %f_z;
 
-    // Student-t state noise: eps = z * rsqrt(chi2/nu)
+    // Student-t state noise: eps = z * sqrt(nu / chi2)
+    // chi2 is pre-generated on host and loaded from param_chi2 array
     setp.gt.f32     %p_t_state, %f_nu_state, 0f00000000;
     @!%p_t_state bra PW_TRANS;
 
-    .reg .f32 %f_chi2, %f_gi;
-    .reg .s32 %r_k, %r_nu_int;
-    .reg .pred %p_chi_loop;
-
-    mov.f32         %f_chi2, 0f00000000;
-    cvt.rzi.s32.f32 %r_nu_int, %f_nu_state;
-    mov.s32         %r_k, 0;
-
-PW_CHI_LP:
-    setp.ge.s32     %p_chi_loop, %r_k, %r_nu_int;
-    @%p_chi_loop bra PW_CHI_DN;
-
-    // PCG32 + ICDF for chi2 component
-    mov.u64         %rd_old, %rd_state;
-    mul.lo.u64      %rd_tmp, %rd_state, %rd_mul;
-    add.u64         %rd_state, %rd_tmp, %rd_inc;
-    shr.u64         %rd_tmp, %rd_old, 18;
-    xor.b64         %rd_tmp, %rd_tmp, %rd_old;
-    shr.u64         %rd_tmp, %rd_tmp, 27;
-    cvt.u32.u64     %r_xsh, %rd_tmp;
-    shr.u64         %rd_tmp, %rd_old, 59;
-    cvt.u32.u64     %r_rot, %rd_tmp;
-    shr.u32         %r_lo, %r_xsh, %r_rot;
-    neg.s32         %r_neg_rot, %r_rot;
-    and.b32         %r_neg_rot, %r_neg_rot, 31;
-    shl.b32         %r_hi, %r_xsh, %r_neg_rot;
-    or.b32          %r_pcg, %r_lo, %r_hi;
-    shr.u32         %r_pcg, %r_pcg, 9;
-    cvt.rn.f32.u32  %f_u, %r_pcg;
-    mul.f32         %f_u, %f_u, 0f34000000;
-    max.f32         %f_u, %f_u, 0f358637BD;
-    min.f32         %f_u, %f_u, 0f3F7FFBCE;
-
-    // ICDF (full Acklam)
-    sub.f32         %f_q, %f_u, 0f3F000000;
-    abs.f32         %f_abs_q, %f_q;
-    setp.lt.f32     %p_central, %f_abs_q, 0f3EF39581;
-    @!%p_central bra PW_CHI_TL;
-
-    mul.f32         %f_r, %f_q, %f_q;
-    fma.rn.f32      %f_num, %f_r, 0fC21EC98E, 0f435CF234;
-    fma.rn.f32      %f_num, %f_r, %f_num, 0fC389F6D9;
-    fma.rn.f32      %f_num, %f_r, %f_num, 0f430A5B96;
-    fma.rn.f32      %f_num, %f_r, %f_num, 0fC1F55182;
-    fma.rn.f32      %f_num, %f_r, %f_num, 0f40206C99;
-    mul.f32         %f_num, %f_q, %f_num;
-    fma.rn.f32      %f_den, %f_r, 0fC259E786, 0f432195F9;
-    fma.rn.f32      %f_den, %f_r, %f_den, 0fC31BB2F0;
-    fma.rn.f32      %f_den, %f_r, %f_den, 0f42859A46;
-    fma.rn.f32      %f_den, %f_r, %f_den, 0fC1547DAC;
-    fma.rn.f32      %f_den, %f_r, %f_den, 0f3F800000;
-    div.approx.f32  %f_gi, %f_num, %f_den;
-    bra             PW_CHI_AC;
-
-PW_CHI_TL:
-    setp.lt.f32     %p_low_tail, %f_u, 0f3F000000;
-    mov.f32         %f_p, %f_u;
-    @!%p_low_tail sub.f32 %f_p, 0f3F800000, %f_u;
-    lg2.approx.f32  %f_log_p, %f_p;
-    mul.f32         %f_log_p, %f_log_p, 0f3F317218;
-    mul.f32         %f_r_tail, %f_log_p, 0fC0000000;
-    sqrt.approx.f32 %f_r_tail, %f_r_tail;
-    fma.rn.f32      %f_num, %f_r_tail, 0fBBFF186D, 0fBEA51126;
-    fma.rn.f32      %f_num, %f_r_tail, %f_num, 0fC019A606;
-    fma.rn.f32      %f_num, %f_r_tail, %f_num, 0fC0232ED1;
-    fma.rn.f32      %f_num, %f_r_tail, %f_num, 0f408BFD40;
-    fma.rn.f32      %f_num, %f_r_tail, %f_num, 0f403C0AE1;
-    fma.rn.f32      %f_den, %f_r_tail, 0f3BFF16C3, 0f3EA51A69;
-    fma.rn.f32      %f_den, %f_r_tail, %f_den, 0f401C7D14;
-    fma.rn.f32      %f_den, %f_r_tail, %f_den, 0f4070483B;
-    fma.rn.f32      %f_den, %f_r_tail, %f_den, 0f3F800000;
-    div.approx.f32  %f_gi, %f_num, %f_den;
-    @!%p_low_tail neg.f32 %f_gi, %f_gi;
-
-PW_CHI_AC:
-    fma.rn.f32      %f_chi2, %f_gi, %f_gi, %f_chi2;
-    add.s32         %r_k, %r_k, 1;
-    bra             PW_CHI_LP;
-
-PW_CHI_DN:
-    // eps = z * rsqrt(chi2/nu)
-    div.approx.f32  %f_chi2, %f_chi2, %f_nu_state;
-    rsqrt.approx.f32 %f_chi2, %f_chi2;
-    mul.f32         %f_eps, %f_z, %f_chi2;
+    .reg .f32 %f_chi2, %f_scale;
+    mul.wide.u32    %rd_off, %idx, 4;
+    .reg .u64 %rd_chi2_addr;
+    add.u64         %rd_chi2_addr, %rd_chi2, %rd_off;
+    ld.global.f32   %f_chi2, [%rd_chi2_addr];
+    div.approx.f32  %f_scale, %f_chi2, %f_nu_state;
+    rsqrt.approx.f32 %f_scale, %f_scale;
+    mul.f32         %f_eps, %f_z, %f_scale;
 
 PW_TRANS:
     // h = mu + rho*(h-mu) + sigma_z*eps
@@ -460,7 +391,7 @@ PW_WEIGHT:
     setp.gt.f32     %p_t_obs, %f_nu_obs, 0f00000000;
     @%p_t_obs bra   PW_T_OBS;
 
-    // Gaussian obs
+    // Gaussian obs: log_w = -0.5*log(2pi) - 0.5*eta^2 - 0.5*h
     mul.f32         %f_eta2, %f_eta, %f_eta;
     mov.f32         %f_log_w, 0fBF6B3F8E;     // -0.5*log(2pi)
     fma.rn.f32      %f_log_w, %f_neg_half, %f_eta2, %f_log_w;
@@ -468,56 +399,24 @@ PW_WEIGHT:
     bra             PW_STORE;
 
 PW_T_OBS:
-    // Student-t obs: Stirling lgamma approx
-    .reg .f32 %f_nu_p1h, %f_nu_h, %f_lgam_a, %f_lgam_b;
-    .reg .f32 %f_log_nupi, %f_t_arg, %f_log_t, %f_xm05, %f_log_x, %f_lg;
+    // Student-t obs: C_obs precomputed on host
+    // log_w = C_obs - (nu+1)/2 * log(1 + eta^2/nu) - 0.5*h
+    .reg .f32 %f_nu_p1h, %f_t_arg, %f_log_t;
 
     add.f32         %f_nu_p1h, %f_nu_obs, 0f3F800000;
     mul.f32         %f_nu_p1h, %f_nu_p1h, 0f3F000000;    // (nu+1)/2
-    mul.f32         %f_nu_h,   %f_nu_obs, 0f3F000000;    // nu/2
 
-    // lgamma((nu+1)/2) via Stirling
-    sub.f32         %f_xm05, %f_nu_p1h, 0f3F000000;
-    lg2.approx.f32  %f_log_x, %f_nu_p1h;
-    mul.f32         %f_log_x, %f_log_x, 0f3F317218;
-    mul.f32         %f_lgam_a, %f_xm05, %f_log_x;
-    sub.f32         %f_lgam_a, %f_lgam_a, %f_nu_p1h;
-    add.f32         %f_lgam_a, %f_lgam_a, 0f3F6B3F8E;    // +0.9189385
-    rcp.approx.f32  %f_lg, %f_nu_p1h;
-    mul.f32         %f_lg, %f_lg, 0f3DAAAAAB;            // 1/12
-    add.f32         %f_lgam_a, %f_lgam_a, %f_lg;
-
-    // lgamma(nu/2) via Stirling
-    sub.f32         %f_xm05, %f_nu_h, 0f3F000000;
-    lg2.approx.f32  %f_log_x, %f_nu_h;
-    mul.f32         %f_log_x, %f_log_x, 0f3F317218;
-    mul.f32         %f_lgam_b, %f_xm05, %f_log_x;
-    sub.f32         %f_lgam_b, %f_lgam_b, %f_nu_h;
-    add.f32         %f_lgam_b, %f_lgam_b, 0f3F6B3F8E;
-    rcp.approx.f32  %f_lg, %f_nu_h;
-    mul.f32         %f_lg, %f_lg, 0f3DAAAAAB;
-    add.f32         %f_lgam_b, %f_lgam_b, %f_lg;
-
-    // -0.5*log(nu*pi)
-    mul.f32         %f_log_nupi, %f_nu_obs, 0f40490FDB;  // pi
-    lg2.approx.f32  %f_log_nupi, %f_log_nupi;
-    mul.f32         %f_log_nupi, %f_log_nupi, 0f3F317218;
-    mul.f32         %f_log_nupi, %f_log_nupi, 0fBF000000;
-
-    // -(nu+1)/2 * log(1 + eta^2/nu)
     mul.f32         %f_eta2, %f_eta, %f_eta;
     div.approx.f32  %f_t_arg, %f_eta2, %f_nu_obs;
-    add.f32         %f_t_arg, %f_t_arg, 0f3F800000;
+    add.f32         %f_t_arg, %f_t_arg, 0f3F800000;       // 1 + eta^2/nu
     lg2.approx.f32  %f_log_t, %f_t_arg;
-    mul.f32         %f_log_t, %f_log_t, 0f3F317218;
+    mul.f32         %f_log_t, %f_log_t, 0f3F317218;       // *ln2
     .reg .f32 %f_neg_nph;
     neg.f32         %f_neg_nph, %f_nu_p1h;
-    mul.f32         %f_log_t, %f_neg_nph, %f_log_t;
+    mul.f32         %f_log_t, %f_neg_nph, %f_log_t;       // -(nu+1)/2 * log(...)
 
-    // Assemble
-    sub.f32         %f_log_w, %f_lgam_a, %f_lgam_b;
-    add.f32         %f_log_w, %f_log_w, %f_log_nupi;
-    add.f32         %f_log_w, %f_log_w, %f_log_t;
+    // Assemble: C_obs + log_t - 0.5*h
+    add.f32         %f_log_w, %f_C_obs, %f_log_t;
     fma.rn.f32      %f_log_w, %f_neg_half, %f_hi, %f_log_w;
 
 PW_STORE:

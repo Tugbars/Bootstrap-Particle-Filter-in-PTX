@@ -8,6 +8,7 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <curand.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -148,14 +149,15 @@ int main() {
         CUdeviceptr dh = (CUdeviceptr)(uintptr_t)d_h;
         CUdeviceptr dlw = (CUdeviceptr)(uintptr_t)d_log_w;
         CUdeviceptr drng = (CUdeviceptr)(uintptr_t)d_rng;
+        CUdeviceptr dchi2 = (CUdeviceptr)0;  // NULL - no chi2 for Gaussian
         float rho = 0.0f, sigma_z = 1.0f, mu = 0.0f;
-        float nu_state = 0.0f, nu_obs = 0.0f;
+        float nu_state = 0.0f, nu_obs = 0.0f, C_obs = 0.0f;
         float y_t = 0.0f;
         int n = N, do_prop = 1;
         void* params[] = {
-            &dh, &dlw, &drng,
+            &dh, &dlw, &drng, &dchi2,
             &rho, &sigma_z, &mu, &nu_state, &nu_obs,
-            &y_t, &n, &do_prop
+            &C_obs, &y_t, &n, &do_prop
         };
         cuLaunchKernel(fn_propagate_weight, G, 1, 1, B, 1, 1, 0, 0, params, NULL);
     }
@@ -189,18 +191,43 @@ int main() {
         void* params[] = { &drng, &seed, &n };
         cuLaunchKernel(fn_init_rng, G, 1, 1, B, 1, 1, 0, 0, params, NULL);
     }
+    // Generate chi2(5) variates: 5 normals per particle, square-sum
+    float *d_chi2_vals, *d_chi2_normals;
+    cudaMalloc(&d_chi2_vals, N * sizeof(float));
+    cudaMalloc(&d_chi2_normals, N * 5 * sizeof(float));
+    {
+        curandGenerator_t gen;
+        curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
+        curandSetPseudoRandomGeneratorSeed(gen, 789ULL);
+        curandGenerateNormal(gen, d_chi2_normals, N * 5, 0.0f, 1.0f);
+        curandDestroyGenerator(gen);
+    }
+    // Square-sum: chi2[i] = sum(normals[i*5..(i+1)*5-1]^2)
+    {
+        float* h_normals = (float*)malloc(N * 5 * sizeof(float));
+        float* h_chi2 = (float*)malloc(N * sizeof(float));
+        cudaMemcpy(h_normals, d_chi2_normals, N * 5 * sizeof(float), cudaMemcpyDeviceToHost);
+        for (int i = 0; i < N; i++) {
+            float s2 = 0;
+            for (int k = 0; k < 5; k++) { float z = h_normals[i*5+k]; s2 += z*z; }
+            h_chi2[i] = s2;
+        }
+        cudaMemcpy(d_chi2_vals, h_chi2, N * sizeof(float), cudaMemcpyHostToDevice);
+        free(h_normals); free(h_chi2);
+    }
     {
         CUdeviceptr dh = (CUdeviceptr)(uintptr_t)d_h;
         CUdeviceptr dlw = (CUdeviceptr)(uintptr_t)d_log_w;
         CUdeviceptr drng = (CUdeviceptr)(uintptr_t)d_rng;
+        CUdeviceptr dchi2 = (CUdeviceptr)(uintptr_t)d_chi2_vals;
         float rho = 0.0f, sigma_z = 1.0f, mu = 0.0f;
-        float nu_state = 5.0f, nu_obs = 0.0f;
+        float nu_state = 5.0f, nu_obs = 0.0f, C_obs = 0.0f;
         float y_t = 0.0f;
         int n = N, do_prop = 1;
         void* params[] = {
-            &dh, &dlw, &drng,
+            &dh, &dlw, &drng, &dchi2,
             &rho, &sigma_z, &mu, &nu_state, &nu_obs,
-            &y_t, &n, &do_prop
+            &C_obs, &y_t, &n, &do_prop
         };
         cuLaunchKernel(fn_propagate_weight, G, 1, 1, B, 1, 1, 0, 0, params, NULL);
     }
@@ -227,6 +254,7 @@ int main() {
     printf("  min=%.4f  max=%.4f\n", min_v, max_v);
 
     free(h_h);
+    cudaFree(d_chi2_vals); cudaFree(d_chi2_normals);
     cudaFree(d_rng); cudaFree(d_h); cudaFree(d_log_w); cudaFree(d_noise);
     cuModuleUnload(mod);
     return 0;

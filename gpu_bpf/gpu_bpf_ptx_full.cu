@@ -33,6 +33,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
+#include <curand.h>
 #include <thrust/device_ptr.h>
 #include <thrust/scan.h>
 #include <thrust/system/cuda/execution_policy.h>
@@ -40,6 +41,24 @@
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
+
+// =============================================================================
+// Chi2 square-sum kernel: chi2[i] = sum(normals[i*nu .. (i+1)*nu - 1]^2)
+// =============================================================================
+
+__global__ void chi2_square_sum_k(float* __restrict__ chi2,
+                                   const float* __restrict__ normals,
+                                   int nu, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float sum = 0.0f;
+    const float* base = normals + i * nu;
+    for (int k = 0; k < nu; k++) {
+        float z = base[k];
+        sum += z * z;
+    }
+    chi2[i] = sum;
+}
 
 // =============================================================================
 // PTX Module — 13 kernels
@@ -219,6 +238,29 @@ GpuBpfState* gpu_bpf_create(int n_particles, float rho, float sigma_z, float mu,
     cudaMalloc(&s->d_noise,   n_particles * sizeof(float));
     cudaMalloc(&s->d_var,     sizeof(float));
 
+    // Chi2 pre-generation for Student-t state noise
+    s->nu_int = (nu_state > 0.0f) ? (int)(nu_state + 0.5f) : 0;
+    s->d_chi2 = NULL;
+    s->d_chi2_normals = NULL;
+    s->curand_gen = NULL;
+    if (s->nu_int > 0) {
+        cudaMalloc(&s->d_chi2, n_particles * sizeof(float));
+        cudaMalloc(&s->d_chi2_normals, (size_t)n_particles * s->nu_int * sizeof(float));
+        curandGenerator_t gen;
+        curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
+        curandSetPseudoRandomGeneratorSeed(gen, (unsigned long long)seed * 31337ULL);
+        curandSetStream(gen, s->stream);
+        s->curand_gen = (void*)gen;
+    }
+
+    // Precompute Student-t observation constant: lgamma((nu+1)/2) - lgamma(nu/2) - 0.5*log(nu*pi)
+    if (nu_obs > 0.0f) {
+        s->C_obs = (float)(lgamma((nu_obs + 1.0) / 2.0) - lgamma(nu_obs / 2.0)
+                           - 0.5 * log(nu_obs * 3.14159265358979323846));
+    } else {
+        s->C_obs = 0.0f;
+    }
+
     int g = s->grid, b = s->block;
     cudaStream_t st = s->stream;
 
@@ -262,6 +304,9 @@ void gpu_bpf_destroy(GpuBpfState* s) {
     cudaFree(s->d_scalars);
     cudaFree(s->d_noise);
     cudaFree(s->d_var);
+    if (s->d_chi2) cudaFree(s->d_chi2);
+    if (s->d_chi2_normals) cudaFree(s->d_chi2_normals);
+    if (s->curand_gen) curandDestroyGenerator((curandGenerator_t)s->curand_gen);
     free(s);
 }
 
@@ -287,16 +332,27 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
     CUdeviceptr dnoise= (CUdeviceptr)(uintptr_t)s->d_noise;
     CUdeviceptr dvar  = (CUdeviceptr)(uintptr_t)s->d_var;
 
-    // 1. Propagate + weight (PTX: fused PCG32 + ICDF + OU + obs weight)
-    //    propagate_weight(u64 h, u64 log_w, u64 rng,
+    // 1. Generate chi2 variates if Student-t state noise
+    CUdeviceptr dchi2 = (CUdeviceptr)(uintptr_t)s->d_chi2;
+    if (s->nu_int > 0 && s->timestep > 0) {
+        curandGenerator_t gen = (curandGenerator_t)s->curand_gen;
+        curandGenerateNormal(gen, s->d_chi2_normals,
+                             (size_t)n * s->nu_int, 0.0f, 1.0f);
+        int chi_g = (n + b - 1) / b;
+        chi2_square_sum_k<<<chi_g, b, 0, st>>>(s->d_chi2, s->d_chi2_normals,
+                                                  s->nu_int, n);
+    }
+
+    // 2. Propagate + weight (PTX: fused PCG32 + ICDF + OU + obs weight)
+    //    propagate_weight(u64 h, u64 log_w, u64 rng, u64 chi2,
     //                     f32 rho, f32 sigma_z, f32 mu, f32 nu_state, f32 nu_obs,
-    //                     f32 y_t, s32 n, s32 do_prop)
+    //                     f32 C_obs, f32 y_t, s32 n, s32 do_prop)
     {
         int do_prop = (s->timestep > 0) ? 1 : 0;
         void* params[] = {
-            &dh, &dlw, &drng,
+            &dh, &dlw, &drng, &dchi2,
             &s->rho, &s->sigma_z, &s->mu, &s->nu_state, &s->nu_obs,
-            &y_t, &n, &do_prop
+            &s->C_obs, &y_t, &n, &do_prop
         };
         ptx_launch(g_ptx.propagate_weight, st, g, b, 0, params);
     }
