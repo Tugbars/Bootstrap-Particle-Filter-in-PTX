@@ -36,10 +36,13 @@ typedef struct {
     float* d_wh;
     curandState* d_rng;
     float* d_scalars;       // [4]: max_lw, sum_w, h_est, log_lik
+    float* d_noise;         // [N]: standard normal samples for Silverman jitter
+    float* d_var;           // [1]: variance accumulator scalar
     int n_particles;
     int block, grid;
     cudaStream_t stream;
     float rho, sigma_z, mu, nu_state, nu_obs;
+    float silverman_shrink; // 0.0 = off, 0.5 = conservative, 0.7 = moderate
     unsigned long long host_rng_state;
     int timestep;
 } GpuBpfState;

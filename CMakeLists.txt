@@ -182,7 +182,7 @@ set_target_properties(gpu_bpf PROPERTIES
 )
 
 # ==============================================================================
-# Target: test_bpf_matched_dgp (matched-DGP test suite)
+# Target: test_bpf_matched_dgp (matched-DGP test suite — nvcc kernels)
 # ==============================================================================
 
 add_executable(test_bpf_matched_dgp test_bpf_matched_dgp.cu)
@@ -196,6 +196,59 @@ target_link_libraries(test_bpf_matched_dgp PRIVATE
 set_target_properties(test_bpf_matched_dgp PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+# ==============================================================================
+# Library: gpu_bpf_ptx (HYBRID: PTX weight processing + cuRAND propagation)
+#
+# Drop-in replacement for gpu_bpf. BPF reductions/resample run from
+# hand-written PTX loaded at runtime. APF/IMM use nvcc-compiled kernels.
+# ==============================================================================
+
+add_library(gpu_bpf_ptx STATIC gpu_bpf/gpu_bpf_ptx.cu)
+
+target_link_libraries(gpu_bpf_ptx PRIVATE
+    CUDA::cuda_driver
+    CUDA::cudart
+    CUDA::curand
+)
+
+target_include_directories(gpu_bpf_ptx PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/gpu_bpf
+    ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+set_target_properties(gpu_bpf_ptx PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+)
+
+# ==============================================================================
+# Target: test_bpf_ptx (matched-DGP test suite — PTX hybrid path)
+#
+# Same test harness, linked against gpu_bpf_ptx instead of gpu_bpf.
+# Requires bpf_kernels.ptx in working directory at runtime.
+# ==============================================================================
+
+add_executable(test_bpf_ptx test_bpf_matched_dgp.cu)
+
+target_link_libraries(test_bpf_ptx PRIVATE
+    gpu_bpf_ptx
+    CUDA::cuda_driver
+    CUDA::cudart
+    CUDA::curand
+)
+
+set_target_properties(test_bpf_ptx PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+# Copy PTX to build dir so test_bpf_ptx can find it
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/bpf_kernels.ptx"
+    "${CMAKE_CURRENT_BINARY_DIR}/bpf_kernels.ptx"
+    COPYONLY
 )
 
 # ==============================================================================

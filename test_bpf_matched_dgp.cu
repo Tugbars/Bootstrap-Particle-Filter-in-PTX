@@ -1035,7 +1035,7 @@ int main(int argc, char** argv) {
     int imm_per_model = 2000;
     int mc_particles  = 10000;
     int base_seed     = 42;
-    const char* csv_path = "csv_bank/bpf_output.csv";
+    const char* csv_path = NULL; //"csv_bank/bpf_output.csv";
     int csv_scenario     = 0;    // 0 = all
     int csv_only         = 0;    // if --csv-only, skip tests
     int no_imm           = 1;    // if --no-imm, skip IMM everywhere
