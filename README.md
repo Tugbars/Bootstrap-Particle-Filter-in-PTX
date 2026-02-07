@@ -1,8 +1,8 @@
-# BPF Bootstrap Particle Filter — Hand-Written PTX (SM_120 / RTX 5080)
+# BPF Bootstrap Particle Filter, Hand-Written in PTX (SM_120 / RTX 5080)
 
 ## Results
 
-Stochastic Volatility tracking across 5000 ticks — true latent log-volatility (white) vs BPF filtered estimate (blue). All scenarios use zero model mismatch (filter knows the true DGP parameters).
+Stochastic Volatility tracking across 5000 ticks, true latent log-volatility (white) vs BPF filtered estimate (blue). All scenarios use zero model mismatch (filter knows the true DGP parameters).
 
 <img width="1907" height="947" alt="image" src="https://github.com/user-attachments/assets/5528f997-065e-4018-a5d6-67f729a348b6" />
 
