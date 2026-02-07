@@ -3,7 +3,7 @@
 ## What This Is
 
 A complete Bootstrap Particle Filter for Stochastic Volatility estimation,
-written in raw NVIDIA PTX assembly targeting **SM_100 (Blackwell / RTX 5080)**.
+written in raw NVIDIA PTX assembly targeting **SM_120 (Blackwell / RTX 5080)**.
 
 This is an educational companion to the CUDA C implementation (`gpu_bpf.cu`).
 Every kernel that the CUDA compiler (`nvcc`) would generate is written here by hand,
