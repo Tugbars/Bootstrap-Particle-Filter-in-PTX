@@ -2,6 +2,15 @@
 
 ## What This Is
 
+<img width="1907" height="947" alt="image" src="https://github.com/user-attachments/assets/5528f997-065e-4018-a5d6-67f729a348b6" />
+
+<img width="1908" height="947" alt="image" src="https://github.com/user-attachments/assets/c68c4be1-8cd7-40f6-a10a-39bd590f76d0" />
+
+<img width="1908" height="947" alt="image" src="https://github.com/user-attachments/assets/af15aa53-5f50-4eed-8e3e-77c9b5a82e6e" />
+
+<img width="1907" height="587" alt="image" src="https://github.com/user-attachments/assets/00e8d2b3-b583-4594-b4bc-69504ec75023" />
+
+
 A complete Bootstrap Particle Filter for Stochastic Volatility estimation,
 written in raw NVIDIA PTX assembly targeting **SM_120 (Blackwell / RTX 5080)**.
 
