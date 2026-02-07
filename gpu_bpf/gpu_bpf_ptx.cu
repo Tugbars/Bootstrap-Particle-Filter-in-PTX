@@ -51,42 +51,94 @@ static int          g_ptx_loaded = 0;
 static void ensure_ptx_loaded() {
     if (g_ptx_loaded) return;
 
-    // Try several paths for the PTX file
-    const char* paths[] = {
+    // Force CUDA runtime to establish a context (Driver API needs one)
+    cudaFree(0);
+
+    // Try to load precompiled cubin first, fall back to PTX JIT
+    const char* cubin_paths[] = {
+        "bpf_kernels.cubin",
+        NULL
+    };
+    const char* ptx_paths[] = {
         "bpf_kernels.ptx",
         "./bpf_kernels.ptx",
         NULL
     };
 
-    char* ptx_source = NULL;
-    for (int i = 0; paths[i]; i++) {
-        FILE* f = fopen(paths[i], "rb");
+    // Try cubin first
+    for (int i = 0; cubin_paths[i]; i++) {
+        FILE* f = fopen(cubin_paths[i], "rb");
         if (!f) continue;
         fseek(f, 0, SEEK_END);
         long sz = ftell(f);
         fseek(f, 0, SEEK_SET);
-        ptx_source = (char*)malloc(sz + 1);
-        fread(ptx_source, 1, sz, f);
-        ptx_source[sz] = '\0';
+        char* buf = (char*)malloc(sz);
+        fread(buf, 1, sz, f);
         fclose(f);
-        fprintf(stderr, "[PTX] Loaded from: %s (%ld bytes)\n", paths[i], sz);
-        break;
+        CUresult err = cuModuleLoadData(&g_ptx_module, buf);
+        free(buf);
+        if (err == CUDA_SUCCESS) {
+            fprintf(stderr, "[PTX] Loaded cubin from: %s (%ld bytes)\n", cubin_paths[i], sz);
+            goto extract_functions;
+        }
+        fprintf(stderr, "[PTX] cubin load failed, trying PTX JIT...\n");
     }
 
-    if (!ptx_source) {
-        fprintf(stderr, "[PTX] ERROR: Cannot find bpf_kernels.ptx\n");
-        exit(1);
+    // Fall back to PTX JIT
+    {
+        char* ptx_source = NULL;
+        for (int i = 0; ptx_paths[i]; i++) {
+            FILE* f = fopen(ptx_paths[i], "rb");
+            if (!f) continue;
+            fseek(f, 0, SEEK_END);
+            long sz = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            ptx_source = (char*)malloc(sz + 1);
+            fread(ptx_source, 1, sz, f);
+            ptx_source[sz] = '\0';
+            fclose(f);
+            fprintf(stderr, "[PTX] Loaded source from: %s (%ld bytes)\n", ptx_paths[i], sz);
+            break;
+        }
+
+        if (!ptx_source) {
+            fprintf(stderr, "[PTX] ERROR: Cannot find bpf_kernels.cubin or bpf_kernels.ptx\n");
+            exit(1);
+        }
+
+        // JIT with error log
+        char jit_error_log[4096] = {0};
+        char jit_info_log[4096] = {0};
+        CUjit_option opts[] = {
+            CU_JIT_ERROR_LOG_BUFFER,
+            CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+            CU_JIT_INFO_LOG_BUFFER,
+            CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
+            CU_JIT_TARGET
+        };
+        void* vals[] = {
+            (void*)jit_error_log,
+            (void*)(uintptr_t)sizeof(jit_error_log),
+            (void*)jit_info_log,
+            (void*)(uintptr_t)sizeof(jit_info_log),
+            (void*)(uintptr_t)CU_TARGET_COMPUTE_120
+        };
+
+        CUresult err = cuModuleLoadDataEx(&g_ptx_module, ptx_source, 5, opts, vals);
+        free(ptx_source);
+
+        if (err != CUDA_SUCCESS) {
+            const char* msg;
+            cuGetErrorString(err, &msg);
+            fprintf(stderr, "[PTX] cuModuleLoadDataEx failed: %s\n", msg);
+            if (jit_error_log[0]) fprintf(stderr, "[PTX] JIT error: %s\n", jit_error_log);
+            if (jit_info_log[0])  fprintf(stderr, "[PTX] JIT info: %s\n", jit_info_log);
+            exit(1);
+        }
+        if (jit_info_log[0]) fprintf(stderr, "[PTX] JIT info: %s\n", jit_info_log);
     }
 
-    CUresult err = cuModuleLoadData(&g_ptx_module, ptx_source);
-    free(ptx_source);
-
-    if (err != CUDA_SUCCESS) {
-        const char* msg;
-        cuGetErrorString(err, &msg);
-        fprintf(stderr, "[PTX] cuModuleLoadData failed: %s\n", msg);
-        exit(1);
-    }
+extract_functions:
 
     // Extract kernel handles
     cuModuleGetFunction(&g_ptx.set_scalar,     g_ptx_module, "bpf_set_scalar");
@@ -197,7 +249,6 @@ static inline float host_pcg32_float(unsigned long long* state) {
 GpuBpfState* gpu_bpf_create(int n_particles, float rho, float sigma_z, float mu,
                               float nu_state, float nu_obs, int seed) {
     // Ensure PTX module is loaded (idempotent)
-    cuInit(0);
     ensure_ptx_loaded();
 
     GpuBpfState* s = (GpuBpfState*)calloc(1, sizeof(GpuBpfState));
