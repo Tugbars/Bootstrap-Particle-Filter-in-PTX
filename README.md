@@ -1,6 +1,8 @@
 # BPF Bootstrap Particle Filter — Hand-Written PTX (SM_120 / RTX 5080)
 
-## What This Is
+## Results
+
+Stochastic Volatility tracking across 5000 ticks — true latent log-volatility (white) vs BPF filtered estimate (blue). All scenarios use zero model mismatch (filter knows the true DGP parameters).
 
 <img width="1907" height="947" alt="image" src="https://github.com/user-attachments/assets/5528f997-065e-4018-a5d6-67f729a348b6" />
 
@@ -10,9 +12,16 @@
 
 <img width="1907" height="587" alt="image" src="https://github.com/user-attachments/assets/00e8d2b3-b583-4594-b4bc-69504ec75023" />
 
+**Performance:** 50K particles, ~130 µs/tick on RTX 5080. Hand-written PTX runs 15% faster than nvcc-compiled CUDA C — `ex2.approx`, `rcp.approx`, no `cvta.to.global` overhead, tighter register allocation.
+
+## What This Is
 
 A complete Bootstrap Particle Filter for Stochastic Volatility estimation,
 written in raw NVIDIA PTX assembly targeting **SM_120 (Blackwell / RTX 5080)**.
+
+8 hand-written kernels implement the full BPF pipeline: propagate + weight,
+log-weight normalization (reduce-max, exp-sub, reduce-sum, scale),
+log-likelihood accumulation, and systematic resampling via binary search.
 
 This is an educational companion to the CUDA C implementation (`gpu_bpf.cu`).
 Every kernel that the CUDA compiler (`nvcc`) would generate is written here by hand,
@@ -29,8 +38,8 @@ so you can see exactly what happens at the instruction level.
 
 ```bash
 # Option 1: Ahead-of-time compile PTX → cubin, then load at runtime
-ptxas -arch=sm_100 -o bpf_kernels.cubin bpf_kernels.ptx
-nvcc -o bpf_demo bpf_ptx_host.cu -lcuda -arch=sm_100
+ptxas -arch=sm_120 -o bpf_kernels.cubin bpf_kernels.ptx
+nvcc -o bpf_demo bpf_ptx_host.cu -lcuda -arch=sm_120
 ./bpf_demo bpf_kernels.ptx
 
 # Option 2: JIT — the driver API compiles PTX at load time
@@ -160,17 +169,17 @@ only one actually writes. Critical for the binary search in resampling.
 3. **Student-t PDF** — Needs `lgamma()` which is a long polynomial
    approximation in PTX. Better to link a device function from a .cu file.
 
-4. **Warp-level Primitives** — SM_100 supports `shfl.sync` for warp-level
+4. **Warp-level Primitives** — SM_120 supports `shfl.sync` for warp-level
    reductions (faster than shared memory for small reductions).
 
-## SM_100 (Blackwell) Specifics
+## SM_120 (Blackwell) Specifics
 
-- 128 CUDA cores per SM, up from 128 on Ada (SM_89)
+- 128 CUDA cores per SM, up from 128 on Ada (SM_100)
 - Native `atom.global.add.f32` — no CAS needed for float atomicAdd
-- `ex2.approx.f32` precision: ~23 bits mantissa (same as SM_89)
+- `ex2.approx.f32` precision: ~23 bits mantissa (same as SM_100)
 - 256 KB shared memory per SM (configurable L1/shared split)
 - Max 1024 threads per block, 32 warps per SM
-- PTX ISA 8.5+ required for SM_100 features
+- PTX ISA 8.8+ required for SM_120 features
 
 ## The Pipeline (CUDA C → PTX Mapping)
 
