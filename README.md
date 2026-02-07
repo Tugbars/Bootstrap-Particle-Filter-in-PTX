@@ -1,4 +1,4 @@
-# BPF Bootstrap Particle Filter — Hand-Written PTX (SM_100 / RTX 5080)
+# BPF Bootstrap Particle Filter — Hand-Written PTX (SM_120 / RTX 5080)
 
 ## What This Is
 
