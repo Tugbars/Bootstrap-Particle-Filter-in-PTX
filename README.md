@@ -157,20 +157,41 @@ setp.lt.f32   %p_lt, %f_cdf_mid, %f_target;   // set predicate
 This avoids warp divergence — all threads execute both instructions but
 only one actually writes. Critical for the binary search in resampling.
 
-## What's Missing (Left as Exercises)
+## What We Built (and What's Left)
 
-1. **PRNG in PTX** — The propagation kernel needs random numbers. You could
-   implement PCG32 or xoshiro256 in PTX (all integer arithmetic).
+### Implemented in PTX
 
-2. **Blelloch Prefix Scan** — We still use thrust for `inclusive_scan`.
-   Writing a work-efficient parallel scan in PTX is ~200 lines but very
-   educational.
+1. **PCG32 PRNG** — Full PCG XSH-RR in PTX (64-bit state, 16 bytes/particle).
+   Seeded per-particle with unique odd increments.
 
-3. **Student-t PDF** — Needs `lgamma()` which is a long polynomial
-   approximation in PTX. Better to link a device function from a .cu file.
+2. **Inverse CDF Normal Generation** — Full Acklam rational approximation
+   (degree-6/5 central, degree-6/4 tails). ~1e-9 relative accuracy in float32.
 
-4. **Warp-level Primitives** — SM_120 supports `shfl.sync` for warp-level
-   reductions (faster than shared memory for small reductions).
+3. **Fused Propagate+Weight Kernel** — OU transition, Student-t state noise
+   (via host-pregenerated chi² from cuRAND), and Student-t observation
+   log-weights with precomputed lgamma constant. One kernel launch per tick.
+
+4. **All 13 BPF Kernels in PTX** — init_rng, init_particles,
+   propagate_weight, set_scalar, reduce_max, reduce_sum, exp_sub, scale_wh,
+   compute_loglik, resample, compute_var, gen_noise, silverman_jitter.
+
+### Still Using CUDA C / Libraries
+
+1. **Thrust Prefix Scan** — Resampling CDF still uses `thrust::inclusive_scan`.
+   Writing a Blelloch scan in PTX is ~200 lines but would eliminate the last
+   library dependency in the BPF path.
+
+2. **cuRAND for Chi² Generation** — Bulk normal generation + square-sum for
+   Student-t state noise. Fast (adds ~10μs/tick) but means the BPF isn't
+   fully cuRAND-free when nu_state > 0.
+
+3. **Warp-level Primitives** — SM_120 supports `shfl.sync` for warp-level
+   reductions. The current reduce kernels use shared memory; warp shuffles
+   would save ~30% on the reduction passes.
+
+4. **APF / IMM** — The Auxiliary Particle Filter and Interacting Multiple
+   Model filter remain nvcc-compiled. They share the same test harness but
+   use cuRAND throughout.
 
 ## SM_120 (Blackwell) Specifics
 

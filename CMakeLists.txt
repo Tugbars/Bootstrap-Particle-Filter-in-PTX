@@ -1,6 +1,12 @@
 ################################################################################
 # CMakeLists.txt — BPF PTX Educational Project
 #
+# Directory layout:
+#   gpu_bpf/          — Host-side BPF/APF/IMM implementations
+#   ptx_assembly/     — Hand-written PTX kernels and pre-compiled cubins
+#   tests/            — Test harnesses and diagnostics
+#   csv_bank/         — Data files
+#
 # Cross-platform: auto-detects MSVC (Windows) vs ICX/GCC (Linux)
 # Device compiler: NVCC (CUDA Toolkit 13.x+)
 # Target GPU:     SM_120 (Blackwell / RTX 5080)
@@ -59,7 +65,7 @@ if(MSVC)
     set(CMAKE_C_FLAGS_DEBUG     "/W4 /Od /Zi")
     set(CMAKE_CXX_FLAGS_DEBUG   "/W4 /Od /Zi")
 
-    # NVCC → MSVC forwarding (Release)
+    # NVCC -> MSVC forwarding (Release)
     set(CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} -Xcompiler=/W4,/O2")
     set(CMAKE_CUDA_FLAGS_DEBUG   "${CMAKE_CUDA_FLAGS_DEBUG} -Xcompiler=/W4,/Od,/Zi")
 
@@ -68,7 +74,6 @@ elseif(CMAKE_CXX_COMPILER_ID MATCHES "IntelLLVM")
     message(STATUS "Detected Intel ICX host compiler")
 
     if(WIN32)
-        # ICX on Windows uses MSVC-compatible flags
         set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   /W4 /O2")
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4 /O2")
         set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=/W4,/O2")
@@ -95,7 +100,7 @@ endif()
 find_package(CUDAToolkit REQUIRED)
 
 # ==============================================================================
-# PTX compilation (ahead-of-time PTX → cubin)
+# PTX compilation (ahead-of-time PTX -> cubin)
 # ==============================================================================
 
 find_program(PTXAS_EXECUTABLE ptxas
@@ -111,10 +116,11 @@ else()
                     "JIT compilation at runtime still works.")
 endif()
 
-set(PTX_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/bpf_kernels.ptx")
+# --- Weight-only PTX (7 kernels) ---
+set(PTX_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/ptx_assembly/bpf_kernels.ptx")
 set(CUBIN_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/bpf_kernels.cubin")
 
-if(PTXAS_EXECUTABLE)
+if(PTXAS_EXECUTABLE AND EXISTS "${PTX_SOURCE}")
     add_custom_command(
         OUTPUT  "${CUBIN_OUTPUT}"
         COMMAND "${PTXAS_EXECUTABLE}"
@@ -123,45 +129,41 @@ if(PTXAS_EXECUTABLE)
                 "${PTX_SOURCE}"
                 --verbose
         DEPENDS "${PTX_SOURCE}"
-        COMMENT "Compiling PTX -> cubin (SM_120)"
+        COMMENT "Compiling bpf_kernels.ptx -> cubin (SM_120)"
         VERBATIM
     )
     add_custom_target(ptx_cubin ALL DEPENDS "${CUBIN_OUTPUT}")
 endif()
 
-# Copy PTX source to build dir so the demo can find it
-configure_file(
-    "${PTX_SOURCE}"
-    "${CMAKE_CURRENT_BINARY_DIR}/bpf_kernels.ptx"
-    COPYONLY
-)
+if(EXISTS "${PTX_SOURCE}")
+    configure_file("${PTX_SOURCE}" "${CMAKE_CURRENT_BINARY_DIR}/bpf_kernels.ptx" COPYONLY)
+endif()
 
-# ==============================================================================
-# Target: bpf_ptx_demo (host driver that loads PTX at runtime)
-# ==============================================================================
+# --- Full PTX (13 kernels) ---
+set(PTX_FULL_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/ptx_assembly/bpf_kernels_full.ptx")
+set(CUBIN_FULL_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/bpf_kernels_full.cubin")
 
-add_executable(bpf_ptx_demo bpf_ptx_host.cu)
+if(PTXAS_EXECUTABLE AND EXISTS "${PTX_FULL_SOURCE}")
+    add_custom_command(
+        OUTPUT  "${CUBIN_FULL_OUTPUT}"
+        COMMAND "${PTXAS_EXECUTABLE}"
+                -arch=sm_120
+                -o "${CUBIN_FULL_OUTPUT}"
+                "${PTX_FULL_SOURCE}"
+                --verbose
+        DEPENDS "${PTX_FULL_SOURCE}"
+        COMMENT "Compiling bpf_kernels_full.ptx -> cubin (SM_120)"
+        VERBATIM
+    )
+    add_custom_target(ptx_cubin_full ALL DEPENDS "${CUBIN_FULL_OUTPUT}")
+endif()
 
-target_link_libraries(bpf_ptx_demo PRIVATE
-    CUDA::cuda_driver
-    CUDA::cudart
-)
-
-target_include_directories(bpf_ptx_demo PRIVATE
-    ${CUDAToolkit_INCLUDE_DIRS}
-)
-
-set_target_properties(bpf_ptx_demo PROPERTIES
-    CUDA_SEPARABLE_COMPILATION OFF
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-)
-
-if(PTXAS_EXECUTABLE)
-    add_dependencies(bpf_ptx_demo ptx_cubin)
+if(EXISTS "${PTX_FULL_SOURCE}")
+    configure_file("${PTX_FULL_SOURCE}" "${CMAKE_CURRENT_BINARY_DIR}/bpf_kernels_full.ptx" COPYONLY)
 endif()
 
 # ==============================================================================
-# Library: gpu_bpf (BPF + APF + IMM runtime kernels)
+# Library: gpu_bpf (BPF + APF + IMM — nvcc compiled kernels)
 # ==============================================================================
 
 add_library(gpu_bpf STATIC gpu_bpf/gpu_bpf.cu)
@@ -182,27 +184,7 @@ set_target_properties(gpu_bpf PROPERTIES
 )
 
 # ==============================================================================
-# Target: test_bpf_matched_dgp (matched-DGP test suite — nvcc kernels)
-# ==============================================================================
-
-add_executable(test_bpf_matched_dgp test_bpf_matched_dgp.cu)
-
-target_link_libraries(test_bpf_matched_dgp PRIVATE
-    gpu_bpf
-    CUDA::cudart
-    CUDA::curand
-)
-
-set_target_properties(test_bpf_matched_dgp PROPERTIES
-    CUDA_SEPARABLE_COMPILATION OFF
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-)
-
-# ==============================================================================
 # Library: gpu_bpf_ptx (HYBRID: PTX weight processing + cuRAND propagation)
-#
-# Drop-in replacement for gpu_bpf. BPF reductions/resample run from
-# hand-written PTX loaded at runtime. APF/IMM use nvcc-compiled kernels.
 # ==============================================================================
 
 add_library(gpu_bpf_ptx STATIC gpu_bpf/gpu_bpf_ptx.cu)
@@ -224,38 +206,10 @@ set_target_properties(gpu_bpf_ptx PROPERTIES
 )
 
 # ==============================================================================
-# Target: test_bpf_ptx (matched-DGP test suite — PTX hybrid path)
-#
-# Same test harness, linked against gpu_bpf_ptx instead of gpu_bpf.
-# Requires bpf_kernels.ptx in working directory at runtime.
-# ==============================================================================
-
-add_executable(test_bpf_ptx test_bpf_matched_dgp.cu)
-
-target_link_libraries(test_bpf_ptx PRIVATE
-    gpu_bpf_ptx
-    CUDA::cuda_driver
-    CUDA::cudart
-    CUDA::curand
-)
-
-set_target_properties(test_bpf_ptx PROPERTIES
-    CUDA_SEPARABLE_COMPILATION OFF
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-)
-
-# Copy PTX to build dir so test_bpf_ptx can find it
-configure_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/bpf_kernels.ptx"
-    "${CMAKE_CURRENT_BINARY_DIR}/bpf_kernels.ptx"
-    COPYONLY
-)
-
-# ==============================================================================
-# Library: gpu_bpf_ptx_full (100% PTX for BPF, cuRAND only for APF)
+# Library: gpu_bpf_ptx_full (100% PTX BPF + cuRAND chi2 pregeneration)
 #
 # All 13 BPF kernels in hand-written PTX. PCG32 PRNG, ICDF normals.
-# Zero cuRAND in BPF path. APF/IMM still nvcc-compiled.
+# cuRAND used only for bulk chi2 generation. APF/IMM still nvcc-compiled.
 # ==============================================================================
 
 add_library(gpu_bpf_ptx_full STATIC gpu_bpf/gpu_bpf_ptx_full.cu)
@@ -277,13 +231,69 @@ set_target_properties(gpu_bpf_ptx_full PROPERTIES
 )
 
 # ==============================================================================
-# Target: test_bpf_ptx_full (full PTX BPF + nvcc APF)
-#
-# Uses gpu_bpf_full.cuh (PCG32 RNG state) instead of gpu_bpf.cuh.
-# Requires bpf_kernels_full.cubin or bpf_kernels_full.ptx in cwd.
+# Target: bpf_ptx_demo (standalone PTX loader demo)
 # ==============================================================================
 
-add_executable(test_bpf_ptx_full test_bpf_matched_dgp.cu)
+add_executable(bpf_ptx_demo gpu_bpf/bpf_ptx_host.cu)
+
+target_link_libraries(bpf_ptx_demo PRIVATE
+    CUDA::cuda_driver
+    CUDA::cudart
+)
+
+target_include_directories(bpf_ptx_demo PRIVATE
+    ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+set_target_properties(bpf_ptx_demo PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+if(TARGET ptx_cubin)
+    add_dependencies(bpf_ptx_demo ptx_cubin)
+endif()
+
+# ==============================================================================
+# Target: test_bpf_matched_dgp (matched-DGP test suite — nvcc kernels)
+# ==============================================================================
+
+add_executable(test_bpf_matched_dgp tests/test_bpf_matched_dgp.cu)
+
+target_link_libraries(test_bpf_matched_dgp PRIVATE
+    gpu_bpf
+    CUDA::cudart
+    CUDA::curand
+)
+
+set_target_properties(test_bpf_matched_dgp PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+# ==============================================================================
+# Target: test_bpf_ptx (matched-DGP — PTX hybrid path)
+# ==============================================================================
+
+add_executable(test_bpf_ptx tests/test_bpf_matched_dgp.cu)
+
+target_link_libraries(test_bpf_ptx PRIVATE
+    gpu_bpf_ptx
+    CUDA::cuda_driver
+    CUDA::cudart
+    CUDA::curand
+)
+
+set_target_properties(test_bpf_ptx PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+# ==============================================================================
+# Target: test_bpf_ptx_full (full PTX BPF + nvcc APF)
+# ==============================================================================
+
+add_executable(test_bpf_ptx_full tests/test_bpf_matched_dgp.cu)
 
 target_compile_definitions(test_bpf_ptx_full PRIVATE USE_PTX_FULL=1)
 
@@ -303,27 +313,15 @@ set_target_properties(test_bpf_ptx_full PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
 )
 
-# Copy full PTX/cubin to build dir
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bpf_kernels_full.ptx")
-    configure_file(
-        "${CMAKE_CURRENT_SOURCE_DIR}/bpf_kernels_full.ptx"
-        "${CMAKE_CURRENT_BINARY_DIR}/bpf_kernels_full.ptx"
-        COPYONLY
-    )
-endif()
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bpf_kernels_full.cubin")
-    configure_file(
-        "${CMAKE_CURRENT_SOURCE_DIR}/bpf_kernels_full.cubin"
-        "${CMAKE_CURRENT_BINARY_DIR}/bpf_kernels_full.cubin"
-        COPYONLY
-    )
+if(TARGET ptx_cubin_full)
+    add_dependencies(test_bpf_ptx_full ptx_cubin_full)
 endif()
 
 # ==============================================================================
 # Print summary
 # ==============================================================================
 
-message(STATUS "───────────────────────────────────────────")
+message(STATUS "-------------------------------------------")
 message(STATUS "BPF PTX Project Configuration")
 message(STATUS "  Platform:          ${CMAKE_SYSTEM_NAME}")
 message(STATUS "  Host C compiler:   ${CMAKE_C_COMPILER_ID} (${CMAKE_C_COMPILER})")
@@ -334,4 +332,4 @@ message(STATUS "  CUDA architectures:${CMAKE_CUDA_ARCHITECTURES}")
 message(STATUS "  CUDA toolkit:      ${CUDAToolkit_TARGET_DIR}")
 message(STATUS "  ptxas:             ${PTXAS_EXECUTABLE}")
 message(STATUS "  Build type:        ${CMAKE_BUILD_TYPE}")
-message(STATUS "───────────────────────────────────────────")
+message(STATUS "-------------------------------------------")
