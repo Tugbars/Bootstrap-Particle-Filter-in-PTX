@@ -27,12 +27,26 @@ This is an educational companion to the CUDA C implementation (`gpu_bpf.cu`).
 Every kernel that the CUDA compiler (`nvcc`) would generate is written here by hand,
 so you can see exactly what happens at the instruction level.
 
-## Files
+##  Files
 
-| File | Description |
-|------|-------------|
-| `bpf_kernels.ptx` | All 8 BPF kernels in raw PTX |
-| `bpf_ptx_host.cu` | Host driver using CUDA Driver API to load & launch PTX |
+```
+├── gpu_bpf/
+│   ├── gpu_bpf.cu / gpu_bpf.cuh          — nvcc-compiled BPF/APF/IMM runtime
+│   ├── gpu_bpf_ptx.cu / gpu_bpf.cuh      — Hybrid: PTX weights + cuRAND propagation
+│   ├── gpu_bpf_ptx_full.cu / gpu_bpf_full.cuh — Full PTX: 13 BPF kernels, PCG32 RNG
+│   └── bpf_ptx_host.cu                   — Standalone PTX loader demo
+├── ptx_assembly/
+│   ├── bpf_kernels.ptx                   — 7 weight-processing kernels (hybrid path)
+│   ├── bpf_kernels_full.ptx              — All 13 BPF kernels: PCG32, ICDF, propagate
+│   └── *.cubin                           — Pre-compiled binaries (SM_120)
+├── tests/
+│   ├── test_bpf_matched_dgp.cu           — Matched-DGP test suite (all filter variants)
+│   ├── bench_particle_scaling.cu         — Latency vs particle count benchmark
+│   └── test_icdf_diag.cu                 — ICDF/RNG accuracy diagnostics
+├── csv_bank/                              — Output data files
+├── CMakeLists.txt                         — Cross-platform build (MSVC / ICX / GCC)
+└── README.m
+```
 
 ## Build & Run
 
