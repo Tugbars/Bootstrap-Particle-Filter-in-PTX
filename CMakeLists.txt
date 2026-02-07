@@ -45,7 +45,7 @@ set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_HOST_COMPILER "${CMAKE_CXX_COMPILER}")
 
 # Target SM_100 (Blackwell). Also generate PTX for forward compat.
-set(CMAKE_CUDA_ARCHITECTURES "100")
+set(CMAKE_CUDA_ARCHITECTURES "120")
 
 # NVCC flags
 #   -Xcompiler flags get forwarded to ICX
@@ -134,20 +134,44 @@ if(PTXAS_EXECUTABLE)
 endif()
 
 # ==============================================================================
-# Target: bpf_cuda_reference (original CUDA C version for comparison)
-#
-# Uncomment if you have gpu_bpf.cu + gpu_bpf.cuh alongside this project.
+# Library: gpu_bpf (BPF + APF + IMM runtime kernels)
 # ==============================================================================
 
-# if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/gpu_bpf.cu")
-#     add_library(bpf_cuda_ref STATIC gpu_bpf.cu)
-#     target_link_libraries(bpf_cuda_ref PRIVATE
-#         CUDA::cudart
-#     )
-#     set_target_properties(bpf_cuda_ref PROPERTIES
-#         CUDA_SEPARABLE_COMPILATION OFF
-#     )
-# endif()
+add_library(gpu_bpf STATIC gpu_bpf/gpu_bpf.cu)
+
+target_link_libraries(gpu_bpf PRIVATE
+    CUDA::cudart
+    CUDA::curand
+)
+
+target_include_directories(gpu_bpf PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+set_target_properties(gpu_bpf PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+)
+
+# ==============================================================================
+# Target: test_bpf_matched_dgp (matched-DGP test suite)
+#
+#   Tests 1-6: BPF/APF/IMM accuracy, particle sweep, head-to-head,
+#              IMM model selection, MC variance, throughput benchmark
+# ==============================================================================
+
+add_executable(test_bpf_matched_dgp test_bpf_matched_dgp.cu)
+
+target_link_libraries(test_bpf_matched_dgp PRIVATE
+    gpu_bpf
+    CUDA::cudart
+    CUDA::curand
+)
+
+set_target_properties(test_bpf_matched_dgp PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
 
 # ==============================================================================
 # Print summary
