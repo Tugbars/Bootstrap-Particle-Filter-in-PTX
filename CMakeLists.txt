@@ -4,6 +4,7 @@
 # Directory layout:
 #   gpu_bpf/          — Host-side BPF/APF/IMM implementations
 #   ptx_assembly/     — Hand-written PTX kernels and pre-compiled cubins
+#   smc2/             — SMC² batch parameter learner (BPF inner filter)
 #   tests/            — Test harnesses and diagnostics
 #   csv_bank/         — Data files
 #
@@ -231,6 +232,30 @@ set_target_properties(gpu_bpf_ptx_full PROPERTIES
 )
 
 # ==============================================================================
+# Library: smc2_bpf (SMC² batch parameter learner with BPF inner filter)
+#
+# Learns θ = (ρ, σ_z, μ) for stochastic volatility model using SMC² with
+# CPMMH rejuvenation. Student-t observation model matches production BPF.
+# Uses CUB BlockRadixSort for CPMMH particle coupling.
+# ==============================================================================
+
+add_library(smc2_bpf STATIC smc2/smc2_bpf_batch.cu)
+
+target_link_libraries(smc2_bpf PRIVATE
+    CUDA::cudart
+    CUDA::curand
+)
+
+target_include_directories(smc2_bpf PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/smc2
+    ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+set_target_properties(smc2_bpf PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+)
+
+# ==============================================================================
 # Target: bpf_ptx_demo (standalone PTX loader demo)
 # ==============================================================================
 
@@ -414,6 +439,31 @@ set_target_properties(test_cond_resample PROPERTIES
 
 target_include_directories(test_cond_resample PRIVATE gpu_bpf)
 target_link_libraries(test_cond_resample curand)
+
+# ==============================================================================
+# Target: test_smc2_bpf (SMC² + BPF convergence tests)
+#
+# Simulates from known SV model, checks parameter recovery.
+# Tests: single window, multi-window, high-vol stress, CPMMH acceptance,
+#        ρ vs σ_z identifiability.
+# ==============================================================================
+
+add_executable(test_smc2_bpf smc2/test_smc2_bpf.cu)
+
+target_link_libraries(test_smc2_bpf PRIVATE
+    smc2_bpf
+    CUDA::cudart
+    CUDA::curand
+)
+
+target_include_directories(test_smc2_bpf PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/smc2
+)
+
+set_target_properties(test_smc2_bpf PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
 
 # ==============================================================================
 # Print summary
