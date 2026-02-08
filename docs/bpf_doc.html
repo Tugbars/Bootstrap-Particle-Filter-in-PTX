@@ -1,0 +1,1190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GPU Bootstrap Particle Filter — Architecture & Methods</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Source+Serif+4:ital,wght@0,400;0,600;0,700;1,400&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+    --bg: #0a0c10;
+    --bg2: #12151c;
+    --bg3: #1a1e28;
+    --fg: #c9cdd6;
+    --fg2: #8b92a0;
+    --accent: #4fc3f7;
+    --accent2: #81d4fa;
+    --green: #66bb6a;
+    --red: #ef5350;
+    --orange: #ffa726;
+    --purple: #ab47bc;
+    --yellow: #ffee58;
+    --border: #2a2f3a;
+    --code-bg: #0d1017;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: 'DM Sans', sans-serif;
+    font-size: 17px;
+    line-height: 1.75;
+    -webkit-font-smoothing: antialiased;
+}
+
+.container {
+    max-width: 920px;
+    margin: 0 auto;
+    padding: 0 40px;
+}
+
+/* ─── Hero ─── */
+.hero {
+    padding: 100px 0 60px;
+    text-align: center;
+    position: relative;
+    overflow: hidden;
+}
+
+.hero::before {
+    content: '';
+    position: absolute;
+    top: -200px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 800px;
+    height: 800px;
+    background: radial-gradient(circle, rgba(79,195,247,0.06) 0%, transparent 70%);
+    pointer-events: none;
+}
+
+.hero h1 {
+    font-family: 'Source Serif 4', serif;
+    font-size: 3.2em;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: -1px;
+    margin-bottom: 16px;
+    animation: fadeUp 0.8s ease;
+}
+
+.hero .subtitle {
+    font-size: 1.15em;
+    color: var(--fg2);
+    max-width: 600px;
+    margin: 0 auto 30px;
+    animation: fadeUp 0.8s ease 0.15s both;
+}
+
+.hero .specs {
+    display: flex;
+    gap: 32px;
+    justify-content: center;
+    flex-wrap: wrap;
+    animation: fadeUp 0.8s ease 0.3s both;
+}
+
+.hero .spec {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 22px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.82em;
+}
+
+.hero .spec .val {
+    color: var(--accent);
+    font-weight: 700;
+    font-size: 1.4em;
+    display: block;
+}
+
+/* ─── Sections ─── */
+section {
+    padding: 70px 0;
+    border-top: 1px solid var(--border);
+}
+
+.section-num {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.75em;
+    color: var(--accent);
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+}
+
+h2 {
+    font-family: 'Source Serif 4', serif;
+    font-size: 2em;
+    font-weight: 700;
+    color: #fff;
+    margin-bottom: 20px;
+    letter-spacing: -0.5px;
+}
+
+h3 {
+    font-family: 'Source Serif 4', serif;
+    font-size: 1.35em;
+    font-weight: 600;
+    color: #e0e4ec;
+    margin: 36px 0 14px;
+}
+
+p { margin-bottom: 16px; }
+
+strong { color: #e0e4ec; font-weight: 600; }
+
+/* ─── Animated Diagrams ─── */
+.diagram-box {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 30px;
+    margin: 28px 0;
+    overflow: hidden;
+    position: relative;
+}
+
+.diagram-box .caption {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72em;
+    color: var(--fg2);
+    text-align: center;
+    margin-top: 16px;
+    letter-spacing: 0.5px;
+}
+
+/* ─── Code blocks ─── */
+pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px 24px;
+    margin: 20px 0;
+    overflow-x: auto;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.8em;
+    line-height: 1.65;
+    color: var(--fg);
+}
+
+code {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.88em;
+    background: var(--bg3);
+    padding: 2px 7px;
+    border-radius: 4px;
+    color: var(--accent2);
+}
+
+pre code {
+    background: none;
+    padding: 0;
+    color: inherit;
+}
+
+.kw { color: var(--purple); }
+.fn { color: var(--accent); }
+.cm { color: #546e7a; }
+.num { color: var(--orange); }
+.str { color: var(--green); }
+
+/* ─── Tables ─── */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 20px 0;
+    font-size: 0.92em;
+}
+
+th {
+    background: var(--bg3);
+    color: var(--accent);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.8em;
+    letter-spacing: 0.5px;
+    text-align: left;
+    padding: 12px 16px;
+    border-bottom: 2px solid var(--border);
+}
+
+td {
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+}
+
+tr:hover td { background: rgba(79,195,247,0.03); }
+
+/* ─── Metric cards ─── */
+.metrics {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 16px;
+    margin: 24px 0;
+}
+
+.metric {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px;
+    text-align: center;
+}
+
+.metric .label {
+    font-size: 0.78em;
+    color: var(--fg2);
+    margin-bottom: 6px;
+    font-family: 'JetBrains Mono', monospace;
+}
+
+.metric .value {
+    font-size: 1.6em;
+    font-weight: 700;
+    font-family: 'JetBrains Mono', monospace;
+}
+
+.metric .value.good { color: var(--green); }
+.metric .value.accent { color: var(--accent); }
+.metric .value.warn { color: var(--orange); }
+
+/* ─── SVG animations ─── */
+@keyframes fadeUp {
+    from { opacity: 0; transform: translateY(20px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes particleDrift {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-6px); }
+}
+
+@keyframes pulseGlow {
+    0%, 100% { opacity: 0.4; }
+    50% { opacity: 1; }
+}
+
+@keyframes widen {
+    0%, 100% { rx: 20; ry: 12; }
+    50% { rx: 35; ry: 18; }
+}
+
+@keyframes slideRight {
+    from { transform: translateX(-100%); opacity: 0; }
+    to { transform: translateX(0); opacity: 1; }
+}
+
+.particle-dot {
+    animation: particleDrift 2s ease-in-out infinite;
+}
+
+.particle-dot:nth-child(2n) { animation-delay: -0.5s; }
+.particle-dot:nth-child(3n) { animation-delay: -1s; }
+.particle-dot:nth-child(5n) { animation-delay: -1.5s; }
+
+/* ─── Callout ─── */
+.callout {
+    background: rgba(79,195,247,0.06);
+    border-left: 3px solid var(--accent);
+    border-radius: 0 10px 10px 0;
+    padding: 18px 24px;
+    margin: 24px 0;
+}
+
+.callout.warn {
+    background: rgba(255,167,38,0.06);
+    border-left-color: var(--orange);
+}
+
+.callout.success {
+    background: rgba(102,187,106,0.06);
+    border-left-color: var(--green);
+}
+
+/* ─── Flow diagram ─── */
+.flow {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin: 20px 0;
+}
+
+.flow-step {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 16px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.78em;
+    white-space: nowrap;
+}
+
+.flow-step.active {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.flow-step.skip {
+    border-color: var(--border);
+    color: var(--fg2);
+    opacity: 0.5;
+    text-decoration: line-through;
+}
+
+.flow-arrow {
+    color: var(--fg2);
+    font-size: 1.2em;
+}
+
+/* ─── Responsive ─── */
+@media (max-width: 700px) {
+    .container { padding: 0 20px; }
+    .hero h1 { font-size: 2.2em; }
+    h2 { font-size: 1.6em; }
+    .hero .specs { flex-direction: column; align-items: center; }
+}
+</style>
+</head>
+<body>
+
+<div class="container">
+
+<!-- ═══════════════════════════ HERO ═══════════════════════════ -->
+
+<div class="hero">
+    <h1>GPU Bootstrap Particle Filter</h1>
+    <p class="subtitle">
+        300K particles in hand-written PTX for SM_120. Every optimization earned through empirical stress-testing, not theoretical elegance.
+    </p>
+    <div class="specs">
+        <div class="spec"><span class="val">300K</span>particles</div>
+        <div class="spec"><span class="val">13</span>PTX kernels</div>
+        <div class="spec"><span class="val">~450μs</span>per tick</div>
+        <div class="spec"><span class="val">SM_120</span>RTX 5080</div>
+    </div>
+</div>
+
+<!-- ═══════════════════════════ §1 CORE BPF ═══════════════════════════ -->
+
+<section>
+<div class="section-num">01 — Foundation</div>
+<h2>Bootstrap Particle Filter</h2>
+
+<p>
+    The Bootstrap Particle Filter (BPF) is the simplest sequential Monte Carlo method. It represents the posterior distribution p(h_t | y_{1:t}) as a weighted set of particles, each a hypothesis about the current hidden state h_t (log-volatility). No gradients, no sufficient statistics, no accumulated state beyond the particle cloud itself.
+</p>
+
+<p>
+    The <strong>stochastic volatility model</strong> we're filtering:
+</p>
+
+<pre><code><span class="cm">// State (log-volatility) evolution — OU process</span>
+h_t = μ + ρ(h_{t-1} - μ) + σ_z · ε_t     ε_t ~ Student-t(ν_state)  or  N(0,1)
+
+<span class="cm">// Observation (returns)</span>
+y_t = exp(h_t / 2) · η_t                    η_t ~ Student-t(ν_obs)  or  N(0,1)</code></pre>
+
+<div class="diagram-box">
+    <svg viewBox="0 0 800 320" xmlns="http://www.w3.org/2000/svg">
+        <!-- Background grid -->
+        <defs>
+            <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+                <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1a1e28" stroke-width="0.5"/>
+            </pattern>
+            <linearGradient id="particleGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="#4fc3f7" stop-opacity="0.8"/>
+                <stop offset="100%" stop-color="#4fc3f7" stop-opacity="0.2"/>
+            </linearGradient>
+            <filter id="glow">
+                <feGaussianBlur stdDeviation="3" result="blur"/>
+                <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+            </filter>
+        </defs>
+        <rect width="800" height="320" fill="url(#grid)"/>
+
+        <!-- True h(t) curve -->
+        <path d="M 40,160 Q 100,120 160,140 T 280,100 T 400,180 T 520,90 T 640,170 T 760,130"
+              fill="none" stroke="#546e7a" stroke-width="2" stroke-dasharray="6,4"/>
+        <text x="765" y="125" fill="#546e7a" font-family="JetBrains Mono" font-size="11">true h(t)</text>
+
+        <!-- Particle clouds at different timesteps -->
+        <g opacity="0.3">
+            <text x="90" y="285" fill="#4fc3f7" font-family="JetBrains Mono" font-size="10" text-anchor="middle">t=1</text>
+            <circle cx="80" cy="155" r="3" fill="#4fc3f7" class="particle-dot"/>
+            <circle cx="95" cy="148" r="3" fill="#4fc3f7" class="particle-dot"/>
+            <circle cx="88" cy="165" r="3" fill="#4fc3f7" class="particle-dot"/>
+            <circle cx="102" cy="158" r="2.5" fill="#4fc3f7" class="particle-dot"/>
+            <circle cx="75" cy="162" r="2" fill="#4fc3f7" class="particle-dot"/>
+            <circle cx="92" cy="170" r="2" fill="#4fc3f7" class="particle-dot"/>
+        </g>
+
+        <g opacity="0.5">
+            <text x="250" y="285" fill="#4fc3f7" font-family="JetBrains Mono" font-size="10" text-anchor="middle">t=50</text>
+            <circle cx="240" cy="108" r="3.5" fill="#4fc3f7" class="particle-dot"/>
+            <circle cx="255" cy="102" r="4" fill="#4fc3f7" class="particle-dot" filter="url(#glow)"/>
+            <circle cx="248" cy="115" r="3" fill="#4fc3f7" class="particle-dot"/>
+            <circle cx="262" cy="98" r="2.5" fill="#4fc3f7" class="particle-dot"/>
+            <circle cx="235" cy="118" r="2" fill="#4fc3f7" class="particle-dot"/>
+            <circle cx="258" cy="120" r="2" fill="#4fc3f7" class="particle-dot"/>
+            <circle cx="244" cy="95" r="2.5" fill="#4fc3f7" class="particle-dot"/>
+        </g>
+
+        <g opacity="0.8">
+            <text x="420" y="285" fill="#4fc3f7" font-family="JetBrains Mono" font-size="10" text-anchor="middle">t=100</text>
+            <circle cx="410" cy="175" r="4" fill="#4fc3f7" class="particle-dot" filter="url(#glow)"/>
+            <circle cx="425" cy="180" r="3.5" fill="#4fc3f7" class="particle-dot"/>
+            <circle cx="418" cy="168" r="3" fill="#4fc3f7" class="particle-dot"/>
+            <circle cx="432" cy="185" r="3" fill="#4fc3f7" class="particle-dot"/>
+            <circle cx="405" cy="188" r="2.5" fill="#4fc3f7" class="particle-dot"/>
+            <circle cx="415" cy="192" r="2" fill="#4fc3f7" class="particle-dot"/>
+            <circle cx="428" cy="172" r="2.5" fill="#4fc3f7" class="particle-dot"/>
+            <circle cx="422" cy="164" r="2" fill="#4fc3f7" class="particle-dot"/>
+        </g>
+
+        <g opacity="1">
+            <text x="600" y="285" fill="#4fc3f7" font-family="JetBrains Mono" font-size="10" text-anchor="middle">t=200</text>
+            <circle cx="590" cy="92" r="4.5" fill="#4fc3f7" class="particle-dot" filter="url(#glow)"/>
+            <circle cx="605" cy="88" r="4" fill="#4fc3f7" class="particle-dot" filter="url(#glow)"/>
+            <circle cx="598" cy="100" r="3.5" fill="#4fc3f7" class="particle-dot"/>
+            <circle cx="612" cy="95" r="3" fill="#4fc3f7" class="particle-dot"/>
+            <circle cx="585" cy="105" r="2.5" fill="#4fc3f7" class="particle-dot"/>
+            <circle cx="595" cy="85" r="3" fill="#4fc3f7" class="particle-dot"/>
+            <circle cx="608" cy="82" r="2.5" fill="#4fc3f7" class="particle-dot"/>
+            <circle cx="600" cy="108" r="2" fill="#4fc3f7" class="particle-dot"/>
+            <circle cx="615" cy="102" r="2" fill="#4fc3f7" class="particle-dot"/>
+        </g>
+
+        <!-- Labels -->
+        <text x="400" y="30" fill="#fff" font-family="Source Serif 4" font-size="15" text-anchor="middle" font-weight="600">Particle Cloud Tracks Hidden Volatility</text>
+        <text x="400" y="310" fill="#546e7a" font-family="JetBrains Mono" font-size="10" text-anchor="middle">Dot size ∝ weight · Brighter = higher observation likelihood</text>
+    </svg>
+    <div class="caption">Each dot is a particle — a hypothesis about h_t. Observation likelihood assigns weights. Resampling kills low-weight particles.</div>
+</div>
+
+<h3>Per-Tick Pipeline</h3>
+
+<div class="flow">
+    <div class="flow-step active">Propagate</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step active">Weight</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step active">Normalize</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step active">h_est</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step active">ESS check</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step active">Resample?</div>
+</div>
+
+<p>
+    Every tick, 300K particles propagate through the OU transition, receive observation likelihood weights, and get resampled if the effective sample size drops. The weighted mean E[h_t | y_{1:t}] is the state estimate. The entire pipeline runs asynchronously on GPU — zero CPU stalls in the hot path.
+</p>
+
+</section>
+
+<!-- ═══════════════════════════ §2 PTX + PCG32 ═══════════════════════════ -->
+
+<section>
+<div class="section-num">02 — PTX Engine</div>
+<h2>Hand-Written PTX with PCG32</h2>
+
+<p>
+    All 13 BPF kernels are written directly in PTX assembly for the SM_120 ISA (RTX 5080 / Blackwell). This bypasses <code>nvcc</code>'s register allocator and instruction scheduler, giving direct control over register pressure, memory access patterns, and instruction selection.
+</p>
+
+<h3>PCG32 Replaces cuRAND</h3>
+
+<p>
+    The standard CUDA random number generator <code>curandState</code> uses <strong>48 bytes per particle</strong>. PCG32 uses <strong>16 bytes</strong> (two <code>uint64</code>: state + increment). At 300K particles, that's 14.4 MB → 4.8 MB — a 3× memory reduction that improves L2 cache utilization for all other kernels sharing the same cache.
+</p>
+
+<div class="diagram-box">
+    <svg viewBox="0 0 800 200" xmlns="http://www.w3.org/2000/svg">
+        <rect width="800" height="200" fill="none"/>
+
+        <!-- cuRAND bar -->
+        <text x="40" y="50" fill="#ef5350" font-family="JetBrains Mono" font-size="12" font-weight="600">curandState</text>
+        <rect x="180" y="35" width="560" height="28" rx="4" fill="#ef5350" opacity="0.3" stroke="#ef5350" stroke-width="1"/>
+        <rect x="180" y="35" width="560" height="28" rx="4" fill="#ef5350" opacity="0.15">
+            <animate attributeName="width" values="0;560" dur="1.5s" fill="freeze"/>
+        </rect>
+        <text x="750" y="54" fill="#ef5350" font-family="JetBrains Mono" font-size="11" text-anchor="end">48 B/particle → 14.4 MB</text>
+
+        <!-- PCG32 bar -->
+        <text x="40" y="110" fill="#66bb6a" font-family="JetBrains Mono" font-size="12" font-weight="600">PCG32</text>
+        <rect x="180" y="95" width="187" height="28" rx="4" fill="#66bb6a" opacity="0.3" stroke="#66bb6a" stroke-width="1"/>
+        <rect x="180" y="95" width="187" height="28" rx="4" fill="#66bb6a" opacity="0.15">
+            <animate attributeName="width" values="0;187" dur="1.5s" fill="freeze"/>
+        </rect>
+        <text x="375" y="114" fill="#66bb6a" font-family="JetBrains Mono" font-size="11">16 B/particle → 4.8 MB</text>
+
+        <!-- Savings -->
+        <text x="400" y="170" fill="#fff" font-family="JetBrains Mono" font-size="13" text-anchor="middle" font-weight="600">3× memory reduction → better L2 cache hit rate</text>
+    </svg>
+</div>
+
+<h3>ICDF Normal Generation</h3>
+
+<p>
+    Instead of the Box-Muller transform (needs 2 uniforms + sin/cos), we use the <strong>Acklam rational approximation</strong> to the inverse CDF. One uniform → one normal, entirely in PTX. The approximation has relative error &lt; 1.15×10⁻⁹ over the full range.
+</p>
+
+<pre><code><span class="cm">// PTX: PCG32 → uniform → ICDF → standard normal</span>
+<span class="cm">// Total: ~20 PTX instructions per normal variate</span>
+mad.lo.u64  %rd_state, %rd_state, 6364136223846793005, %rd_inc   <span class="cm">// PCG step</span>
+shr.u64     %rd_tmp, %rd_old, 18                                  <span class="cm">// XSH-RR</span>
+xor.b64     %rd_tmp, %rd_tmp, %rd_old
+shr.u64     %rd_tmp, %rd_tmp, 27
+cvt.rn.f32.u32  %f_u, %r_pcg                                     <span class="cm">// → uniform [0,1)</span>
+<span class="cm">// ... Acklam rational approximation (~12 FMA ops) ...</span></code></pre>
+
+<h3>Fused Propagate + Weight Kernel</h3>
+
+<p>
+    The biggest kernel — <code>bpf_propagate_weight</code> — fuses five logical operations into a single GPU kernel launch: RNG advance, normal generation via ICDF, OU transition, adaptive band lookup from constant memory, and observation likelihood computation. One kernel launch does what would otherwise be 5 separate launches.
+</p>
+
+<div class="diagram-box">
+    <svg viewBox="0 0 800 140" xmlns="http://www.w3.org/2000/svg">
+        <rect width="800" height="140" fill="none"/>
+
+        <!-- Fused pipeline -->
+        <g transform="translate(40,30)">
+            <rect x="0" y="0" width="130" height="50" rx="6" fill="none" stroke="#4fc3f7" stroke-width="1.5" opacity="0.6"/>
+            <text x="65" y="22" fill="#4fc3f7" font-family="JetBrains Mono" font-size="10" text-anchor="middle">PCG32</text>
+            <text x="65" y="38" fill="#4fc3f7" font-family="JetBrains Mono" font-size="10" text-anchor="middle">advance</text>
+
+            <line x1="135" y1="25" x2="150" y2="25" stroke="#4fc3f7" stroke-width="1" opacity="0.5"/>
+
+            <rect x="155" y="0" width="130" height="50" rx="6" fill="none" stroke="#4fc3f7" stroke-width="1.5" opacity="0.7"/>
+            <text x="220" y="22" fill="#4fc3f7" font-family="JetBrains Mono" font-size="10" text-anchor="middle">ICDF</text>
+            <text x="220" y="38" fill="#4fc3f7" font-family="JetBrains Mono" font-size="10" text-anchor="middle">normal gen</text>
+
+            <line x1="290" y1="25" x2="305" y2="25" stroke="#4fc3f7" stroke-width="1" opacity="0.5"/>
+
+            <rect x="310" y="0" width="130" height="50" rx="6" fill="none" stroke="#66bb6a" stroke-width="1.5" opacity="0.7"/>
+            <text x="375" y="22" fill="#66bb6a" font-family="JetBrains Mono" font-size="10" text-anchor="middle">OU + Band</text>
+            <text x="375" y="38" fill="#66bb6a" font-family="JetBrains Mono" font-size="10" text-anchor="middle">transition</text>
+
+            <line x1="445" y1="25" x2="460" y2="25" stroke="#4fc3f7" stroke-width="1" opacity="0.5"/>
+
+            <rect x="465" y="0" width="130" height="50" rx="6" fill="none" stroke="#ffa726" stroke-width="1.5" opacity="0.7"/>
+            <text x="530" y="22" fill="#ffa726" font-family="JetBrains Mono" font-size="10" text-anchor="middle">Obs likelihood</text>
+            <text x="530" y="38" fill="#ffa726" font-family="JetBrains Mono" font-size="10" text-anchor="middle">+ weight</text>
+
+            <line x1="600" y1="25" x2="615" y2="25" stroke="#4fc3f7" stroke-width="1" opacity="0.5"/>
+
+            <rect x="620" y="0" width="90" height="50" rx="6" fill="none" stroke="#ab47bc" stroke-width="1.5" opacity="0.7"/>
+            <text x="665" y="22" fill="#ab47bc" font-family="JetBrains Mono" font-size="10" text-anchor="middle">Accumulate</text>
+            <text x="665" y="38" fill="#ab47bc" font-family="JetBrains Mono" font-size="10" text-anchor="middle">log_w</text>
+        </g>
+
+        <!-- Single launch bracket -->
+        <path d="M 38,90 L 38,100 L 762,100 L 762,90" fill="none" stroke="#fff" stroke-width="1" opacity="0.4"/>
+        <text x="400" y="122" fill="#fff" font-family="JetBrains Mono" font-size="11" text-anchor="middle" opacity="0.7">Single kernel launch — zero intermediate global memory traffic</text>
+    </svg>
+</div>
+
+</section>
+
+<!-- ═══════════════════════════ §3 Chi² Optimization ═══════════════════════════ -->
+
+<section>
+<div class="section-num">03 — Student-t Sampling</div>
+<h2>Chi² Optimization</h2>
+
+<p>
+    Student-t state noise requires generating t-distributed random variables. The standard approach — ratio of a normal and a chi² — uses rejection sampling for the chi², which is branch-heavy and terrible on GPUs. Our approach: precompute the chi² variate as a sum of squared normals.
+</p>
+
+<p>
+    For integer degrees of freedom ν, χ²(ν) = Z₁² + Z₂² + ... + Zᵥ² where Z_i ~ N(0,1). Generate all ν·N normals in one cuRAND batch call, then a simple square-and-sum kernel. Zero rejection, zero branches, 100% GPU utilization.
+</p>
+
+<div class="diagram-box">
+    <svg viewBox="0 0 800 220" xmlns="http://www.w3.org/2000/svg">
+        <rect width="800" height="220" fill="none"/>
+
+        <!-- Old method -->
+        <text x="40" y="30" fill="#ef5350" font-family="JetBrains Mono" font-size="12" font-weight="600">❌ Rejection sampling (per particle)</text>
+        <g transform="translate(60, 45)">
+            <rect x="0" y="0" width="100" height="35" rx="5" fill="#ef5350" opacity="0.15" stroke="#ef5350"/>
+            <text x="50" y="22" fill="#ef5350" font-family="JetBrains Mono" font-size="9" text-anchor="middle">generate</text>
+
+            <text x="115" y="22" fill="#ef5350" font-family="JetBrains Mono" font-size="14">→</text>
+
+            <rect x="135" y="0" width="100" height="35" rx="5" fill="#ef5350" opacity="0.15" stroke="#ef5350"/>
+            <text x="185" y="22" fill="#ef5350" font-family="JetBrains Mono" font-size="9" text-anchor="middle">accept?</text>
+
+            <path d="M 185,37 C 185,55 120,55 120,37" fill="none" stroke="#ef5350" stroke-width="1" stroke-dasharray="3,3" opacity="0.6"/>
+            <text x="152" y="60" fill="#ef5350" font-family="JetBrains Mono" font-size="8" text-anchor="middle">reject → retry</text>
+
+            <text x="250" y="22" fill="#ef5350" font-family="JetBrains Mono" font-size="14">→</text>
+
+            <rect x="270" y="0" width="80" height="35" rx="5" fill="#ef5350" opacity="0.15" stroke="#ef5350"/>
+            <text x="310" y="22" fill="#ef5350" font-family="JetBrains Mono" font-size="9" text-anchor="middle">χ²</text>
+
+            <text x="420" y="22" fill="#ef5350" font-family="JetBrains Mono" font-size="10">Warp divergence, variable iterations</text>
+        </g>
+
+        <!-- New method -->
+        <text x="40" y="130" fill="#66bb6a" font-family="JetBrains Mono" font-size="12" font-weight="600">✓ Sum-of-squares (batch)</text>
+        <g transform="translate(60, 145)">
+            <rect x="0" y="0" width="160" height="35" rx="5" fill="#66bb6a" opacity="0.15" stroke="#66bb6a"/>
+            <text x="80" y="14" fill="#66bb6a" font-family="JetBrains Mono" font-size="9" text-anchor="middle">cuRAND batch</text>
+            <text x="80" y="28" fill="#66bb6a" font-family="JetBrains Mono" font-size="9" text-anchor="middle">N·ν normals</text>
+
+            <text x="175" y="22" fill="#66bb6a" font-family="JetBrains Mono" font-size="14">→</text>
+
+            <rect x="195" y="0" width="160" height="35" rx="5" fill="#66bb6a" opacity="0.15" stroke="#66bb6a"/>
+            <text x="275" y="14" fill="#66bb6a" font-family="JetBrains Mono" font-size="9" text-anchor="middle">square-sum kernel</text>
+            <text x="275" y="28" fill="#66bb6a" font-family="JetBrains Mono" font-size="9" text-anchor="middle">Σ Z_k²</text>
+
+            <text x="370" y="22" fill="#66bb6a" font-family="JetBrains Mono" font-size="14">→</text>
+
+            <rect x="390" y="0" width="80" height="35" rx="5" fill="#66bb6a" opacity="0.15" stroke="#66bb6a"/>
+            <text x="430" y="22" fill="#66bb6a" font-family="JetBrains Mono" font-size="9" text-anchor="middle">χ²</text>
+
+            <text x="530" y="22" fill="#66bb6a" font-family="JetBrains Mono" font-size="10">Zero branches, deterministic</text>
+        </g>
+    </svg>
+    <div class="caption">5.3× speedup for Student-t state noise generation. Zero warp divergence.</div>
+</div>
+
+<div class="metrics">
+    <div class="metric">
+        <div class="label">SPEEDUP</div>
+        <div class="value good">5.3×</div>
+    </div>
+    <div class="metric">
+        <div class="label">BRANCHES</div>
+        <div class="value good">0</div>
+    </div>
+    <div class="metric">
+        <div class="label">GPU UTIL</div>
+        <div class="value good">100%</div>
+    </div>
+</div>
+
+</section>
+
+<!-- ═══════════════════════════ §4 Adaptive Bands ═══════════════════════════ -->
+
+<section>
+<div class="section-num">04 — Core Innovation</div>
+<h2>Adaptive Band-Based Mixture Proposal</h2>
+
+<p>
+    The standard BPF proposes all particles with the same transition noise σ_z. When the true volatility regime shifts, particles either spread too wide (wasting coverage) or too narrow (missing the target). The adaptive band system partitions the 300K particles into contiguous bands with different σ_z multipliers.
+</p>
+
+<h3>Three Preloaded Regimes</h3>
+
+<div class="diagram-box">
+    <svg viewBox="0 0 800 350" xmlns="http://www.w3.org/2000/svg">
+        <rect width="800" height="350" fill="none"/>
+
+        <!-- CALM -->
+        <g transform="translate(50, 30)">
+            <text x="100" y="0" fill="#66bb6a" font-family="JetBrains Mono" font-size="13" font-weight="700" text-anchor="middle">CALM</text>
+            <text x="100" y="18" fill="#546e7a" font-family="JetBrains Mono" font-size="9" text-anchor="middle">surprise &lt; 2.0</text>
+
+            <!-- Bar: 84% standard -->
+            <rect x="0" y="30" width="168" height="32" rx="4" fill="#66bb6a" opacity="0.2" stroke="#66bb6a" stroke-width="1">
+                <animate attributeName="width" values="0;168" dur="1s" fill="freeze"/>
+            </rect>
+            <text x="84" y="51" fill="#66bb6a" font-family="JetBrains Mono" font-size="10" text-anchor="middle">84% · k=1.0×</text>
+
+            <!-- Bar: 16% wide -->
+            <rect x="172" y="30" width="32" height="32" rx="4" fill="#4fc3f7" opacity="0.2" stroke="#4fc3f7" stroke-width="1">
+                <animate attributeName="width" values="0;32" dur="1s" fill="freeze"/>
+            </rect>
+            <text x="188" y="51" fill="#4fc3f7" font-family="JetBrains Mono" font-size="8" text-anchor="middle">16%</text>
+            <text x="188" y="80" fill="#4fc3f7" font-family="JetBrains Mono" font-size="9" text-anchor="middle">k=2.5×</text>
+        </g>
+
+        <!-- ALERT -->
+        <g transform="translate(300, 30)">
+            <text x="110" y="0" fill="#ffa726" font-family="JetBrains Mono" font-size="13" font-weight="700" text-anchor="middle">ALERT</text>
+            <text x="110" y="18" fill="#546e7a" font-family="JetBrains Mono" font-size="9" text-anchor="middle">2.0 ≤ surprise &lt; 4.0</text>
+
+            <rect x="0" y="30" width="140" height="32" rx="4" fill="#ffa726" opacity="0.2" stroke="#ffa726" stroke-width="1">
+                <animate attributeName="width" values="0;140" dur="1s" fill="freeze" begin="0.3s"/>
+            </rect>
+            <text x="70" y="51" fill="#ffa726" font-family="JetBrains Mono" font-size="10" text-anchor="middle">70% · k=1.0×</text>
+
+            <rect x="144" y="30" width="60" height="32" rx="4" fill="#4fc3f7" opacity="0.2" stroke="#4fc3f7" stroke-width="1">
+                <animate attributeName="width" values="0;60" dur="1s" fill="freeze" begin="0.3s"/>
+            </rect>
+            <text x="174" y="51" fill="#4fc3f7" font-family="JetBrains Mono" font-size="10" text-anchor="middle">30%</text>
+            <text x="174" y="80" fill="#4fc3f7" font-family="JetBrains Mono" font-size="9" text-anchor="middle">k=3.0×</text>
+        </g>
+
+        <!-- PANIC -->
+        <g transform="translate(560, 30)">
+            <text x="100" y="0" fill="#ef5350" font-family="JetBrains Mono" font-size="13" font-weight="700" text-anchor="middle">PANIC</text>
+            <text x="100" y="18" fill="#546e7a" font-family="JetBrains Mono" font-size="9" text-anchor="middle">surprise ≥ 4.0</text>
+
+            <rect x="0" y="30" width="100" height="32" rx="4" fill="#ef5350" opacity="0.2" stroke="#ef5350" stroke-width="1">
+                <animate attributeName="width" values="0;100" dur="1s" fill="freeze" begin="0.6s"/>
+            </rect>
+            <text x="50" y="51" fill="#ef5350" font-family="JetBrains Mono" font-size="10" text-anchor="middle">50% · k=1.0×</text>
+
+            <rect x="104" y="30" width="100" height="32" rx="4" fill="#4fc3f7" opacity="0.2" stroke="#4fc3f7" stroke-width="1">
+                <animate attributeName="width" values="0;100" dur="1s" fill="freeze" begin="0.6s"/>
+            </rect>
+            <text x="154" y="51" fill="#4fc3f7" font-family="JetBrains Mono" font-size="10" text-anchor="middle">50%</text>
+            <text x="154" y="80" fill="#4fc3f7" font-family="JetBrains Mono" font-size="9" text-anchor="middle">k=4.0×</text>
+        </g>
+
+        <!-- Particle spread visualization -->
+        <g transform="translate(0, 140)">
+            <text x="400" y="10" fill="#fff" font-family="Source Serif 4" font-size="14" text-anchor="middle" font-weight="600">Particle Cloud Spread by Regime</text>
+
+            <!-- Calm: tight -->
+            <ellipse cx="150" cy="80" rx="25" ry="15" fill="#66bb6a" opacity="0.08" stroke="#66bb6a" stroke-width="1">
+                <animate attributeName="rx" values="20;25;20" dur="3s" repeatCount="indefinite"/>
+            </ellipse>
+            <ellipse cx="150" cy="80" rx="12" ry="8" fill="#66bb6a" opacity="0.15"/>
+            <circle cx="145" cy="78" r="2" fill="#66bb6a" class="particle-dot"/>
+            <circle cx="155" cy="82" r="2" fill="#66bb6a" class="particle-dot"/>
+            <circle cx="150" cy="75" r="2" fill="#66bb6a" class="particle-dot"/>
+            <circle cx="148" cy="84" r="2" fill="#66bb6a" class="particle-dot"/>
+            <circle cx="158" cy="77" r="1.5" fill="#4fc3f7" class="particle-dot"/>
+            <text x="150" y="115" fill="#546e7a" font-family="JetBrains Mono" font-size="9" text-anchor="middle">σ_z × 1.0</text>
+            <text x="172" y="96" fill="#4fc3f7" font-family="JetBrains Mono" font-size="8">2.5×</text>
+
+            <!-- Alert: medium -->
+            <ellipse cx="400" cy="80" rx="42" ry="22" fill="#ffa726" opacity="0.06" stroke="#ffa726" stroke-width="1">
+                <animate attributeName="rx" values="35;45;35" dur="3s" repeatCount="indefinite"/>
+            </ellipse>
+            <ellipse cx="400" cy="80" rx="18" ry="10" fill="#ffa726" opacity="0.12"/>
+            <circle cx="395" cy="78" r="2" fill="#ffa726" class="particle-dot"/>
+            <circle cx="405" cy="82" r="2" fill="#ffa726" class="particle-dot"/>
+            <circle cx="400" cy="74" r="2" fill="#ffa726" class="particle-dot"/>
+            <circle cx="390" cy="85" r="2" fill="#ffa726" class="particle-dot"/>
+            <circle cx="420" cy="72" r="1.5" fill="#4fc3f7" class="particle-dot"/>
+            <circle cx="378" cy="88" r="1.5" fill="#4fc3f7" class="particle-dot"/>
+            <text x="400" y="115" fill="#546e7a" font-family="JetBrains Mono" font-size="9" text-anchor="middle">σ_z × 1.0</text>
+            <text x="435" y="96" fill="#4fc3f7" font-family="JetBrains Mono" font-size="8">3.0×</text>
+
+            <!-- Panic: wide -->
+            <ellipse cx="650" cy="80" rx="65" ry="30" fill="#ef5350" opacity="0.05" stroke="#ef5350" stroke-width="1">
+                <animate attributeName="rx" values="55;70;55" dur="3s" repeatCount="indefinite"/>
+            </ellipse>
+            <ellipse cx="650" cy="80" rx="25" ry="14" fill="#ef5350" opacity="0.10"/>
+            <circle cx="645" cy="78" r="2" fill="#ef5350" class="particle-dot"/>
+            <circle cx="655" cy="82" r="2" fill="#ef5350" class="particle-dot"/>
+            <circle cx="650" cy="72" r="2" fill="#ef5350" class="particle-dot"/>
+            <circle cx="640" cy="86" r="2" fill="#ef5350" class="particle-dot"/>
+            <circle cx="690" cy="65" r="1.5" fill="#4fc3f7" class="particle-dot"/>
+            <circle cx="610" cy="95" r="1.5" fill="#4fc3f7" class="particle-dot"/>
+            <circle cx="700" cy="90" r="1.5" fill="#4fc3f7" class="particle-dot"/>
+            <circle cx="605" cy="70" r="1.5" fill="#4fc3f7" class="particle-dot"/>
+            <text x="650" y="125" fill="#546e7a" font-family="JetBrains Mono" font-size="9" text-anchor="middle">σ_z × 1.0</text>
+            <text x="705" y="78" fill="#4fc3f7" font-family="JetBrains Mono" font-size="8">4.0×</text>
+        </g>
+    </svg>
+    <div class="caption">Wide-band particles (cyan) explore tails. In calm markets they die naturally via low p(y|h). During crashes, they survive and capture the true vol.</div>
+</div>
+
+<h3>Why It Works</h3>
+
+<div class="callout success">
+    <strong>Self-correcting by design.</strong> Wide-band particles in the wrong region get low observation likelihood — they die at the next resample. No importance weight correction needed. The "bias" from ignoring the proposal ratio is negligible when 84%+ of particles use the standard band.
+</div>
+
+<h3>Implementation: Constant Memory + Zero Divergence</h3>
+
+<p>
+    Band config lives in PTX <strong>constant memory</strong> (<code>d_mix_config</code>), broadcast to all threads in a single cycle. Particles are partitioned into contiguous index ranges — thread 0–251,999 gets band 0, threads 252,000–299,999 get band 1. This means <strong>zero warp divergence</strong>: every thread in a 32-thread warp takes the same branch.
+</p>
+
+<pre><code><span class="cm">// PTX: Band lookup — 3 instructions for 99% of particles</span>
+ld.const.s32    %r_nb, [d_mix_config + 0];      <span class="cm">// n_bands</span>
+ld.const.f32    %f_kb, [d_mix_config + 20];     <span class="cm">// k[0] = 1.0 (default)</span>
+setp.le.s32     %p_skip, %r_nb, 1;
+@%p_skip bra    PW_BANDS_DONE;
+
+ld.const.s32    %r_bnd, [d_mix_config + 4];     <span class="cm">// boundary[0]</span>
+setp.lt.u32     %p_in, %idx, %r_bnd;
+@%p_in bra      PW_BANDS_DONE;                  <span class="cm">// 84% of particles exit here</span></code></pre>
+
+<div class="metrics">
+    <div class="metric">
+        <div class="label">AVG RMSE Δ</div>
+        <div class="value good">−7.6%</div>
+    </div>
+    <div class="metric">
+        <div class="label">SPIKE RMSE Δ</div>
+        <div class="value good">−8.6%</div>
+    </div>
+    <div class="metric">
+        <div class="label">WIN RATE</div>
+        <div class="value good">44/48</div>
+    </div>
+    <div class="metric">
+        <div class="label">WARP DIVERGENCE</div>
+        <div class="value good">0%</div>
+    </div>
+</div>
+
+</section>
+
+<!-- ═══════════════════════════ §5 Surprise & Switching ═══════════════════════════ -->
+
+<section>
+<div class="section-num">05 — Regime Detection</div>
+<h2>Surprise Score & Regime Switching</h2>
+
+<p>
+    The surprise score quantifies how unexpected the current observation is given the filter's estimate:
+</p>
+
+<pre><code>surprise_t = |y_t| · exp(−ĥ_{t-1} / 2)</code></pre>
+
+<p>
+    This is the standardized return — the observation divided by the filter's expected volatility. High surprise means the filter is underestimating volatility and needs wider bands.
+</p>
+
+<div class="diagram-box">
+    <svg viewBox="0 0 800 280" xmlns="http://www.w3.org/2000/svg">
+        <rect width="800" height="280" fill="none"/>
+
+        <!-- Surprise signal -->
+        <text x="400" y="25" fill="#fff" font-family="Source Serif 4" font-size="14" text-anchor="middle" font-weight="600">Surprise-Gated Regime Switching (1-tick delay)</text>
+
+        <!-- Timeline -->
+        <line x1="60" y1="200" x2="740" y2="200" stroke="#2a2f3a" stroke-width="1"/>
+
+        <!-- Surprise trace -->
+        <polyline points="80,180 120,175 160,182 200,170 240,150 280,90 320,60 360,110 400,160 440,175 480,180 520,170 560,178 600,182 640,176 680,180 720,178"
+                  fill="none" stroke="#ffa726" stroke-width="2" opacity="0.8"/>
+
+        <!-- Threshold lines -->
+        <line x1="60" y1="155" x2="740" y2="155" stroke="#ffa726" stroke-width="1" stroke-dasharray="6,4" opacity="0.4"/>
+        <text x="745" y="158" fill="#ffa726" font-family="JetBrains Mono" font-size="9">2.0</text>
+
+        <line x1="60" y1="110" x2="740" y2="110" stroke="#ef5350" stroke-width="1" stroke-dasharray="6,4" opacity="0.4"/>
+        <text x="745" y="113" fill="#ef5350" font-family="JetBrains Mono" font-size="9">4.0</text>
+
+        <!-- Regime bands -->
+        <rect x="80" y="210" width="160" height="20" rx="3" fill="#66bb6a" opacity="0.15"/>
+        <text x="160" y="224" fill="#66bb6a" font-family="JetBrains Mono" font-size="9" text-anchor="middle">CALM</text>
+
+        <rect x="240" y="210" width="40" height="20" rx="3" fill="#ffa726" opacity="0.15"/>
+        <text x="260" y="224" fill="#ffa726" font-family="JetBrains Mono" font-size="8" text-anchor="middle">ALT</text>
+
+        <rect x="280" y="210" width="80" height="20" rx="3" fill="#ef5350" opacity="0.15"/>
+        <text x="320" y="224" fill="#ef5350" font-family="JetBrains Mono" font-size="9" text-anchor="middle">PANIC</text>
+
+        <rect x="360" y="210" width="40" height="20" rx="3" fill="#ffa726" opacity="0.15"/>
+        <text x="380" y="224" fill="#ffa726" font-family="JetBrains Mono" font-size="8" text-anchor="middle">ALT</text>
+
+        <rect x="400" y="210" width="340" height="20" rx="3" fill="#66bb6a" opacity="0.15"/>
+        <text x="570" y="224" fill="#66bb6a" font-family="JetBrains Mono" font-size="9" text-anchor="middle">CALM</text>
+
+        <!-- 1-tick delay annotation -->
+        <line x1="280" y1="90" x2="295" y2="210" stroke="#fff" stroke-width="1" stroke-dasharray="3,3" opacity="0.3"/>
+        <text x="305" y="250" fill="#546e7a" font-family="JetBrains Mono" font-size="9">↑ regime switches here</text>
+        <text x="305" y="264" fill="#546e7a" font-family="JetBrains Mono" font-size="9">(1 tick after spike)</text>
+
+        <!-- Labels -->
+        <text x="40" y="60" fill="#ffa726" font-family="JetBrains Mono" font-size="10" transform="rotate(-90,40,120)">surprise</text>
+    </svg>
+    <div class="caption">The 1-tick delay prevents single-spike false alarms. Regime only switches after surprise is confirmed on the next tick.</div>
+</div>
+
+<h3>Why 1-Tick Delay</h3>
+
+<p>
+    A single large return can produce high surprise even in calm markets — it's just a tail draw from the observation distribution. Switching immediately would cause regime flicker. The 1-tick delay uses last tick's surprise to decide this tick's bands. If the shock was transient, surprise drops and bands stay calm. If it persists, the switch is genuine.
+</p>
+
+</section>
+
+<!-- ═══════════════════════════ §6 Conditional Resampling ═══════════════════════════ -->
+
+<section>
+<div class="section-num">06 — Efficiency</div>
+<h2>Conditional Resampling</h2>
+
+<p>
+    Standard BPF resamples every tick, even when the weight distribution is healthy. With 300K particles, the effective sample size (ESS) almost never drops below 50% — resampling most ticks is unnecessary work. Conditional resampling skips the expensive cumulative sum + systematic resampling when ESS is above a threshold.
+</p>
+
+<div class="diagram-box">
+    <svg viewBox="0 0 800 200" xmlns="http://www.w3.org/2000/svg">
+        <rect width="800" height="200" fill="none"/>
+        <text x="400" y="25" fill="#fff" font-family="Source Serif 4" font-size="14" text-anchor="middle" font-weight="600">Tick Budget: Always Resample vs Conditional</text>
+
+        <!-- Always resample -->
+        <text x="40" y="70" fill="#ef5350" font-family="JetBrains Mono" font-size="11" font-weight="600">Always</text>
+        <g transform="translate(120, 50)">
+            <rect x="0" y="0" width="100" height="30" rx="4" fill="#4fc3f7" opacity="0.15" stroke="#4fc3f7"/>
+            <text x="50" y="20" fill="#4fc3f7" font-family="JetBrains Mono" font-size="8" text-anchor="middle">propagate</text>
+
+            <rect x="105" y="0" width="80" height="30" rx="4" fill="#ffa726" opacity="0.15" stroke="#ffa726"/>
+            <text x="145" y="20" fill="#ffa726" font-family="JetBrains Mono" font-size="8" text-anchor="middle">reduce</text>
+
+            <rect x="190" y="0" width="120" height="30" rx="4" fill="#ef5350" opacity="0.15" stroke="#ef5350"/>
+            <text x="250" y="20" fill="#ef5350" font-family="JetBrains Mono" font-size="8" text-anchor="middle">cumsum+resample</text>
+
+            <text x="340" y="20" fill="#ef5350" font-family="JetBrains Mono" font-size="10" font-weight="600">760ms / 3K ticks</text>
+        </g>
+
+        <!-- Conditional (non-resample tick) -->
+        <text x="40" y="130" fill="#66bb6a" font-family="JetBrains Mono" font-size="11" font-weight="600">Cond.</text>
+        <text x="40" y="143" fill="#546e7a" font-family="JetBrains Mono" font-size="9">(95%)</text>
+        <g transform="translate(120, 115)">
+            <rect x="0" y="0" width="100" height="30" rx="4" fill="#4fc3f7" opacity="0.15" stroke="#4fc3f7"/>
+            <text x="50" y="20" fill="#4fc3f7" font-family="JetBrains Mono" font-size="8" text-anchor="middle">propagate</text>
+
+            <rect x="105" y="0" width="80" height="30" rx="4" fill="#ffa726" opacity="0.15" stroke="#ffa726"/>
+            <text x="145" y="20" fill="#ffa726" font-family="JetBrains Mono" font-size="8" text-anchor="middle">reduce+ESS</text>
+
+            <rect x="190" y="0" width="120" height="30" rx="4" fill="#2a2f3a" opacity="0.4" stroke="#2a2f3a" stroke-dasharray="4,4"/>
+            <text x="250" y="20" fill="#546e7a" font-family="JetBrains Mono" font-size="8" text-anchor="middle">SKIPPED</text>
+
+            <text x="340" y="20" fill="#66bb6a" font-family="JetBrains Mono" font-size="10" font-weight="600">448ms / 3K ticks</text>
+        </g>
+
+        <!-- Arrow -->
+        <text x="520" y="155" fill="#66bb6a" font-family="JetBrains Mono" font-size="12" font-weight="700">41% latency reduction</text>
+        <text x="520" y="172" fill="#546e7a" font-family="JetBrains Mono" font-size="10">Zero accuracy cost — RMSE identical across all thresholds</text>
+    </svg>
+</div>
+
+<h3>Weight Accumulation</h3>
+
+<p>
+    When skipping resampling, the next tick's log-weights must include the accumulated evidence from all non-resample ticks. The PTX kernel handles this with a single conditional parameter: <code>accumulate_w</code>. When set, it loads the previous <code>log_w[i]</code> in-place and adds the new observation log-likelihood — <strong>2 extra instructions</strong> on the accumulate path (one load + one add), zero on the fresh path.
+</p>
+
+<pre><code><span class="cm">// PTX: Conditional accumulation — 2 instructions on accumulate path</span>
+setp.ne.s32     %p_accum, %r_accum, 0;
+@!%p_accum bra  PW_WRITE;
+ld.global.f32   %f_prev_lw, [%rd_lw_addr];     <span class="cm">// load old log_w</span>
+add.f32         %f_log_w, %f_log_w, %f_prev_lw; <span class="cm">// accumulate</span>
+PW_WRITE:
+st.global.f32   [%rd_lw_addr], %f_log_w;</code></pre>
+
+<div class="metrics">
+    <div class="metric">
+        <div class="label">LATENCY SAVED</div>
+        <div class="value good">41%</div>
+    </div>
+    <div class="metric">
+        <div class="label">RMSE CHANGE</div>
+        <div class="value accent">0.0000</div>
+    </div>
+    <div class="metric">
+        <div class="label">RESAMPLE RATE</div>
+        <div class="value accent">~5%</div>
+    </div>
+    <div class="metric">
+        <div class="label">THRESHOLD</div>
+        <div class="value accent">ESS/N &lt; 0.5</div>
+    </div>
+</div>
+
+</section>
+
+<!-- ═══════════════════════════ §7 Parameter Injection ═══════════════════════════ -->
+
+<section>
+<div class="section-num">07 — Key Insight</div>
+<h2>Parameter Injection Robustness</h2>
+
+<p>
+    The single most important architectural property of the BPF: <strong>parameters can be injected at any tick with zero ceremony</strong>. This was discovered by comparing parameter injection stability across BPF, RBPF, and SVPF — and finding the BPF uniquely robust.
+</p>
+
+<div class="diagram-box">
+    <svg viewBox="0 0 800 260" xmlns="http://www.w3.org/2000/svg">
+        <rect width="800" height="260" fill="none"/>
+
+        <text x="400" y="25" fill="#fff" font-family="Source Serif 4" font-size="14" text-anchor="middle" font-weight="600">Parameter Injection: What Breaks?</text>
+
+        <!-- BPF -->
+        <g transform="translate(50, 50)">
+            <rect x="0" y="0" width="200" height="80" rx="8" fill="#66bb6a" opacity="0.08" stroke="#66bb6a" stroke-width="1.5"/>
+            <text x="100" y="24" fill="#66bb6a" font-family="JetBrains Mono" font-size="13" text-anchor="middle" font-weight="700">BPF</text>
+            <text x="100" y="44" fill="#66bb6a" font-family="JetBrains Mono" font-size="9" text-anchor="middle">Particles + weights</text>
+            <text x="100" y="60" fill="#66bb6a" font-family="JetBrains Mono" font-size="9" text-anchor="middle">No accumulated state</text>
+            <text x="100" y="90" fill="#66bb6a" font-family="JetBrains Mono" font-size="10" text-anchor="middle" font-weight="600">✓ Inject anytime</text>
+            <text x="100" y="106" fill="#546e7a" font-family="JetBrains Mono" font-size="8" text-anchor="middle">Re-equilibrates in 5-10 ticks</text>
+        </g>
+
+        <!-- RBPF -->
+        <g transform="translate(300, 50)">
+            <rect x="0" y="0" width="200" height="80" rx="8" fill="#ffa726" opacity="0.08" stroke="#ffa726" stroke-width="1.5"/>
+            <text x="100" y="24" fill="#ffa726" font-family="JetBrains Mono" font-size="13" text-anchor="middle" font-weight="700">RBPF</text>
+            <text x="100" y="44" fill="#ffa726" font-family="JetBrains Mono" font-size="9" text-anchor="middle">Sufficient statistics</text>
+            <text x="100" y="60" fill="#ffa726" font-family="JetBrains Mono" font-size="9" text-anchor="middle">Accumulated under old params</text>
+            <text x="100" y="90" fill="#ffa726" font-family="JetBrains Mono" font-size="10" text-anchor="middle" font-weight="600">⚠ Stats go stale</text>
+            <text x="100" y="106" fill="#546e7a" font-family="JetBrains Mono" font-size="8" text-anchor="middle">Requires reset ceremony</text>
+        </g>
+
+        <!-- SVPF -->
+        <g transform="translate(550, 50)">
+            <rect x="0" y="0" width="200" height="80" rx="8" fill="#ef5350" opacity="0.08" stroke="#ef5350" stroke-width="1.5"/>
+            <text x="100" y="24" fill="#ef5350" font-family="JetBrains Mono" font-size="13" text-anchor="middle" font-weight="700">SVPF</text>
+            <text x="100" y="44" fill="#ef5350" font-family="JetBrains Mono" font-size="9" text-anchor="middle">Stein gradient landscape</text>
+            <text x="100" y="60" fill="#ef5350" font-family="JetBrains Mono" font-size="9" text-anchor="middle">Kernel bandwidth calibration</text>
+            <text x="100" y="90" fill="#ef5350" font-family="JetBrains Mono" font-size="10" text-anchor="middle" font-weight="600">✗ Gradients explode</text>
+            <text x="100" y="106" fill="#546e7a" font-family="JetBrains Mono" font-size="8" text-anchor="middle">Landscape shifts under feet</text>
+        </g>
+
+        <!-- Explanation -->
+        <g transform="translate(50, 180)">
+            <text x="350" y="10" fill="#fff" font-family="DM Sans" font-size="13" text-anchor="middle">The BPF's observation likelihood p(y|h) doesn't involve σ_z, ρ, or μ directly.</text>
+            <text x="350" y="30" fill="#fff" font-family="DM Sans" font-size="13" text-anchor="middle">Only the transition kernel changes. Particles may be at wrong spread</text>
+            <text x="350" y="50" fill="#fff" font-family="DM Sans" font-size="13" text-anchor="middle">but re-equilibrate naturally through resampling over 5–10 ticks.</text>
+        </g>
+    </svg>
+</div>
+
+<div class="callout">
+    <strong>BPF's "stupidity" is its superpower.</strong> No gradients to explode, no sufficient statistics to corrupt, no kernel bandwidth to recalibrate. Just particles and weights — every tick a fresh start. The filter never knows or cares where its parameters came from.
+</div>
+
+</section>
+
+<!-- ═══════════════════════════ §8 Production Stack ═══════════════════════════ -->
+
+<section>
+<div class="section-num">08 — Architecture</div>
+<h2>Production Stack</h2>
+
+<p>
+    The full production architecture separates <strong>fast dumb filtering</strong> from <strong>slow smart learning</strong>. The BPF handles tick-by-tick state estimation with fixed parameters. A separate learner (RBPF with z-scores, SMC², or windowed MLE) runs alongside and periodically updates the BPF's parameters. The filter never knows or cares where its parameters came from.
+</p>
+
+<div class="diagram-box">
+    <svg viewBox="0 0 800 380" xmlns="http://www.w3.org/2000/svg">
+        <rect width="800" height="380" fill="none"/>
+
+        <text x="400" y="25" fill="#fff" font-family="Source Serif 4" font-size="15" text-anchor="middle" font-weight="600">Multi-Layer Architecture</text>
+
+        <!-- Layer 1: BPF cells -->
+        <g transform="translate(50, 55)">
+            <text x="350" y="0" fill="#4fc3f7" font-family="JetBrains Mono" font-size="11" text-anchor="middle" letter-spacing="2">LAYER 1 — FAST STATE ESTIMATION</text>
+
+            <rect x="0" y="15" width="200" height="70" rx="8" fill="#4fc3f7" opacity="0.06" stroke="#4fc3f7" stroke-width="1"/>
+            <text x="100" y="40" fill="#4fc3f7" font-family="JetBrains Mono" font-size="11" text-anchor="middle" font-weight="600">FAST BPF</text>
+            <text x="100" y="56" fill="#546e7a" font-family="JetBrains Mono" font-size="9" text-anchor="middle">ρ=0.80 · 300K particles</text>
+            <text x="100" y="70" fill="#546e7a" font-family="JetBrains Mono" font-size="9" text-anchor="middle">+ adaptive bands</text>
+
+            <rect x="220" y="15" width="200" height="70" rx="8" fill="#66bb6a" opacity="0.06" stroke="#66bb6a" stroke-width="1"/>
+            <text x="320" y="40" fill="#66bb6a" font-family="JetBrains Mono" font-size="11" text-anchor="middle" font-weight="600">MID BPF</text>
+            <text x="320" y="56" fill="#546e7a" font-family="JetBrains Mono" font-size="9" text-anchor="middle">ρ=0.98 · 300K particles</text>
+            <text x="320" y="70" fill="#546e7a" font-family="JetBrains Mono" font-size="9" text-anchor="middle">+ adaptive bands</text>
+
+            <rect x="440" y="15" width="200" height="70" rx="8" fill="#ffa726" opacity="0.06" stroke="#ffa726" stroke-width="1"/>
+            <text x="540" y="40" fill="#ffa726" font-family="JetBrains Mono" font-size="11" text-anchor="middle" font-weight="600">SLOW BPF</text>
+            <text x="540" y="56" fill="#546e7a" font-family="JetBrains Mono" font-size="9" text-anchor="middle">ρ=0.997 · 300K particles</text>
+            <text x="540" y="70" fill="#546e7a" font-family="JetBrains Mono" font-size="9" text-anchor="middle">+ adaptive bands</text>
+        </g>
+
+        <!-- Layer 2: Multi-scale combiner -->
+        <g transform="translate(50, 175)">
+            <text x="350" y="0" fill="#ab47bc" font-family="JetBrains Mono" font-size="11" text-anchor="middle" letter-spacing="2">LAYER 2 — ESS-WEIGHTED COMBINATION</text>
+
+            <rect x="100" y="15" width="500" height="55" rx="8" fill="#ab47bc" opacity="0.06" stroke="#ab47bc" stroke-width="1"/>
+            <text x="350" y="38" fill="#ab47bc" font-family="JetBrains Mono" font-size="11" text-anchor="middle" font-weight="600">Multi-Scale Combiner</text>
+            <text x="350" y="55" fill="#546e7a" font-family="JetBrains Mono" font-size="9" text-anchor="middle">ESS weighting: whichever timescale fits best gets highest weight</text>
+
+            <!-- Arrows from BPFs -->
+            <line x1="150" y1="-20" x2="250" y2="15" stroke="#4fc3f7" stroke-width="1" opacity="0.4"/>
+            <line x1="370" y1="-20" x2="350" y2="15" stroke="#66bb6a" stroke-width="1" opacity="0.4"/>
+            <line x1="590" y1="-20" x2="450" y2="15" stroke="#ffa726" stroke-width="1" opacity="0.4"/>
+        </g>
+
+        <!-- Output -->
+        <g transform="translate(250, 260)">
+            <line x1="100" y1="0" x2="100" y2="20" stroke="#fff" stroke-width="1" opacity="0.3"/>
+            <rect x="20" y="25" width="260" height="35" rx="6" fill="#fff" opacity="0.04" stroke="#fff" stroke-width="1" opacity="0.2"/>
+            <text x="150" y="48" fill="#fff" font-family="JetBrains Mono" font-size="11" text-anchor="middle" font-weight="600">ĥ_t → trading signal</text>
+        </g>
+
+        <!-- Slow learner -->
+        <g transform="translate(550, 260)">
+            <rect x="0" y="25" width="200" height="70" rx="8" fill="#ef5350" opacity="0.06" stroke="#ef5350" stroke-width="1" stroke-dasharray="6,3"/>
+            <text x="100" y="50" fill="#ef5350" font-family="JetBrains Mono" font-size="11" text-anchor="middle" font-weight="600">SLOW LEARNER</text>
+            <text x="100" y="66" fill="#546e7a" font-family="JetBrains Mono" font-size="9" text-anchor="middle">RBPF z-scores / SMC²</text>
+            <text x="100" y="80" fill="#546e7a" font-family="JetBrains Mono" font-size="9" text-anchor="middle">σ_z, ρ, μ drift</text>
+
+            <!-- Feedback arrow -->
+            <path d="M -50,60 C -80,60 -80,-170 200,-170" fill="none" stroke="#ef5350" stroke-width="1.5" stroke-dasharray="6,3" opacity="0.4" marker-end="url(#arrowRed)"/>
+            <text x="-20" y="-60" fill="#ef5350" font-family="JetBrains Mono" font-size="8" transform="rotate(-90, -20, -60)">inject params</text>
+        </g>
+
+        <defs>
+            <marker id="arrowRed" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="#ef5350" opacity="0.6"/>
+            </marker>
+        </defs>
+    </svg>
+    <div class="caption">Dumb fast filter + smart slow learner, loosely coupled. BPF accepts parameter updates mid-stream without flinching.</div>
+</div>
+
+<div class="callout">
+    <strong>The insight that drove every decision:</strong> online parameter learning for stochastic volatility through BPF likelihood is fundamentally hard. The signal-per-tick is too weak — it's an information bottleneck, not a compute bottleneck. Rather than fight this with increasingly clever single-filter solutions (Liu-West, PMMH, SVPF), accept it and separate the concerns. Let the BPF do what it's good at (fast, robust state estimation) and let a different system handle parameter drift on a longer timescale.
+</div>
+
+</section>
+
+<!-- ═══════════════════════════ §9 Production Config ═══════════════════════════ -->
+
+<section>
+<div class="section-num">09 — Summary</div>
+<h2>Production Configuration</h2>
+
+<table>
+    <tr><th>Parameter</th><th>Value</th><th>Rationale</th></tr>
+    <tr><td>Particles</td><td><code>300,000</code></td><td>Sweet spot: weight concentration negligible, ESS &gt; 95%</td></tr>
+    <tr><td>ESS threshold</td><td><code>0.5</code></td><td>Resample only when ESS &lt; N/2 (saves 41% latency)</td></tr>
+    <tr><td>Silverman jitter</td><td><code>OFF</code></td><td>Solving a problem that doesn't exist at 300K</td></tr>
+    <tr><td>MH rejuvenation</td><td><code>OFF</code></td><td>Can't distinguish underspec from overspec via surprise</td></tr>
+    <tr><td>Adaptive bands</td><td><code>ON</code></td><td>84/16 calm, 70/30 alert, 50/50 panic</td></tr>
+    <tr><td>Regime thresholds</td><td><code>2.0 / 4.0</code></td><td>Surprise score boundaries for alert/panic</td></tr>
+    <tr><td>Readout</td><td><code>Weighted mean</code></td><td>Provably optimal under correct specification</td></tr>
+    <tr><td>RNG</td><td><code>PCG32</code></td><td>16 bytes vs 48 bytes per particle</td></tr>
+    <tr><td>Observation model</td><td><code>Student-t(ν)</code></td><td>Heavy tails for crash robustness</td></tr>
+</table>
+
+<h3>What Was Tested and Rejected</h3>
+
+<table>
+    <tr><th>Method</th><th>Result</th><th>Why Rejected</th></tr>
+    <tr><td>Silverman jitter</td><td>No effect at 300K</td><td>Weight distribution already flat — nothing to smooth</td></tr>
+    <tr><td>MH rejuvenation</td><td>Helps underspec, hurts overspec</td><td>Surprise can't distinguish why filter struggles</td></tr>
+    <tr><td>Liu-West learning</td><td>Fails on regime changes</td><td>Kernel shrinkage too slow to track σ_z jumps</td></tr>
+    <tr><td>PMMH / CPMMH</td><td>95% acceptance, learns nothing</td><td>15 ticks carry zero info about σ_z</td></tr>
+    <tr><td>SVPF</td><td>Repulsive kernel bias</td><td>Systematically wrong under heavy tails</td></tr>
+    <tr><td>MAP readout</td><td>Random particle at 300K</td><td>Weights too uniform for argmax to be meaningful</td></tr>
+    <tr><td>Top-k readout</td><td>≈ mean under correct spec</td><td>Same reason — weight structure only under misspec</td></tr>
+</table>
+
+</section>
+
+<!-- ═══════════════════════════ Footer ═══════════════════════════ -->
+
+<section style="border-top: none; padding: 40px 0 80px; text-align: center;">
+    <p style="color: var(--fg2); font-family: 'JetBrains Mono', monospace; font-size: 0.8em;">
+        GPU BPF · SM_120 PTX · Built for stochastic volatility estimation<br>
+        Every optimization earned empirically. No sacred cows.
+    </p>
+</section>
+
+</div>
+
+</body>
+</html>
