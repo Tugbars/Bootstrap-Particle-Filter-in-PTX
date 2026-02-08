@@ -274,6 +274,28 @@ static MatchedTestData* gen_fast_revert_highvol(int n, int seed) {
     return d;
 }
 
+// Gaussian-state version of the stress scenario — optimal proposal actually runs
+static MatchedTestData* gen_fast_revert_highvol_gauss(int n, int seed) {
+    MatchedTestData* d = alloc_matched_data(n);
+    d->scenario_id   = 10;
+    d->scenario_name = "FastRev+HiVoV(G)";
+    d->scenario_desc = "rho=0.85 sz=0.50 mu=-4.5 Gauss/t(5) — optimal proposal test";
+    pcg32_dgp_t rng; pcg32_dgp_seed(&rng, seed);
+    generate_matched_series(d, 0.85, 0.50, -4.5, 0.0, 5.0, &rng);
+    return d;
+}
+
+// Fast revert, moderate vol-of-vol, Gaussian state
+static MatchedTestData* gen_fast_revert_gauss(int n, int seed) {
+    MatchedTestData* d = alloc_matched_data(n);
+    d->scenario_id   = 11;
+    d->scenario_name = "FastRevert (G)";
+    d->scenario_desc = "rho=0.90 sz=0.15 mu=-4.5 Gauss/t(5) — moderate optimal test";
+    pcg32_dgp_t rng; pcg32_dgp_seed(&rng, seed);
+    generate_matched_series(d, 0.90, 0.15, -4.5, 0.0, 5.0, &rng);
+    return d;
+}
+
 typedef MatchedTestData* (*ScenarioGenFn)(int, int);
 
 static const struct {
@@ -288,6 +310,8 @@ static const struct {
     { gen_fast_revert },
     { gen_gaussian },
     { gen_fast_revert_highvol },
+    { gen_fast_revert_highvol_gauss },
+    { gen_fast_revert_gauss },
 };
 static const int N_SCENARIOS = sizeof(ALL_SCENARIOS) / sizeof(ALL_SCENARIOS[0]);
 
