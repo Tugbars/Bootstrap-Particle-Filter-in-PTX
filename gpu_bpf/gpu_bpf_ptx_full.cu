@@ -16,12 +16,6 @@
  *  11.  bpf_compute_var
  *  12.  bpf_gen_noise
  *  13.  bpf_silverman_jitter
- *  14.  bpf_propagate_weight_opt — Mode-matched Gaussian optimal proposal
- *
- * Kernel 14 is a drop-in replacement for kernel 3. Instead of blind OU
- * proposal, it finds the mode of log p(y|h) + log p(h|h_{t-1}) via 3
- * Newton iterations, samples from N(h_mode, -1/g''), and corrects
- * importance weights. Toggle: gpu_bpf_use_optimal_proposal(1).
  *
  * PCG32 state: 16 bytes/particle (2 x u64) vs curandState ~48 bytes/particle.
  * Normal generation: ICDF (Acklam rational approx) — 1 uniform per normal.
@@ -106,12 +100,10 @@ typedef struct {
     CUfunction compute_var;
     CUfunction gen_noise;
     CUfunction silverman_jitter;
-    CUfunction propagate_weight_opt;  // Kernel 14: mode-matched optimal proposal
 } PtxFunctions;
 
 static PtxFunctions g_ptx;
 static int          g_ptx_loaded = 0;
-static int          g_use_optimal_proposal = 0;  // 0=bootstrap(k3), 1=optimal(k14)
 
 // Constant memory for band config
 static CUdeviceptr  g_d_mix_config = 0;
@@ -203,20 +195,8 @@ extract:
     cuModuleGetFunction(&g_ptx.gen_noise,         g_ptx_module, "bpf_gen_noise");
     cuModuleGetFunction(&g_ptx.silverman_jitter,  g_ptx_module, "bpf_silverman_jitter");
 
-    // Kernel 14: optimal proposal (soft-fail if PTX doesn't have it)
-    CUresult opt_err = cuModuleGetFunction(&g_ptx.propagate_weight_opt,
-                                            g_ptx_module, "bpf_propagate_weight_opt");
-    int has_optimal = (opt_err == CUDA_SUCCESS);
-
     g_ptx_loaded = 1;
-    fprintf(stderr, "[PTX-FULL] %d kernels loaded (optimal proposal: %s)\n",
-            has_optimal ? 14 : 13, has_optimal ? "YES" : "NO");
-
-    if (g_use_optimal_proposal && !has_optimal) {
-        fprintf(stderr, "[PTX-FULL] WARNING: optimal proposal requested but kernel 14 "
-                        "not found in PTX. Falling back to bootstrap.\n");
-        g_use_optimal_proposal = 0;
-    }
+    fprintf(stderr, "[PTX-FULL] 13 kernels loaded\n");
 
     // Get constant memory symbol for band config
     cuModuleGetGlobal(&g_d_mix_config, &g_d_mix_config_size,
@@ -502,9 +482,7 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
         mix_maybe_switch_regime(s->last_surprise);
     }
 
-    // 2. Propagate + weight
-    //    Bootstrap (kernel 3): blind OU proposal, obs-only weight
-    //    Optimal   (kernel 14): mode-matched Gaussian, importance-corrected weight
+    // 2. Propagate + weight (kernel 3: OU proposal, obs log-likelihood)
     {
         int do_prop = (s->timestep > 0) ? 1 : 0;
         void* params[] = {
@@ -512,10 +490,7 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
             &s->rho, &s->sigma_z, &s->mu, &s->nu_state, &s->nu_obs,
             &s->C_obs, &y_t, &n, &do_prop
         };
-        CUfunction prop_fn = (g_use_optimal_proposal && g_ptx.propagate_weight_opt)
-                           ? g_ptx.propagate_weight_opt
-                           : g_ptx.propagate_weight;
-        ptx_launch(prop_fn, st, g, b, 0, params);
+        ptx_launch(g_ptx.propagate_weight, st, g, b, 0, params);
     }
 
     // 2b. Accumulate previous log-weights if we skipped resampling last tick
@@ -716,29 +691,6 @@ void gpu_bpf_set_ess_threshold(GpuBpfState* s, float threshold) {
 
 int gpu_bpf_get_resample_count(GpuBpfState* s) {
     return s->resample_count;
-}
-
-// =============================================================================
-// Optimal proposal toggle
-//
-// Call gpu_bpf_use_optimal_proposal(1) BEFORE gpu_bpf_create() to use
-// kernel 14 (mode-matched Gaussian) instead of kernel 3 (bootstrap).
-// Same signature, same launch config — just smarter particle placement.
-//
-// If kernel 14 is not in the PTX file, silently falls back to bootstrap.
-// =============================================================================
-
-void gpu_bpf_use_optimal_proposal(int enable) {
-    g_use_optimal_proposal = enable;
-    if (g_ptx_loaded && enable && !g_ptx.propagate_weight_opt) {
-        fprintf(stderr, "[PTX-FULL] WARNING: optimal proposal kernel not loaded. "
-                        "Falling back to bootstrap.\n");
-        g_use_optimal_proposal = 0;
-    }
-}
-
-int gpu_bpf_get_optimal_proposal(void) {
-    return g_use_optimal_proposal;
 }
 
 // =============================================================================

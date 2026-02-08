@@ -209,8 +209,7 @@ set_target_properties(gpu_bpf_ptx PROPERTIES
 # ==============================================================================
 # Library: gpu_bpf_ptx_full (100% PTX BPF + cuRAND chi2 pregeneration)
 #
-# 14 BPF kernels in hand-written PTX. PCG32 PRNG, ICDF normals.
-# Kernel 14: mode-matched Gaussian optimal proposal (runtime toggle).
+# 13 BPF kernels in hand-written PTX. PCG32 PRNG, ICDF normals.
 # cuRAND used only for bulk chi2 generation. APF still nvcc-compiled.
 # ==============================================================================
 
@@ -302,7 +301,7 @@ set_target_properties(test_mix_bands PROPERTIES
 
 
 # ==============================================================================
-# Target: test_bpf_ptx_full (bootstrap vs optimal proposal A/B test suite)
+# Target: test_bpf_ptx_full (matched-DGP BPF accuracy and throughput)
 # ==============================================================================
 
 add_executable(test_bpf_ptx_full tests/test_bpf_matched_dgp.cu)
