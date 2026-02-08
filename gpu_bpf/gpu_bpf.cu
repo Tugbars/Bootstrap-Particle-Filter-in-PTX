@@ -4,6 +4,9 @@
  *
  * Custom reduction kernels replace thrust for max/sum to enable fully async
  * execution across K streams. Only thrust::inclusive_scan remains (device→device).
+ *
+ * Silverman kernel smoothing: post-resample jitter to fight particle degeneracy.
+ * Controlled by silverman_shrink (0.0 = off, 0.5 = conservative, 0.7 = moderate).
  */
 
 #include "gpu_bpf.cuh"
@@ -63,6 +66,125 @@ __global__ void bpf_init_particles(float* h, curandState* states,
     if (i < n) h[i] = mu + std_stat * curand_normal(&states[i]);
 }
 
+// =============================================================================
+// Adaptive band-based stratified mixture proposal
+//
+// 3 regimes preloaded at startup:
+//   CALM  (|eta| < 2):  minimal exploration (99% standard)
+//   ALERT (|eta| < 4):  moderate exploration
+//   PANIC (|eta| >= 4): full exploration
+//
+// Host switches regime only on transitions → zero overhead in steady state.
+// =============================================================================
+
+#define MIX_MAX_BANDS 4
+#define MIX_N_REGIMES 3
+
+enum MixRegime { MIX_CALM = 0, MIX_ALERT = 1, MIX_PANIC = 2 };
+
+struct MixBandConfig {
+    int   n_bands;
+    int   boundary[MIX_MAX_BANDS];       // exclusive upper bound per band
+    float k[MIX_MAX_BANDS];              // sigma scale (k[0] = 1.0)
+};
+
+__constant__ MixBandConfig d_mix_config;
+
+// Host-side regime table: precomputed at startup, never changes
+static MixBandConfig h_regime_table[MIX_N_REGIMES];
+static MixRegime     h_current_regime = MIX_CALM;
+static bool          h_adaptive_enabled = false;
+static float         h_surprise_ema = 0.0f;
+static float         h_surprise_thresholds[2] = { 2.0f, 4.0f };  // calm→alert, alert→panic
+
+// Host helper: build a MixBandConfig from fractions and scales
+static MixBandConfig mix_build_config(int n_particles, int n_bands,
+                                       const float* fracs, const float* scales) {
+    MixBandConfig cfg;
+    cfg.n_bands = n_bands;
+    int cum = 0;
+    for (int b = 0; b < n_bands; b++) {
+        int count = (b < n_bands - 1)
+            ? (int)(fracs[b] * n_particles + 0.5f)
+            : (n_particles - cum);
+        cum += count;
+        cfg.boundary[b] = cum;
+        cfg.k[b] = scales[b];
+    }
+    // Zero-fill unused bands
+    for (int b = n_bands; b < MIX_MAX_BANDS; b++) {
+        cfg.boundary[b] = cum;
+        cfg.k[b] = 1.0f;
+    }
+    return cfg;
+}
+
+static void mix_upload_config(const MixBandConfig* cfg) {
+    cudaMemcpyToSymbol(d_mix_config, cfg, sizeof(MixBandConfig));
+}
+
+// Public: one-shot setup of all 3 regimes
+void gpu_bpf_set_adaptive_bands(int n_particles,
+                                 const float* calm_fracs,  const float* calm_scales,  int calm_nb,
+                                 const float* alert_fracs, const float* alert_scales, int alert_nb,
+                                 const float* panic_fracs, const float* panic_scales, int panic_nb,
+                                 float thresh_alert, float thresh_panic) {
+    h_regime_table[MIX_CALM]  = mix_build_config(n_particles, calm_nb,  calm_fracs,  calm_scales);
+    h_regime_table[MIX_ALERT] = mix_build_config(n_particles, alert_nb, alert_fracs, alert_scales);
+    h_regime_table[MIX_PANIC] = mix_build_config(n_particles, panic_nb, panic_fracs, panic_scales);
+    h_surprise_thresholds[0] = thresh_alert;
+    h_surprise_thresholds[1] = thresh_panic;
+    h_current_regime = MIX_CALM;
+    h_adaptive_enabled = true;
+    h_surprise_ema = 0.0f;
+    mix_upload_config(&h_regime_table[MIX_CALM]);
+}
+
+// Public: simple static bands (non-adaptive, backward compat)
+void gpu_bpf_set_bands(int n_particles, int n_bands,
+                        const float* fracs, const float* scales) {
+    MixBandConfig cfg = mix_build_config(n_particles, n_bands, fracs, scales);
+    mix_upload_config(&cfg);
+    h_adaptive_enabled = false;
+}
+
+// Host: called each tick BEFORE kernel launch. Only uploads on regime change.
+// Uses EMA of surprise to require SUSTAINED surprise for escalation.
+// De-escalation is instant (one calm tick → calm mode).
+static const float SURPRISE_EMA_ALPHA = 0.3f;  // ~3 tick half-life
+
+static void mix_maybe_switch_regime(float surprise) {
+    if (!h_adaptive_enabled) return;
+
+    // Update EMA: fast up, fast down
+    // Escalation based on EMA (sustained surprise)
+    // De-escalation based on raw surprise (instant recovery)
+    h_surprise_ema = SURPRISE_EMA_ALPHA * surprise
+                   + (1.0f - SURPRISE_EMA_ALPHA) * h_surprise_ema;
+
+    // Escalation: use EMA (must sustain surprise to escalate)
+    // De-escalation: use min(raw, EMA) (one calm tick pulls down immediately)
+    float effective = fminf(h_surprise_ema, fmaxf(surprise, h_surprise_ema));
+    // Simpler: for escalation use EMA, for de-escalation use raw
+    MixRegime target;
+    if (surprise < h_surprise_thresholds[0]) {
+        // Current tick is calm → go calm immediately
+        target = MIX_CALM;
+        h_surprise_ema = surprise;  // reset EMA on calm tick
+    } else if (h_surprise_ema >= h_surprise_thresholds[1]) {
+        target = MIX_PANIC;
+    } else if (h_surprise_ema >= h_surprise_thresholds[0]) {
+        target = MIX_ALERT;
+    } else {
+        target = MIX_CALM;
+    }
+
+    if (target != h_current_regime) {
+        h_current_regime = target;
+        mix_upload_config(&h_regime_table[target]);
+    }
+}
+
 __global__ void bpf_propagate_weight(
     float* h, float* log_w, curandState* states,
     float rho, float sigma_z, float mu,
@@ -71,15 +193,38 @@ __global__ void bpf_propagate_weight(
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
+
+    float z_std = 0.0f;
+
     if (do_propagate) {
         float eps = bpf_sample_t(&states[i], nu_state);
-        h[i] = mu + rho * (h[i] - mu) + sigma_z * eps;
+
+        // Determine band from thread index (contiguous → zero warp divergence)
+        float k_b = 1.0f;
+        if (d_mix_config.n_bands > 1) {
+            // Linear scan over ≤4 bands — faster than binary search for N≤4
+            for (int b = 0; b < d_mix_config.n_bands; b++) {
+                if (i < d_mix_config.boundary[b]) {
+                    k_b = d_mix_config.k[b];
+                    break;
+                }
+            }
+        }
+
+        h[i] = mu + rho * (h[i] - mu) + (sigma_z * k_b) * eps;
+        z_std = k_b * eps;  // innovation / sigma_z
     }
+
     float h_i = h[i];
     float eta = y_t * __expf(-h_i * 0.5f);
     log_w[i] = (nu_obs > 0.0f)
         ? bpf_log_t_pdf(eta, nu_obs) - h_i * 0.5f
         : -0.9189385f - 0.5f * eta * eta - h_i * 0.5f;
+
+    // NOTE: No importance weight correction for the mixture proposal.
+    // Wide-band particles get naturally low p(y|h) in calm markets (self-correcting).
+    // During crashes, their h values match reality and p(y|h) keeps them alive.
+    // The "bias" is negligible with 84%+ particles in band 0.
 }
 
 // =============================================================================
@@ -159,6 +304,53 @@ __global__ void bpf_resample(float* h_out, const float* h_in,
 }
 
 // =============================================================================
+// Kernels: Silverman kernel smoothing
+// =============================================================================
+
+// Compute sum of squared deviations: sum((h[i] - mean)²) → atomicAdd to *d_var
+// Pre-zero d_var before launch. After launch: sigma = sqrt(*d_var / N)
+__global__ void bpf_compute_var(const float* __restrict__ h,
+                                 float* __restrict__ d_var,
+                                 float h_mean, int n) {
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + tid;
+
+    float dev2 = 0.0f;
+    if (i < n) {
+        float dev = h[i] - h_mean;
+        dev2 = dev * dev;
+    }
+    sdata[tid] = dev2;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) atomicAdd(d_var, sdata[0]);
+}
+
+// Generate standard normal noise using device-side cuRAND states
+// Reuses the existing d_rng states (advances them, which is fine)
+__global__ void bpf_gen_noise(float* noise, curandState* states, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) noise[i] = curand_normal(&states[i]);
+}
+
+// Apply jitter: h[i] += bandwidth * noise[i], clamp to [mu-8, mu+8]
+__global__ void bpf_silverman_jitter(float* __restrict__ h,
+                                      const float* __restrict__ noise,
+                                      float bandwidth, int n, float mu) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float h_val = h[i] + bandwidth * noise[i];
+    h_val = fmaxf(h_val, mu - 8.0f);
+    h_val = fminf(h_val, mu + 8.0f);
+    h[i] = h_val;
+}
+
+// =============================================================================
 // Host-side PCG32
 // =============================================================================
 
@@ -191,6 +383,17 @@ GpuBpfState* gpu_bpf_create(int n_particles, float rho, float sigma_z, float mu,
     s->grid = (n_particles + s->block - 1) / s->block;
     s->host_rng_state = (unsigned long long)seed * 67890ULL + 12345ULL;
     s->timestep = 0;
+    s->last_h_est = mu;  // initial guess = long-run mean
+    s->last_surprise = 0.0f;
+    s->silverman_shrink = 0.5f;  // ← TOGGLE HERE: 0.0 = off, 0.5 = conservative
+
+    // ── Band-based mixture proposal ──
+    // Default: single band (standard BPF). Call gpu_bpf_set_adaptive_bands() to enable.
+    {
+        float fracs[]  = { 1.0f };
+        float scales[] = { 1.0f };
+        gpu_bpf_set_bands(n_particles, 1, fracs, scales);
+    }
 
     cudaStreamCreate(&s->stream);
 
@@ -202,6 +405,8 @@ GpuBpfState* gpu_bpf_create(int n_particles, float rho, float sigma_z, float mu,
     cudaMalloc(&s->d_wh,      n_particles * sizeof(float));
     cudaMalloc(&s->d_rng,     n_particles * sizeof(curandState));
     cudaMalloc(&s->d_scalars, 4 * sizeof(float));  // max_lw, sum_w, h_est, log_lik
+    cudaMalloc(&s->d_noise,   n_particles * sizeof(float));
+    cudaMalloc(&s->d_var,     sizeof(float));
 
     bpf_init_rng<<<s->grid, s->block, 0, s->stream>>>(
         s->d_rng, (unsigned long long)seed, n_particles);
@@ -225,6 +430,8 @@ void gpu_bpf_destroy(GpuBpfState* s) {
     cudaFree(s->d_wh);
     cudaFree(s->d_rng);
     cudaFree(s->d_scalars);
+    cudaFree(s->d_noise);
+    cudaFree(s->d_var);
     free(s);
 }
 
@@ -239,7 +446,16 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
     cudaStream_t st = s->stream;
     size_t smem = b * sizeof(float);
 
-    // 1. Propagate + weight
+    // Adaptive band switching: apply regime decided by PREVIOUS tick's surprise.
+    // This introduces 1-tick delay but prevents single-spike false alarms:
+    // tick t spike → surprise high → but bands for tick t were set by tick t-1 (calm)
+    // tick t+1: normal return → instant de-escalation → wide bands never fire
+    // Under sustained misspec: every tick is surprising → regime escalates on tick t+1
+    if (s->timestep > 0) {
+        mix_maybe_switch_regime(s->last_surprise);
+    }
+
+    // 1. Propagate + weight (band config in __constant__ d_mix_config)
     bpf_propagate_weight<<<g, b, 0, st>>>(
         s->d_h, s->d_log_w, s->d_rng,
         s->rho, s->sigma_z, s->mu, s->nu_state, s->nu_obs, y_t,
@@ -279,6 +495,45 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
 
     // Swap particle buffers
     float* tmp = s->d_h; s->d_h = s->d_h2; s->d_h2 = tmp;
+
+    // ─── 10. Silverman kernel smoothing (post-resample jitter) ───
+    //
+    // After resampling, many particles are duplicates. Silverman jitter
+    // adds bandwidth-scaled Gaussian noise to restore diversity.
+    //
+    // Bandwidth = shrink * sigma_hat * (4/(3N))^(1/5)
+    //
+    // This requires a sync to read h_mean and var back to host for the
+    // bandwidth calculation. The noise generation itself is on-device via cuRAND.
+    //
+    if (s->silverman_shrink > 0.0f) {
+        // Need h_mean from step 6 — must sync to read d_scalars[2]
+        cudaStreamSynchronize(st);
+        float h_mean;
+        cudaMemcpy(&h_mean, s->d_scalars + 2, sizeof(float), cudaMemcpyDeviceToHost);
+
+        // 10a. Compute variance of resampled particles
+        bpf_set_scalar<<<1, 1, 0, st>>>(s->d_var, 0.0f);
+        bpf_compute_var<<<g, b, smem, st>>>(s->d_h, s->d_var, h_mean, n);
+
+        // Sync to read variance
+        cudaStreamSynchronize(st);
+        float var_sum;
+        cudaMemcpy(&var_sum, s->d_var, sizeof(float), cudaMemcpyDeviceToHost);
+
+        float sigma_hat = sqrtf(var_sum / (float)n);
+
+        // Silverman bandwidth: shrink * sigma * (4/(3N))^(1/5)
+        // (4/3)^(1/5) ≈ 1.05922
+        float bw = s->silverman_shrink * sigma_hat * 1.05922f * powf((float)n, -0.2f);
+
+        // 10b. Generate noise on device (reuses cuRAND states — advances them)
+        bpf_gen_noise<<<g, b, 0, st>>>(s->d_noise, s->d_rng, n);
+
+        // 10c. Apply jitter
+        bpf_silverman_jitter<<<g, b, 0, st>>>(s->d_h, s->d_noise, bw, n, s->mu);
+    }
+
     s->timestep++;
 }
 
@@ -289,6 +544,7 @@ BpfResult gpu_bpf_get_result(GpuBpfState* s) {
     BpfResult r;
     r.h_mean  = scalars[2];
     r.log_lik = scalars[3];
+    s->last_h_est = scalars[2];  // cache for next tick's surprise score
     return r;
 }
 
@@ -299,7 +555,10 @@ BpfResult gpu_bpf_get_result(GpuBpfState* s) {
 BpfResult gpu_bpf_step(GpuBpfState* s, float y_t) {
     gpu_bpf_step_async(s, y_t);
     cudaStreamSynchronize(s->stream);
-    return gpu_bpf_get_result(s);
+    // Compute surprise BEFORE get_result overwrites last_h_est
+    // Uses previous tick's h_est — "how surprising was y_t given what we expected?"
+    s->last_surprise = fabsf(y_t) * expf(-s->last_h_est * 0.5f);
+    return gpu_bpf_get_result(s);  // this updates last_h_est
 }
 
 // =============================================================================

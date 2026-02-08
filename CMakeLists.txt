@@ -272,6 +272,23 @@ set_target_properties(test_bpf_matched_dgp PROPERTIES
 )
 
 # ==============================================================================
+# Target: test_mix_bands (band-based mixture proposal validation)
+# ==============================================================================
+
+add_executable(test_mix_bands tests/test_mix_bands.cu)
+
+target_link_libraries(test_mix_bands PRIVATE
+    gpu_bpf
+    CUDA::cudart
+    CUDA::curand
+)
+
+set_target_properties(test_mix_bands PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+# ==============================================================================
 # Target: test_bpf_ptx (matched-DGP — PTX hybrid path)
 # ==============================================================================
 

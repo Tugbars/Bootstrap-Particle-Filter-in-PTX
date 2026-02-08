@@ -44,6 +44,8 @@ typedef struct {
     float rho, sigma_z, mu, nu_state, nu_obs;
     float silverman_shrink; // 0.0 = off, 0.5 = conservative, 0.7 = moderate
     unsigned long long host_rng_state;
+    float last_h_est;           // h_est from previous tick (for adaptive bands)
+    float last_surprise;        // surprise score from previous tick (delayed switching)
     int timestep;
 } GpuBpfState;
 
@@ -59,6 +61,18 @@ double gpu_bpf_run_rmse(
     int n_particles, float rho, float sigma_z, float mu,
     float nu_state, float nu_obs, int seed
 );
+
+// Band-based mixture proposal configuration
+// Static: fixed band allocation for all ticks
+void gpu_bpf_set_bands(int n_particles, int n_bands,
+                        const float* fracs, const float* scales);
+
+// Adaptive: 3 regimes (calm/alert/panic) switched by surprise score |y_t|*exp(-h/2)
+void gpu_bpf_set_adaptive_bands(int n_particles,
+                                 const float* calm_fracs,  const float* calm_scales,  int calm_nb,
+                                 const float* alert_fracs, const float* alert_scales, int alert_nb,
+                                 const float* panic_fracs, const float* panic_scales, int panic_nb,
+                                 float thresh_alert, float thresh_panic);
 
 // =============================================================================
 // Auxiliary Particle Filter (Pitt & Shephard 1999)
