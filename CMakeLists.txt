@@ -402,6 +402,20 @@ if(TARGET ptx_cubin_full)
 endif()
 
 # ==============================================================================
+# Target: test_cond_resample (Conditional resampling — GPU)
+# ==============================================================================
+
+add_executable(test_cond_resample tests/test_cond_resample.cu gpu_bpf/gpu_bpf.cu)
+
+set_target_properties(test_cond_resample PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+target_include_directories(test_cond_resample PRIVATE gpu_bpf)
+target_link_libraries(test_cond_resample curand)
+
+# ==============================================================================
 # Print summary
 # ==============================================================================
 

@@ -44,6 +44,9 @@ typedef struct {
     float rho, sigma_z, mu, nu_state, nu_obs;
     float silverman_shrink; // 0.0 = off, 0.5 = conservative, 0.7 = moderate
     int ess_adaptive;       // 1 = ESS-scaled Silverman bandwidth, 0 = fixed
+    float ess_threshold;    // 0.0 = always resample, 0.5 = resample when ESS < 0.5*N
+    int did_resample;       // flag: did we resample last tick? (for weight accumulation)
+    int resample_count;     // diagnostic: how many ticks actually resampled
     unsigned long long host_rng_state;
     float last_h_est;           // h_est from previous tick (for adaptive bands)
     float last_surprise;        // surprise score from previous tick (delayed switching)
@@ -74,6 +77,12 @@ void gpu_bpf_set_adaptive_bands(int n_particles,
                                  const float* alert_fracs, const float* alert_scales, int alert_nb,
                                  const float* panic_fracs, const float* panic_scales, int panic_nb,
                                  float thresh_alert, float thresh_panic);
+
+// Conditional resampling: only resample when ESS < threshold * N
+// threshold=0.0: always resample (default BPF behavior)
+// threshold=0.5: resample when ESS < N/2 (standard choice)
+void gpu_bpf_set_ess_threshold(GpuBpfState* state, float threshold);
+int  gpu_bpf_get_resample_count(GpuBpfState* state);
 
 // =============================================================================
 // Auxiliary Particle Filter (Pitt & Shephard 1999)

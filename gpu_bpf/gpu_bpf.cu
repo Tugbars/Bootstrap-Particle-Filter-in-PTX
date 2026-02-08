@@ -189,10 +189,14 @@ __global__ void bpf_propagate_weight(
     float* h, float* log_w, curandState* states,
     float rho, float sigma_z, float mu,
     float nu_state, float nu_obs, float y_t,
-    int n, int do_propagate
+    int n, int do_propagate, int accumulate_w
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
+
+    // Load previous accumulated log-weight BEFORE overwriting
+    float prev_lw = 0.0f;
+    if (accumulate_w) prev_lw = log_w[i];
 
     float z_std = 0.0f;
 
@@ -217,9 +221,11 @@ __global__ void bpf_propagate_weight(
 
     float h_i = h[i];
     float eta = y_t * __expf(-h_i * 0.5f);
-    log_w[i] = (nu_obs > 0.0f)
+    float new_lw = (nu_obs > 0.0f)
         ? bpf_log_t_pdf(eta, nu_obs) - h_i * 0.5f
         : -0.9189385f - 0.5f * eta * eta - h_i * 0.5f;
+
+    log_w[i] = new_lw + prev_lw;
 
     // NOTE: No importance weight correction for the mixture proposal.
     // Wide-band particles get naturally low p(y|h) in calm markets (self-correcting).
@@ -399,6 +405,9 @@ GpuBpfState* gpu_bpf_create(int n_particles, float rho, float sigma_z, float mu,
     s->last_surprise = 0.0f;
     s->silverman_shrink = 0.5f;  // ← TOGGLE HERE: 0.0 = off, 0.5 = conservative
     s->ess_adaptive = 1;         // ← TOGGLE: 1 = ESS-scaled jitter, 0 = fixed bandwidth
+    s->ess_threshold = 0.5f;     // ← TOGGLE: 0.0 = always resample, 0.5 = resample when ESS < N/2
+    s->did_resample = 1;         // force fresh weights on first tick
+    s->resample_count = 0;
 
     // ── Band-based mixture proposal ──
     // Default: single band (standard BPF). Call gpu_bpf_set_adaptive_bands() to enable.
@@ -460,19 +469,20 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
     size_t smem = b * sizeof(float);
 
     // Adaptive band switching: apply regime decided by PREVIOUS tick's surprise.
-    // This introduces 1-tick delay but prevents single-spike false alarms:
-    // tick t spike → surprise high → but bands for tick t were set by tick t-1 (calm)
-    // tick t+1: normal return → instant de-escalation → wide bands never fire
-    // Under sustained misspec: every tick is surprising → regime escalates on tick t+1
     if (s->timestep > 0) {
         mix_maybe_switch_regime(s->last_surprise);
     }
 
-    // 1. Propagate + weight (band config in __constant__ d_mix_config)
+    // Accumulate weights if we did NOT resample last tick.
+    // When accumulate_w=1, kernel does: log_w[i] = log p(y|h) + log_w_prev[i]
+    // When accumulate_w=0 (after resample): log_w[i] = log p(y|h) (fresh)
+    int accumulate_w = (s->timestep > 0 && !s->did_resample) ? 1 : 0;
+
+    // 1. Propagate + weight
     bpf_propagate_weight<<<g, b, 0, st>>>(
         s->d_h, s->d_log_w, s->d_rng,
         s->rho, s->sigma_z, s->mu, s->nu_state, s->nu_obs, y_t,
-        n, (s->timestep > 0) ? 1 : 0);
+        n, (s->timestep > 0) ? 1 : 0, accumulate_w);
 
     // 2. Max of log_w → d_scalars[0]
     bpf_set_scalar<<<1, 1, 0, st>>>(s->d_scalars + 0, -1e30f);
@@ -496,76 +506,83 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
     bpf_compute_loglik<<<1, 1, 0, st>>>(s->d_scalars, n);
 
     // 7b. ESS: sum(w_i²) → d_scalars[4].  ESS = 1/sum_w_sq.
-    //     Reuses d_wh as scratch (free after step 6).
     bpf_square_weights<<<g, b, 0, st>>>(s->d_w, s->d_wh, n);
     bpf_set_scalar<<<1, 1, 0, st>>>(s->d_scalars + 4, 0.0f);
     bpf_reduce_sum<<<g, b, smem, st>>>(s->d_wh, s->d_scalars + 4, n);
 
-    // 8. Inclusive scan for CDF (thrust on stream — device→device, no host sync)
-    thrust::inclusive_scan(
-        thrust::cuda::par.on(st),
-        thrust::device_ptr<float>(s->d_w),
-        thrust::device_ptr<float>(s->d_w + n),
-        thrust::device_ptr<float>(s->d_cdf));
-
-    // 9. Resample
-    float u = bpf_pcg32_float(&s->host_rng_state) / (float)n;
-    bpf_resample<<<g, b, 0, st>>>(s->d_h2, s->d_h, s->d_cdf, u, n);
-
-    // Swap particle buffers
-    float* tmp = s->d_h; s->d_h = s->d_h2; s->d_h2 = tmp;
-
-    // ─── 10. Silverman kernel smoothing (post-resample, ESS-adaptive jitter) ───
-    //
-    // After resampling, many particles are duplicates. Silverman jitter
-    // adds bandwidth-scaled Gaussian noise to restore diversity.
-    //
-    // Base bandwidth = shrink * sigma_hat * (4/(3N))^(1/5)
-    //
-    // ESS scaling: bw *= (N/ESS)^0.5
-    //   ESS ≈ N → scale ≈ 1 (normal conditions, standard jitter)
-    //   ESS << N → scale >> 1 (heavy degeneracy, wider jitter)
-    //
-    if (s->silverman_shrink > 0.0f) {
-        // Sync to read h_mean and sum_w_sq (both already computed on stream)
+    // ─── Conditional resampling decision ───
+    // Sync to read ESS, then branch.
+    // Cost: one sync per tick. Savings: skip cumsum + resample + Silverman when healthy.
+    bool do_resample = true;
+    if (s->ess_threshold > 0.0f) {
         cudaStreamSynchronize(st);
-        float host_scalars[5];
-        cudaMemcpy(host_scalars, s->d_scalars, 5 * sizeof(float), cudaMemcpyDeviceToHost);
-        float h_mean = host_scalars[2];
-        float sum_w_sq = host_scalars[4];
-
-        // ESS = 1/sum(w²), ESS_N = ESS/N
+        float sum_w_sq;
+        cudaMemcpy(&sum_w_sq, s->d_scalars + 4, sizeof(float), cudaMemcpyDeviceToHost);
         float ess = 1.0f / fmaxf(sum_w_sq, 1e-30f);
-        float ess_n = ess / (float)n;
+        float ess_ratio = ess / (float)n;
+        do_resample = (ess_ratio < s->ess_threshold);
+    }
 
-        // 10a. Compute variance of resampled particles
-        bpf_set_scalar<<<1, 1, 0, st>>>(s->d_var, 0.0f);
-        bpf_compute_var<<<g, b, smem, st>>>(s->d_h, s->d_var, h_mean, n);
+    if (do_resample) {
+        s->did_resample = 1;
+        s->resample_count++;
 
-        // Sync to read variance
-        cudaStreamSynchronize(st);
-        float var_sum;
-        cudaMemcpy(&var_sum, s->d_var, sizeof(float), cudaMemcpyDeviceToHost);
+        // 8. Inclusive scan for CDF
+        thrust::inclusive_scan(
+            thrust::cuda::par.on(st),
+            thrust::device_ptr<float>(s->d_w),
+            thrust::device_ptr<float>(s->d_w + n),
+            thrust::device_ptr<float>(s->d_cdf));
 
-        float sigma_hat = sqrtf(var_sum / (float)n);
+        // 9. Resample
+        float u = bpf_pcg32_float(&s->host_rng_state) / (float)n;
+        bpf_resample<<<g, b, 0, st>>>(s->d_h2, s->d_h, s->d_cdf, u, n);
 
-        // Silverman bandwidth: shrink * sigma * (4/(3N))^(1/5)
-        // (4/3)^(1/5) ≈ 1.05922
-        float bw = s->silverman_shrink * sigma_hat * 1.05922f * powf((float)n, -0.2f);
+        // Swap particle buffers
+        float* tmp = s->d_h; s->d_h = s->d_h2; s->d_h2 = tmp;
 
-        // ESS scaling: widen jitter when particle diversity is low
-        // sqrt(N/ESS) = sqrt(1/ESS_N).  Clamp to avoid extreme jitter.
-        if (s->ess_adaptive) {
-            float ess_scale = sqrtf(1.0f / fmaxf(ess_n, 0.01f));  // max 10× widening
-            ess_scale = fminf(ess_scale, 10.0f);
-            bw *= ess_scale;
+        // ─── 10. Silverman kernel smoothing (post-resample only) ───
+        if (s->silverman_shrink > 0.0f) {
+            // May need to sync if we haven't already (ess_threshold=0 path)
+            if (s->ess_threshold <= 0.0f) {
+                cudaStreamSynchronize(st);
+            }
+            float host_scalars[5];
+            cudaMemcpy(host_scalars, s->d_scalars, 5 * sizeof(float), cudaMemcpyDeviceToHost);
+            float h_mean = host_scalars[2];
+            float sum_w_sq = host_scalars[4];
+
+            float ess = 1.0f / fmaxf(sum_w_sq, 1e-30f);
+            float ess_n = ess / (float)n;
+
+            // 10a. Compute variance of resampled particles
+            bpf_set_scalar<<<1, 1, 0, st>>>(s->d_var, 0.0f);
+            bpf_compute_var<<<g, b, smem, st>>>(s->d_h, s->d_var, h_mean, n);
+
+            cudaStreamSynchronize(st);
+            float var_sum;
+            cudaMemcpy(&var_sum, s->d_var, sizeof(float), cudaMemcpyDeviceToHost);
+
+            float sigma_hat = sqrtf(var_sum / (float)n);
+
+            // Silverman bandwidth: shrink * sigma * (4/(3N))^(1/5)
+            float bw = s->silverman_shrink * sigma_hat * 1.05922f * powf((float)n, -0.2f);
+
+            if (s->ess_adaptive) {
+                float ess_scale = sqrtf(1.0f / fmaxf(ess_n, 0.01f));
+                ess_scale = fminf(ess_scale, 10.0f);
+                bw *= ess_scale;
+            }
+
+            // 10b-c. Jitter
+            bpf_gen_noise<<<g, b, 0, st>>>(s->d_noise, s->d_rng, n);
+            bpf_silverman_jitter<<<g, b, 0, st>>>(s->d_h, s->d_noise, bw, n, s->mu);
         }
-
-        // 10b. Generate noise on device (reuses cuRAND states — advances them)
-        bpf_gen_noise<<<g, b, 0, st>>>(s->d_noise, s->d_rng, n);
-
-        // 10c. Apply jitter
-        bpf_silverman_jitter<<<g, b, 0, st>>>(s->d_h, s->d_noise, bw, n, s->mu);
+    } else {
+        // No resampling — particles keep their positions and weights carry forward.
+        // d_log_w still holds accumulated log-weights for next tick's kernel.
+        // Saves: thrust::inclusive_scan + bpf_resample + Silverman = 3+ kernel launches.
+        s->did_resample = 0;
     }
 
     s->timestep++;
@@ -593,6 +610,18 @@ BpfResult gpu_bpf_step(GpuBpfState* s, float y_t) {
     // Uses previous tick's h_est — "how surprising was y_t given what we expected?"
     s->last_surprise = fabsf(y_t) * expf(-s->last_h_est * 0.5f);
     return gpu_bpf_get_result(s);  // this updates last_h_est
+}
+
+// =============================================================================
+// Conditional Resampling API
+// =============================================================================
+
+void gpu_bpf_set_ess_threshold(GpuBpfState* s, float threshold) {
+    s->ess_threshold = fmaxf(0.0f, fminf(1.0f, threshold));
+}
+
+int gpu_bpf_get_resample_count(GpuBpfState* s) {
+    return s->resample_count;
 }
 
 // =============================================================================
@@ -786,7 +815,7 @@ BpfResult gpu_apf_step(GpuApfState* s, float y_t) {
         bpf_propagate_weight<<<g, b, 0, st>>>(
             s->d_h, s->d_log_w, s->d_rng,
             s->rho, s->sigma_z, s->mu, s->nu_state, s->nu_obs, y_t,
-            n, 0);
+            n, 0, 0);
 
         // Max → exp → sum → normalize → weighted mean
         bpf_set_scalar<<<1, 1, 0, st>>>(s->d_scalars + 0, -1e30f);
