@@ -55,9 +55,10 @@ typedef struct {
     float* d_cdf;
     float* d_wh;
     uint64_t* d_rng;         // PCG32: 2 x u64 per particle [state, inc]
-    float* d_scalars;        // [4]: max_lw, sum_w, h_est, log_lik
+    float* d_scalars;        // [5]: max_lw, sum_w, h_est, log_lik, sum_w_sq
     float* d_noise;          // [N]: standard normal samples for Silverman
     float* d_var;            // [1]: variance accumulator
+    float* d_log_w_prev;     // [N]: saved log-weights for accumulation across non-resample ticks
     float* d_chi2;           // [N]: pre-generated chi2 variates (or NULL)
     float* d_chi2_normals;   // [N*nu_int]: temp normals for chi2 gen
     void* curand_gen;        // curandGenerator_t (void* for header compat)
@@ -68,6 +69,9 @@ typedef struct {
     cudaStream_t stream;
     float rho, sigma_z, mu, nu_state, nu_obs;
     float silverman_shrink;  // 0.0 = off, 0.5 = conservative
+    float ess_threshold;     // 0.0 = always resample, 0.5 = resample when ESS < N/2
+    int did_resample;        // flag: did we resample last tick?
+    int resample_count;      // diagnostic: how many ticks actually resampled
     float last_h_est;        // h_est from previous tick (for surprise score)
     float last_surprise;     // surprise from previous tick (1-tick delay)
     unsigned long long host_rng_state;
@@ -89,6 +93,10 @@ void gpu_bpf_set_adaptive_bands(int n_particles,
     const float* alert_fracs, const float* alert_scales, int alert_nb,
     const float* panic_fracs, const float* panic_scales, int panic_nb,
     float thresh_alert, float thresh_panic);
+
+// Conditional resampling
+void gpu_bpf_set_ess_threshold(GpuBpfState* state, float threshold);
+int  gpu_bpf_get_resample_count(GpuBpfState* state);
 
 double gpu_bpf_run_rmse(
     const double* returns, const double* true_h, int n_ticks,

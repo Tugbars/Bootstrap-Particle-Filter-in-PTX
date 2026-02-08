@@ -61,6 +61,26 @@ __global__ void chi2_square_sum_k(float* __restrict__ chi2,
 }
 
 // =============================================================================
+// Helper CUDA kernels for conditional resampling
+// (Avoids modifying hand-written PTX assembly)
+// =============================================================================
+
+// Square normalized weights for ESS computation: out[i] = in[i]^2
+__global__ void bpf_square_weights_k(const float* __restrict__ w,
+                                      float* __restrict__ w_sq, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) w_sq[i] = w[i] * w[i];
+}
+
+// Accumulate previous log-weights: log_w[i] += prev[i]
+// Used on non-resample ticks to carry forward accumulated weights.
+__global__ void bpf_accumulate_lw_k(float* __restrict__ log_w,
+                                     const float* __restrict__ prev, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) log_w[i] += prev[i];
+}
+
+// =============================================================================
 // PTX Module — 13 kernels
 // =============================================================================
 
@@ -330,6 +350,9 @@ GpuBpfState* gpu_bpf_create(int n_particles, float rho, float sigma_z, float mu,
     s->host_rng_state = (unsigned long long)seed * 67890ULL + 12345ULL;
     s->timestep = 0;
     s->silverman_shrink = 0.0f;
+    s->ess_threshold = 0.5f;       // resample when ESS < N/2
+    s->did_resample = 1;           // force fresh weights on first tick
+    s->resample_count = 0;
     s->last_h_est = mu;            // initial estimate for surprise score
     s->last_surprise = 0.0f;
 
@@ -343,9 +366,10 @@ GpuBpfState* gpu_bpf_create(int n_particles, float rho, float sigma_z, float mu,
     cudaMalloc(&s->d_wh,      n_particles * sizeof(float));
     // PCG32: 2 x u64 per particle = 16 bytes each
     cudaMalloc(&s->d_rng,     n_particles * 2 * sizeof(uint64_t));
-    cudaMalloc(&s->d_scalars, 4 * sizeof(float));
+    cudaMalloc(&s->d_scalars, 5 * sizeof(float));  // max_lw, sum_w, h_est, log_lik, sum_w_sq
     cudaMalloc(&s->d_noise,   n_particles * sizeof(float));
     cudaMalloc(&s->d_var,     sizeof(float));
+    cudaMalloc(&s->d_log_w_prev, n_particles * sizeof(float));
 
     // Chi2 pre-generation for Student-t state noise
     s->nu_int = (nu_state > 0.0f) ? (int)(nu_state + 0.5f) : 0;
@@ -413,6 +437,7 @@ void gpu_bpf_destroy(GpuBpfState* s) {
     cudaFree(s->d_scalars);
     cudaFree(s->d_noise);
     cudaFree(s->d_var);
+    cudaFree(s->d_log_w_prev);
     if (s->d_chi2) cudaFree(s->d_chi2);
     if (s->d_chi2_normals) cudaFree(s->d_chi2_normals);
     if (s->curand_gen) curandDestroyGenerator((curandGenerator_t)s->curand_gen);
@@ -453,16 +478,11 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
     }
 
     // 1b. Adaptive band switching: apply regime from PREVIOUS tick's surprise
-    //     (1-tick delay prevents single-spike false alarms)
     if (s->timestep > 0) {
         mix_maybe_switch_regime(s->last_surprise);
     }
 
     // 2. Propagate + weight (PTX: fused PCG32 + ICDF + OU + obs weight)
-    //    Band config read from d_mix_config constant memory (no kernel params needed)
-    //    propagate_weight(u64 h, u64 log_w, u64 rng, u64 chi2,
-    //                     f32 rho, f32 sigma_z, f32 mu, f32 nu_state, f32 nu_obs,
-    //                     f32 C_obs, f32 y_t, s32 n, s32 do_prop)
     {
         int do_prop = (s->timestep > 0) ? 1 : 0;
         void* params[] = {
@@ -473,7 +493,12 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
         ptx_launch(g_ptx.propagate_weight, st, g, b, 0, params);
     }
 
-    // 2. Max of log_w -> d_scalars[0]
+    // 2b. Accumulate previous log-weights if we skipped resampling last tick
+    if (s->timestep > 0 && !s->did_resample) {
+        bpf_accumulate_lw_k<<<g, b, 0, st>>>(s->d_log_w, s->d_log_w_prev, n);
+    }
+
+    // 3. Max of log_w -> d_scalars[0]
     {
         CUdeviceptr ptr = dscal;
         float val = -1e30f;
@@ -483,14 +508,14 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
         ptx_launch(g_ptx.reduce_max, st, g, b, smem, p2);
     }
 
-    // 3. w = exp(log_w - max)
+    // 4. w = exp(log_w - max)
     {
         CUdeviceptr d_max = dscal;
         void* params[] = { &dw, &dlw, &d_max, &n };
         ptx_launch(g_ptx.exp_sub, st, g, b, 0, params);
     }
 
-    // 4. Sum of w -> d_scalars[1]
+    // 5. Sum of w -> d_scalars[1]
     {
         CUdeviceptr ptr = dscal + sizeof(float);
         float val = 0.0f;
@@ -500,14 +525,14 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
         ptx_launch(g_ptx.reduce_sum, st, g, b, smem, p2);
     }
 
-    // 5. Normalize + w*h
+    // 6. Normalize + w*h
     {
         CUdeviceptr d_sum = dscal + sizeof(float);
         void* params[] = { &dw, &dwh, &dh, &d_sum, &n };
         ptx_launch(g_ptx.scale_wh, st, g, b, 0, params);
     }
 
-    // 6. h_est = sum(w*h) -> d_scalars[2]
+    // 7. h_est = sum(w*h) -> d_scalars[2]
     {
         CUdeviceptr ptr = dscal + 2 * sizeof(float);
         float val = 0.0f;
@@ -517,68 +542,92 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
         ptx_launch(g_ptx.reduce_sum, st, g, b, smem, p2);
     }
 
-    // 7. Log-likelihood
+    // 8. Log-likelihood
     {
         void* params[] = { &dscal, &n };
         ptx_launch(g_ptx.compute_loglik, st, 1, 1, 0, params);
     }
 
-    // 8. CDF (thrust prefix scan)
+    // 8b. ESS: sum(w_i^2) -> d_scalars[4]
+    bpf_square_weights_k<<<g, b, 0, st>>>(s->d_w, s->d_wh, n);
     {
+        CUdeviceptr ptr = dscal + 4 * sizeof(float);
+        float val = 0.0f;
+        void* p1[] = { &ptr, &val };
+        ptx_launch(g_ptx.set_scalar, st, 1, 1, 0, p1);
+        void* p2[] = { &dwh, &ptr, &n };
+        ptx_launch(g_ptx.reduce_sum, st, g, b, smem, p2);
+    }
+
+    // ─── Conditional resampling decision ───
+    bool do_resample = true;
+    if (s->ess_threshold > 0.0f) {
+        cudaStreamSynchronize(st);
+        float sum_w_sq;
+        cudaMemcpy(&sum_w_sq, s->d_scalars + 4, sizeof(float), cudaMemcpyDeviceToHost);
+        float ess = 1.0f / fmaxf(sum_w_sq, 1e-30f);
+        float ess_ratio = ess / (float)n;
+        do_resample = (ess_ratio < s->ess_threshold);
+    }
+
+    if (do_resample) {
+        s->did_resample = 1;
+        s->resample_count++;
+
+        // 9. CDF (thrust prefix scan)
         thrust::inclusive_scan(
             thrust::cuda::par.on(st),
             thrust::device_ptr<float>(s->d_w),
             thrust::device_ptr<float>(s->d_w + n),
             thrust::device_ptr<float>(s->d_cdf));
-    }
 
-    // 9. Resample
-    {
-        float u = host_pcg32_float(&s->host_rng_state) / (float)n;
-        void* params[] = { &dh2, &dh, &dcdf, &u, &n };
-        ptx_launch(g_ptx.resample, st, g, b, 0, params);
-    }
-
-    // Swap buffers
-    float* tmp = s->d_h; s->d_h = s->d_h2; s->d_h2 = tmp;
-
-    // 10. Silverman jitter (PTX: var + noise + jitter)
-    if (s->silverman_shrink > 0.0f) {
-        // Need h_mean from step 6
-        cudaStreamSynchronize(st);
-        float h_mean;
-        cudaMemcpy(&h_mean, s->d_scalars + 2, sizeof(float), cudaMemcpyDeviceToHost);
-
-        // Recompute dh after swap
-        dh = (CUdeviceptr)(uintptr_t)s->d_h;
-
-        // 10a. Variance
+        // 10. Resample
         {
-            float zero = 0.0f;
-            void* p1[] = { &dvar, &zero };
-            ptx_launch(g_ptx.set_scalar, st, 1, 1, 0, p1);
-            void* p2[] = { &dh, &dvar, &h_mean, &n };
-            ptx_launch(g_ptx.compute_var, st, g, b, smem, p2);
+            float u = host_pcg32_float(&s->host_rng_state) / (float)n;
+            void* params[] = { &dh2, &dh, &dcdf, &u, &n };
+            ptx_launch(g_ptx.resample, st, g, b, 0, params);
         }
 
-        cudaStreamSynchronize(st);
-        float var_sum;
-        cudaMemcpy(&var_sum, s->d_var, sizeof(float), cudaMemcpyDeviceToHost);
-        float sigma_hat = sqrtf(var_sum / (float)n);
-        float bw = s->silverman_shrink * sigma_hat * 1.05922f * powf((float)n, -0.2f);
+        // Swap buffers
+        float* tmp = s->d_h; s->d_h = s->d_h2; s->d_h2 = tmp;
 
-        // 10b. Generate noise (PTX: PCG32 + ICDF)
-        {
-            CUdeviceptr drng2 = (CUdeviceptr)(uintptr_t)s->d_rng;
-            void* params[] = { &dnoise, &drng2, &n };
-            ptx_launch(g_ptx.gen_noise, st, g, b, 0, params);
-        }
+        // Silverman jitter (legacy, off by default)
+        if (s->silverman_shrink > 0.0f) {
+            dh = (CUdeviceptr)(uintptr_t)s->d_h;
 
-        // 10c. Jitter
-        {
-            void* params[] = { &dh, &dnoise, &bw, &n, &s->mu };
-            ptx_launch(g_ptx.silverman_jitter, st, g, b, 0, params);
+            cudaStreamSynchronize(st);
+            float h_mean;
+            cudaMemcpy(&h_mean, s->d_scalars + 2, sizeof(float), cudaMemcpyDeviceToHost);
+
+            {
+                float zero = 0.0f;
+                void* p1[] = { &dvar, &zero };
+                ptx_launch(g_ptx.set_scalar, st, 1, 1, 0, p1);
+                void* p2[] = { &dh, &dvar, &h_mean, &n };
+                ptx_launch(g_ptx.compute_var, st, g, b, smem, p2);
+            }
+
+            cudaStreamSynchronize(st);
+            float var_sum;
+            cudaMemcpy(&var_sum, s->d_var, sizeof(float), cudaMemcpyDeviceToHost);
+            float sigma_hat = sqrtf(var_sum / (float)n);
+            float bw = s->silverman_shrink * sigma_hat * 1.05922f * powf((float)n, -0.2f);
+
+            {
+                CUdeviceptr drng2 = (CUdeviceptr)(uintptr_t)s->d_rng;
+                void* params[] = { &dnoise, &drng2, &n };
+                ptx_launch(g_ptx.gen_noise, st, g, b, 0, params);
+            }
+            {
+                void* params[] = { &dh, &dnoise, &bw, &n, &s->mu };
+                ptx_launch(g_ptx.silverman_jitter, st, g, b, 0, params);
+            }
         }
+    } else {
+        // No resampling — save current log-weights for accumulation next tick
+        s->did_resample = 0;
+        cudaMemcpyAsync(s->d_log_w_prev, s->d_log_w,
+                         n * sizeof(float), cudaMemcpyDeviceToDevice, st);
     }
 
     s->timestep++;
@@ -628,6 +677,18 @@ double gpu_bpf_run_rmse(
     }
     gpu_bpf_destroy(f);
     return sqrt(sse / (double)count);
+}
+
+// =============================================================================
+// Conditional resampling API
+// =============================================================================
+
+void gpu_bpf_set_ess_threshold(GpuBpfState* s, float threshold) {
+    s->ess_threshold = threshold;
+}
+
+int gpu_bpf_get_resample_count(GpuBpfState* s) {
+    return s->resample_count;
 }
 
 // =============================================================================
