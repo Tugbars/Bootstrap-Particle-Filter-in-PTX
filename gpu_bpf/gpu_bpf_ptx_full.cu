@@ -85,6 +85,17 @@ typedef struct {
 static PtxFunctions g_ptx;
 static int          g_ptx_loaded = 0;
 
+// Constant memory for band config
+static CUdeviceptr  g_d_mix_config = 0;
+static size_t       g_d_mix_config_size = 0;
+
+// Adaptive band regime state (file scope, same pattern as gpu_bpf.cu)
+static MixBandConfig h_regime_table[3];  // calm, alert, panic
+static MixRegime     h_current_regime = MIX_CALM;
+static bool          h_adaptive_enabled = false;
+static float         h_surprise_ema = 0.0f;
+static float         h_surprise_thresholds[2] = {2.0f, 4.0f};
+
 static void ensure_ptx_loaded() {
     if (g_ptx_loaded) return;
     cudaFree(0);
@@ -166,6 +177,19 @@ extract:
 
     g_ptx_loaded = 1;
     fprintf(stderr, "[PTX-FULL] All 13 kernels loaded\n");
+
+    // Get constant memory symbol for band config
+    cuModuleGetGlobal(&g_d_mix_config, &g_d_mix_config_size,
+                      g_ptx_module, "d_mix_config");
+    fprintf(stderr, "[PTX-FULL] d_mix_config: %zu bytes at 0x%llx\n",
+            g_d_mix_config_size, (unsigned long long)g_d_mix_config);
+
+    // Upload default: 1 band, k=1.0 (standard BPF)
+    MixBandConfig def = {};
+    def.n_bands = 1;
+    def.boundary[0] = 0x7FFFFFFF;  // all particles
+    def.k[0] = 1.0f;
+    cuMemcpyHtoD(g_d_mix_config, &def, sizeof(def));
 }
 
 // =============================================================================
@@ -204,6 +228,89 @@ static inline float host_pcg32_float(unsigned long long* state) {
 }
 
 // =============================================================================
+// Adaptive band helpers (mirrors gpu_bpf.cu, uses cuMemcpyHtoD for PTX)
+// =============================================================================
+
+static MixBandConfig mix_build_config(int n_particles, int n_bands,
+                                       const float* fracs, const float* scales) {
+    MixBandConfig cfg = {};
+    cfg.n_bands = n_bands;
+    int cum = 0;
+    for (int b = 0; b < n_bands; b++) {
+        int count = (b < n_bands - 1)
+            ? (int)(fracs[b] * n_particles + 0.5f)
+            : (n_particles - cum);
+        cum += count;
+        cfg.boundary[b] = cum;
+        cfg.k[b] = scales[b];
+    }
+    for (int b = n_bands; b < MIX_MAX_BANDS; b++) {
+        cfg.boundary[b] = cum;
+        cfg.k[b] = 1.0f;
+    }
+    return cfg;
+}
+
+static void mix_upload_config(const MixBandConfig* cfg) {
+    if (g_d_mix_config)
+        cuMemcpyHtoD(g_d_mix_config, cfg, sizeof(MixBandConfig));
+}
+
+// Public: one-shot setup of all 3 regimes
+void gpu_bpf_set_adaptive_bands(int n_particles,
+                                 const float* calm_fracs,  const float* calm_scales,  int calm_nb,
+                                 const float* alert_fracs, const float* alert_scales, int alert_nb,
+                                 const float* panic_fracs, const float* panic_scales, int panic_nb,
+                                 float thresh_alert, float thresh_panic) {
+    ensure_ptx_loaded();
+    h_regime_table[MIX_CALM]  = mix_build_config(n_particles, calm_nb,  calm_fracs,  calm_scales);
+    h_regime_table[MIX_ALERT] = mix_build_config(n_particles, alert_nb, alert_fracs, alert_scales);
+    h_regime_table[MIX_PANIC] = mix_build_config(n_particles, panic_nb, panic_fracs, panic_scales);
+    h_surprise_thresholds[0] = thresh_alert;
+    h_surprise_thresholds[1] = thresh_panic;
+    h_current_regime = MIX_CALM;
+    h_adaptive_enabled = true;
+    h_surprise_ema = 0.0f;
+    mix_upload_config(&h_regime_table[MIX_CALM]);
+}
+
+// Public: simple static bands (non-adaptive, backward compat)
+void gpu_bpf_set_bands(int n_particles, int n_bands,
+                        const float* fracs, const float* scales) {
+    ensure_ptx_loaded();
+    MixBandConfig cfg = mix_build_config(n_particles, n_bands, fracs, scales);
+    mix_upload_config(&cfg);
+    h_adaptive_enabled = false;
+}
+
+// Host: called each tick BEFORE kernel launch. Only uploads on regime change.
+static const float SURPRISE_EMA_ALPHA = 0.3f;
+
+static void mix_maybe_switch_regime(float surprise) {
+    if (!h_adaptive_enabled) return;
+
+    h_surprise_ema = SURPRISE_EMA_ALPHA * surprise
+                   + (1.0f - SURPRISE_EMA_ALPHA) * h_surprise_ema;
+
+    MixRegime target;
+    if (surprise < h_surprise_thresholds[0]) {
+        target = MIX_CALM;
+        h_surprise_ema = surprise;
+    } else if (h_surprise_ema >= h_surprise_thresholds[1]) {
+        target = MIX_PANIC;
+    } else if (h_surprise_ema >= h_surprise_thresholds[0]) {
+        target = MIX_ALERT;
+    } else {
+        target = MIX_CALM;
+    }
+
+    if (target != h_current_regime) {
+        h_current_regime = target;
+        mix_upload_config(&h_regime_table[target]);
+    }
+}
+
+// =============================================================================
 // gpu_bpf_create — ALL PTX
 // =============================================================================
 
@@ -223,6 +330,8 @@ GpuBpfState* gpu_bpf_create(int n_particles, float rho, float sigma_z, float mu,
     s->host_rng_state = (unsigned long long)seed * 67890ULL + 12345ULL;
     s->timestep = 0;
     s->silverman_shrink = 0.0f;
+    s->last_h_est = mu;            // initial estimate for surprise score
+    s->last_surprise = 0.0f;
 
     cudaStreamCreate(&s->stream);
 
@@ -343,7 +452,14 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
                                                   s->nu_int, n);
     }
 
+    // 1b. Adaptive band switching: apply regime from PREVIOUS tick's surprise
+    //     (1-tick delay prevents single-spike false alarms)
+    if (s->timestep > 0) {
+        mix_maybe_switch_regime(s->last_surprise);
+    }
+
     // 2. Propagate + weight (PTX: fused PCG32 + ICDF + OU + obs weight)
+    //    Band config read from d_mix_config constant memory (no kernel params needed)
     //    propagate_weight(u64 h, u64 log_w, u64 rng, u64 chi2,
     //                     f32 rho, f32 sigma_z, f32 mu, f32 nu_state, f32 nu_obs,
     //                     f32 C_obs, f32 y_t, s32 n, s32 do_prop)
@@ -478,13 +594,16 @@ BpfResult gpu_bpf_get_result(GpuBpfState* s) {
     BpfResult r;
     r.h_mean  = scalars[2];
     r.log_lik = scalars[3];
+    s->last_h_est = scalars[2];  // cache for next tick's surprise score
     return r;
 }
 
 BpfResult gpu_bpf_step(GpuBpfState* s, float y_t) {
     gpu_bpf_step_async(s, y_t);
     cudaStreamSynchronize(s->stream);
-    return gpu_bpf_get_result(s);
+    // Compute surprise BEFORE get_result overwrites last_h_est
+    s->last_surprise = fabsf(y_t) * expf(-s->last_h_est * 0.5f);
+    return gpu_bpf_get_result(s);  // this updates last_h_est
 }
 
 // =============================================================================

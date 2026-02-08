@@ -380,6 +380,28 @@ set_target_properties(test_bpf_adaptive_stress PROPERTIES
 )
 
 # ==============================================================================
+# Target: test_bpf_ptx_stress (adaptive bands stress test — PTX kernels)
+# ==============================================================================
+
+add_executable(test_bpf_ptx_stress tests/test_bpf_ptx_stress.cu)
+
+target_link_libraries(test_bpf_ptx_stress PRIVATE
+    gpu_bpf_ptx_full
+    CUDA::cuda_driver
+    CUDA::cudart
+    CUDA::curand
+)
+
+set_target_properties(test_bpf_ptx_stress PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+if(TARGET ptx_cubin_full)
+    add_dependencies(test_bpf_ptx_stress ptx_cubin_full)
+endif()
+
+# ==============================================================================
 # Print summary
 # ==============================================================================
 

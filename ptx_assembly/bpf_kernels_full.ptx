@@ -33,6 +33,10 @@
 
 .extern .shared .align 4 .b8 smem_raw[];
 
+// Band config in constant memory (uploaded by host on regime transitions)
+// Layout: n_bands(4) | boundary[4](16) | k[4](16) = 36 bytes
+.const .align 4 .b8 d_mix_config[36];
+
 
 // -----------------------------------------------------------------------------
 // MACRO-LIKE PATTERNS (inlined, PTX has no macros):
@@ -221,6 +225,9 @@ INIT_P_EXIT:
 //   Propagate (OU + optional Student-t noise) + compute observation log-weight
 //   chi2 variates pre-generated on host (param_chi2 array)
 //   Student-t obs constant precomputed on host (param_C_obs)
+//   Adaptive bands: sigma_z scaled by k_b from d_mix_config constant memory
+//   Band lookup: contiguous ranges → zero warp divergence
+//   No importance weight correction — observation likelihood does natural selection
 // =============================================================================
 
 .visible .entry bpf_propagate_weight(
@@ -288,6 +295,43 @@ INIT_P_EXIT:
 
     setp.ne.s32     %p_do_prop, %r_do_prop, 0;
     @!%p_do_prop bra PW_WEIGHT;
+
+    // === ADAPTIVE BAND LOOKUP (constant memory) ===
+    // d_mix_config layout: [n_bands:s32][boundary[4]:s32×4][k[4]:f32×4]
+    // Contiguous particle ranges → zero warp divergence
+    // 99% of particles hit band 0 → 3 instructions typical
+    .reg .f32   %f_kb;
+    .reg .s32   %r_nb, %r_bnd;
+    .reg .pred  %p_skip_bands, %p_in_band;
+
+    ld.const.s32    %r_nb, [d_mix_config + 0];       // n_bands
+    ld.const.f32    %f_kb, [d_mix_config + 20];       // k[0] (default = 1.0)
+    setp.le.s32     %p_skip_bands, %r_nb, 1;
+    @%p_skip_bands bra PW_BANDS_DONE;
+
+    // Band 0: fast path — most particles land here
+    ld.const.s32    %r_bnd, [d_mix_config + 4];       // boundary[0]
+    setp.lt.u32     %p_in_band, %idx, %r_bnd;
+    @%p_in_band bra PW_BANDS_DONE;
+
+    // Band 1
+    ld.const.f32    %f_kb, [d_mix_config + 24];       // k[1]
+    ld.const.s32    %r_bnd, [d_mix_config + 8];       // boundary[1]
+    setp.lt.u32     %p_in_band, %idx, %r_bnd;
+    @%p_in_band bra PW_BANDS_DONE;
+
+    // Band 2
+    ld.const.f32    %f_kb, [d_mix_config + 28];       // k[2]
+    ld.const.s32    %r_bnd, [d_mix_config + 12];      // boundary[2]
+    setp.lt.u32     %p_in_band, %idx, %r_bnd;
+    @%p_in_band bra PW_BANDS_DONE;
+
+    // Band 3 (fallthrough — always taken if we got here)
+    ld.const.f32    %f_kb, [d_mix_config + 32];       // k[3]
+
+PW_BANDS_DONE:
+    // Apply band scale: sigma_z *= k_b
+    mul.f32         %f_sigma_z, %f_sigma_z, %f_kb;
 
     // === PROPAGATION ===
 
@@ -372,6 +416,7 @@ PW_ICDF_OK:
 
 PW_TRANS:
     // h = mu + rho*(h-mu) + sigma_z*eps
+    // sigma_z already scaled by k_b from band lookup
     .reg .f32 %f_dev;
     sub.f32         %f_dev, %f_hi, %f_mu;
     mul.f32         %f_dev, %f_rho, %f_dev;
@@ -381,6 +426,8 @@ PW_TRANS:
 
 PW_WEIGHT:
     // === OBSERVATION WEIGHT ===
+    // No importance weight correction — observation likelihood does natural selection.
+    // Wide-band particles in wrong region get low p(y|h) naturally.
     .reg .f32 %f_neg_half, %f_exp_arg;
     mov.f32         %f_neg_half, 0fBF000000;
     mul.f32         %f_exp_arg, %f_hi, %f_neg_half;

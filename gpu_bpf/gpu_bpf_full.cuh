@@ -30,6 +30,20 @@ typedef struct {
 } BpfResult;
 
 // =============================================================================
+// Adaptive band config (same layout as d_mix_config in PTX constant memory)
+// =============================================================================
+
+#define MIX_MAX_BANDS 4
+
+typedef struct {
+    int   n_bands;
+    int   boundary[MIX_MAX_BANDS]; // cumulative particle boundaries
+    float k[MIX_MAX_BANDS];        // sigma_z scale factors
+} MixBandConfig;
+
+typedef enum { MIX_CALM = 0, MIX_ALERT = 1, MIX_PANIC = 2 } MixRegime;
+
+// =============================================================================
 // Bootstrap PF — Pure PTX (PCG32 RNG)
 // =============================================================================
 
@@ -54,6 +68,8 @@ typedef struct {
     cudaStream_t stream;
     float rho, sigma_z, mu, nu_state, nu_obs;
     float silverman_shrink;  // 0.0 = off, 0.5 = conservative
+    float last_h_est;        // h_est from previous tick (for surprise score)
+    float last_surprise;     // surprise from previous tick (1-tick delay)
     unsigned long long host_rng_state;
     int timestep;
 } GpuBpfState;
@@ -64,6 +80,15 @@ void gpu_bpf_destroy(GpuBpfState* state);
 BpfResult gpu_bpf_step(GpuBpfState* state, float y_t);
 void gpu_bpf_step_async(GpuBpfState* state, float y_t);
 BpfResult gpu_bpf_get_result(GpuBpfState* state);
+
+// Adaptive band API
+void gpu_bpf_set_bands(int n_particles, int n_bands,
+                       const float* fracs, const float* scales);
+void gpu_bpf_set_adaptive_bands(int n_particles,
+    const float* calm_fracs,  const float* calm_scales,  int calm_nb,
+    const float* alert_fracs, const float* alert_scales, int alert_nb,
+    const float* panic_fracs, const float* panic_scales, int panic_nb,
+    float thresh_alert, float thresh_panic);
 
 double gpu_bpf_run_rmse(
     const double* returns, const double* true_h, int n_ticks,
