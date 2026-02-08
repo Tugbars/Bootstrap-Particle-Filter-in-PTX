@@ -13,7 +13,6 @@
  */
 
 #include "smc2_bpf_batch.cuh"
-#include <cub/block/block_radix_sort.cuh>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -62,23 +61,35 @@ __device__ float log_prior_theta(float rho, float sigma_z, float mu) {
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
- * CPMMH SORT — CUB BlockRadixSort by h value
+ * CPMMH SORT — Bitonic Sort by h value (in shared memory)
  *
  * After resampling, all particles have equal weight. Sorting by h ensures
  * that noise index i maps to the same "rank" in particle space across
  * current and proposed runs, reducing CPMMH likelihood variance.
  *
- * Only h needs permuting (BPF has no other per-particle state).
+ * Bitonic sort: O(log²N) barrier steps, no CUB dependency, no extra smem.
+ * Requires N to be power of 2 (enforced by N_inner constraint).
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 template<int N>
-__device__ void cpmmh_sort_h(float* s_h, void* cub_temp) {
-    typedef cub::BlockRadixSort<float, N, 1> BlockSort;
-
-    float key = s_h[threadIdx.x];
-    BlockSort(*reinterpret_cast<typename BlockSort::TempStorage*>(cub_temp)).Sort(key);
-    s_h[threadIdx.x] = key;
-    __syncthreads();
+__device__ void cpmmh_sort_h(float* s_h) {
+    int tid = threadIdx.x;
+    #pragma unroll
+    for (int k = 2; k <= N; k <<= 1) {
+        #pragma unroll
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            int ixj = tid ^ j;
+            if (ixj > tid && ixj < N) {
+                bool ascending = ((tid & k) == 0);
+                float a = s_h[tid], b = s_h[ixj];
+                if (ascending ? (a > b) : (a < b)) {
+                    s_h[tid] = b;
+                    s_h[ixj] = a;
+                }
+            }
+            __syncthreads();
+        }
+    }
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
@@ -247,8 +258,7 @@ void kernel_bpf_step_impl(
     if ((t_current % SMC2_SORT_EVERY_K) == 0) {
         s_h[inner_idx] = h;
         __syncthreads();
-        cpmmh_sort_h<N_INNER>(s_h,
-            reinterpret_cast<void*>(&s_cdf[0]));  /* Reuse s_cdf as CUB temp after scan done */
+        cpmmh_sort_h<N_INNER>(s_h);
         h = s_h[inner_idx];
         __syncthreads();
     }
@@ -472,7 +482,6 @@ void kernel_cpmmh_rejuvenate_impl(
     float* s_red = reinterpret_cast<float*>(shared_raw);
     float* s_h   = &s_red[32];
     float* s_cdf = &s_h[N_INNER];
-    void*  s_cub = reinterpret_cast<void*>(&s_cdf[N_INNER]);
 
     __shared__ float s_log_max, s_sum_w;
     __shared__ float s_rho_c, s_sz_c, s_mu_c;
@@ -604,7 +613,7 @@ void kernel_cpmmh_rejuvenate_impl(
         if ((t % SMC2_SORT_EVERY_K) == 0) {
             s_h[inner_idx] = h;
             __syncthreads();
-            cpmmh_sort_h<N_INNER>(s_h, s_cub);
+            cpmmh_sort_h<N_INNER>(s_h);
             h = s_h[inner_idx];
             __syncthreads();
         }

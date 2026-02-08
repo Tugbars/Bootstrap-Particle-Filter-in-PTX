@@ -254,12 +254,12 @@ __host__ __device__ constexpr int bpf_step_smem() {
 
 /**
  * Shared memory for CPMMH rejuvenation kernel.
- * Layout: s_reduction[32] | s_h[N] | s_cdf[N] | CUB_temp
- * CUB BlockRadixSort<float, N, 1>::TempStorage is ≤ 4*N bytes typically.
+ * Layout: s_reduction[32] | s_h[N] | s_cdf[N]
+ * Bitonic sort operates in-place on s_h (no extra temp storage).
  */
 template<int N>
 __host__ __device__ constexpr int cpmmh_smem() {
-    return (32 + 2 * N) * sizeof(float) + 4 * N;  /* Conservative CUB estimate */
+    return (32 + 2 * N) * sizeof(float);
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════

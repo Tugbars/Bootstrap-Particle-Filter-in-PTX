@@ -9,10 +9,8 @@
  * Then runs SMC² to see if it recovers (ρ, σ_z, μ).
  *
  * Build:
- *   nvcc -O2 -arch=sm_89 -o test_smc2_bpf test_smc2_bpf.cu smc2_bpf_batch.cu \
- *        -lcurand -I/path/to/cub --expt-relaxed-constexpr
- *
- * (Adjust sm_89 to your GPU. CUB is bundled with CUDA 11+.)
+ *   nvcc -O2 -arch=sm_120 -o test_smc2_bpf test_smc2_bpf.cu smc2_bpf_batch.cu \
+ *        -lcurand --expt-relaxed-constexpr
  */
 
 #include "smc2_bpf_batch.cuh"
@@ -470,6 +468,199 @@ static int test_identifiability(void) {
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
+ * TEST 6: Latency Benchmark
+ *
+ * CUDA event timing for accurate GPU measurement.
+ * Measures:
+ *   - Per-tick forward filtering (no resample)
+ *   - Per-tick with resample + rejuvenation (amortized)
+ *   - Full window wall time
+ *   - Scaling across N_inner = {64, 128, 256, 512}
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
+static void test_latency(void) {
+    printf("\n");
+    print_sep();
+    printf("TEST 6: Latency Benchmark (CUDA event timing)\n");
+    print_sep();
+
+    SVParams truth = {0.95, 0.15, -1.0, 5.0};
+    int T = 1000;
+
+    double* h_true = (double*)malloc(T * sizeof(double));
+    double* y_true = (double*)malloc(T * sizeof(double));
+    float*  y_f    = (float*)malloc(T * sizeof(float));
+
+    simulate_sv(&truth, y_true, h_true, T);
+    for (int t = 0; t < T; t++) y_f[t] = (float)y_true[t];
+
+    int N_theta = 64;
+    int n_inner_configs[] = {64, 128, 256, 512};
+    int n_configs = 4;
+
+    printf("\n  N_theta = %d, T = %d, K_rejuv = 5, fixed_lag = 200\n\n", N_theta, T);
+    printf("  %-8s  %10s  %10s  %10s  %10s  %10s  %10s\n",
+           "N_inner", "Wall(ms)", "μs/tick", "FwdOnly", "Resamp+Rej", "#Resamp", "Accept%%");
+    printf("  %-8s  %10s  %10s  %10s  %10s  %10s  %10s\n",
+           "-------", "--------", "------", "-------", "----------", "-------", "-------");
+
+    for (int ci = 0; ci < n_configs; ci++) {
+        int N_inner = n_inner_configs[ci];
+
+        SMC2BPFState* s = smc2_bpf_alloc(N_theta, N_inner);
+        s->nu_obs = (float)truth.nu;
+        smc2_bpf_set_fixed_lag(s, 200);
+        smc2_bpf_set_seed(s, 42);
+
+        /* Warmup run (JIT, cache priming) */
+        smc2_bpf_learn_window(s, y_f, 100);
+
+        /* Timed run — full window */
+        cudaEvent_t ev_start, ev_end;
+        cudaEventCreate(&ev_start);
+        cudaEventCreate(&ev_end);
+
+        cudaEventRecord(ev_start);
+        smc2_bpf_init(s);
+        for (int t = 0; t < T; t++) smc2_bpf_update(s, y_f[t]);
+        cudaEventRecord(ev_end);
+        cudaEventSynchronize(ev_end);
+
+        float total_ms = 0;
+        cudaEventElapsedTime(&total_ms, ev_start, ev_end);
+
+        int n_resamp = s->n_resamples;
+        int n_acc = s->n_rejuv_accepts;
+        int n_tot = s->n_rejuv_total;
+        double accept_pct = n_tot > 0 ? 100.0 * n_acc / n_tot : 0.0;
+
+        /* Per-tick breakdown: ticks that trigger resample vs ticks that don't.
+         * Forward-only ticks ≈ T - n_resamp
+         * Resample ticks ≈ n_resamp (each includes K_rejuv CPMMH sweeps)
+         *
+         * We can estimate:
+         *   total_time = fwd_ticks * t_fwd + resamp_ticks * t_resamp
+         *
+         * Measure forward-only cost directly with a short no-resample run
+         */
+        smc2_bpf_init(s);
+        /* Feed a few ticks — early ticks rarely trigger resample */
+        cudaEvent_t ev_fwd_s, ev_fwd_e;
+        cudaEventCreate(&ev_fwd_s);
+        cudaEventCreate(&ev_fwd_e);
+
+        int T_fwd = 50;  /* First 50 ticks — ESS won't drop yet */
+        cudaEventRecord(ev_fwd_s);
+        for (int t = 0; t < T_fwd; t++) smc2_bpf_update(s, y_f[t]);
+        cudaEventRecord(ev_fwd_e);
+        cudaEventSynchronize(ev_fwd_e);
+
+        float fwd_ms = 0;
+        cudaEventElapsedTime(&fwd_ms, ev_fwd_s, ev_fwd_e);
+        float fwd_us_per_tick = (fwd_ms * 1000.0f) / T_fwd;
+
+        /* Derive resample+rejuvenation cost */
+        int fwd_ticks = T - n_resamp;
+        float fwd_total_ms = fwd_ticks * (fwd_us_per_tick / 1000.0f);
+        float resamp_total_ms = total_ms - fwd_total_ms;
+        float resamp_us_per = n_resamp > 0 ? (resamp_total_ms * 1000.0f) / n_resamp : 0.0f;
+
+        printf("  %-8d  %10.2f  %10.1f  %10.1f  %10.1f  %10d  %9.1f%%\n",
+               N_inner, total_ms,
+               (total_ms * 1000.0f) / T,
+               fwd_us_per_tick, resamp_us_per,
+               n_resamp, accept_pct);
+
+        cudaEventDestroy(ev_start);
+        cudaEventDestroy(ev_end);
+        cudaEventDestroy(ev_fwd_s);
+        cudaEventDestroy(ev_fwd_e);
+        smc2_bpf_free(s);
+    }
+
+    /* Detailed per-tick histogram for default config (N_inner=256) */
+    printf("\n  Per-tick latency distribution (N_inner=256, CUDA events per tick):\n");
+    {
+        int N_inner = 256;
+        int T_bench = 500;
+        SMC2BPFState* s = smc2_bpf_alloc(N_theta, N_inner);
+        s->nu_obs = (float)truth.nu;
+        smc2_bpf_set_fixed_lag(s, 200);
+        smc2_bpf_set_seed(s, 42);
+
+        float* tick_us = (float*)malloc(T_bench * sizeof(float));
+
+        cudaEvent_t* ev_s = (cudaEvent_t*)malloc(T_bench * sizeof(cudaEvent_t));
+        cudaEvent_t* ev_e = (cudaEvent_t*)malloc(T_bench * sizeof(cudaEvent_t));
+        for (int t = 0; t < T_bench; t++) {
+            cudaEventCreate(&ev_s[t]);
+            cudaEventCreate(&ev_e[t]);
+        }
+
+        smc2_bpf_init(s);
+        for (int t = 0; t < T_bench; t++) {
+            cudaEventRecord(ev_s[t]);
+            smc2_bpf_update(s, y_f[t]);
+            cudaEventRecord(ev_e[t]);
+        }
+        cudaDeviceSynchronize();
+
+        for (int t = 0; t < T_bench; t++) {
+            float ms = 0;
+            cudaEventElapsedTime(&ms, ev_s[t], ev_e[t]);
+            tick_us[t] = ms * 1000.0f;
+        }
+
+        /* Sort for percentiles */
+        for (int i = 0; i < T_bench - 1; i++)
+            for (int j = i + 1; j < T_bench; j++)
+                if (tick_us[j] < tick_us[i]) {
+                    float tmp = tick_us[i]; tick_us[i] = tick_us[j]; tick_us[j] = tmp;
+                }
+
+        float p50  = tick_us[T_bench / 2];
+        float p90  = tick_us[(int)(T_bench * 0.90)];
+        float p95  = tick_us[(int)(T_bench * 0.95)];
+        float p99  = tick_us[(int)(T_bench * 0.99)];
+        float pmax = tick_us[T_bench - 1];
+        float pmin = tick_us[0];
+
+        float sum = 0;
+        for (int t = 0; t < T_bench; t++) sum += tick_us[t];
+        float avg = sum / T_bench;
+
+        /* Count how many are "spikes" (resample ticks) — use 3× median as threshold */
+        int n_spikes = 0;
+        float spike_thresh = 3.0f * p50;
+        for (int t = 0; t < T_bench; t++)
+            if (tick_us[t] > spike_thresh) n_spikes++;
+
+        printf("    T = %d ticks\n", T_bench);
+        printf("    Min:    %8.1f μs\n", pmin);
+        printf("    P50:    %8.1f μs  (forward-only baseline)\n", p50);
+        printf("    Mean:   %8.1f μs\n", avg);
+        printf("    P90:    %8.1f μs\n", p90);
+        printf("    P95:    %8.1f μs\n", p95);
+        printf("    P99:    %8.1f μs  (resample + rejuvenation spikes)\n", p99);
+        printf("    Max:    %8.1f μs\n", pmax);
+        printf("    Spikes: %d / %d ticks > %.0f μs (3× median)\n",
+               n_spikes, T_bench, spike_thresh);
+
+        for (int t = 0; t < T_bench; t++) {
+            cudaEventDestroy(ev_s[t]);
+            cudaEventDestroy(ev_e[t]);
+        }
+        free(ev_s); free(ev_e);
+        free(tick_us);
+        smc2_bpf_free(s);
+    }
+
+    printf("\n  TEST 6: DONE (no pass/fail — informational)\n");
+
+    free(h_true); free(y_true); free(y_f);
+}
+
+/*═══════════════════════════════════════════════════════════════════════════════
  * MAIN
  *═══════════════════════════════════════════════════════════════════════════════*/
 
@@ -492,6 +683,8 @@ int main(int argc, char** argv) {
     n_pass += test_high_vol();
     n_pass += test_cpmmh_acceptance();
     n_pass += test_identifiability();
+
+    test_latency();  /* Informational — no pass/fail */
 
     printf("\n");
     print_sep();
