@@ -402,6 +402,17 @@ if(TARGET ptx_cubin_full)
 endif()
 
 # ==============================================================================
+# Target: test_liu_west (Liu-West parameter learning convergence test — CPU only)
+# ==============================================================================
+
+add_executable(test_liu_west tests/test_liu_west.cu)
+
+set_target_properties(test_liu_west PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+# ==============================================================================
 # Print summary
 # ==============================================================================
 
