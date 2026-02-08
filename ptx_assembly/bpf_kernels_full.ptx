@@ -11,7 +11,7 @@
 //   2.  bpf_init_particles    -- Draw from stationary N(mu, sigma_stat^2)
 //   3.  bpf_propagate_weight  -- OU transition + obs log-likelihood (Gaussian/t)
 //   4.  bpf_set_scalar        -- Initialize a device scalar
-//   5.  bpf_reduce_max        -- Block-parallel max -> atomicMax
+//   5.  bpf_reduce_max        -- Block-parallel max -> CAS atomicMax
 //   6.  bpf_reduce_sum        -- Block-parallel sum -> atomicAdd
 //   7.  bpf_exp_sub           -- w[i] = exp(log_w[i] - max)
 //   8.  bpf_scale_wh          -- Normalize weights, compute w*h
@@ -24,6 +24,11 @@
 // PCG32 State: 2 x u64 per particle [state, inc] in flat array
 // ICDF: Beasley-Springer-Moro rational approximation (~7 digit accuracy)
 //
+// v2 changes (warp-level reductions):
+//   - Kernels 5, 6, 11: shfl.sync.bfly for final 5 reduction levels
+//     Saves 5 bar.sync + 15 shared memory ops per invocation
+//   - Kernel 5: CAS atomicMax kept (atom.global.max.f32 not in SM_120 ptxas 13.1)
+//   - Net: 20 fewer block stalls per tick (4 reduction invocations)//
 // Compile:  ptxas -arch=sm_120 -o bpf_kernels.cubin bpf_kernels.ptx
 // =============================================================================
 
@@ -36,14 +41,6 @@
 // Band config in constant memory (uploaded by host on regime transitions)
 // Layout: n_bands(4) | boundary[4](16) | k[4](16) = 36 bytes
 .const .align 4 .b8 d_mix_config[36];
-
-
-// -----------------------------------------------------------------------------
-// MACRO-LIKE PATTERNS (inlined, PTX has no macros):
-//
-// PCG32_STEP: old=state; state=state*MULT+inc; output xorshift+rotate
-// ICDF:       u in (0,1) -> z ~ N(0,1) via rational approx
-// -----------------------------------------------------------------------------
 
 
 // =============================================================================
@@ -297,40 +294,32 @@ INIT_P_EXIT:
     @!%p_do_prop bra PW_WEIGHT;
 
     // === ADAPTIVE BAND LOOKUP (constant memory) ===
-    // d_mix_config layout: [n_bands:s32][boundary[4]:s32×4][k[4]:f32×4]
-    // Contiguous particle ranges → zero warp divergence
-    // 99% of particles hit band 0 → 3 instructions typical
     .reg .f32   %f_kb;
     .reg .s32   %r_nb, %r_bnd;
     .reg .pred  %p_skip_bands, %p_in_band;
 
-    ld.const.s32    %r_nb, [d_mix_config + 0];       // n_bands
-    ld.const.f32    %f_kb, [d_mix_config + 20];       // k[0] (default = 1.0)
+    ld.const.s32    %r_nb, [d_mix_config + 0];
+    ld.const.f32    %f_kb, [d_mix_config + 20];
     setp.le.s32     %p_skip_bands, %r_nb, 1;
     @%p_skip_bands bra PW_BANDS_DONE;
 
-    // Band 0: fast path — most particles land here
-    ld.const.s32    %r_bnd, [d_mix_config + 4];       // boundary[0]
+    ld.const.s32    %r_bnd, [d_mix_config + 4];
     setp.lt.u32     %p_in_band, %idx, %r_bnd;
     @%p_in_band bra PW_BANDS_DONE;
 
-    // Band 1
-    ld.const.f32    %f_kb, [d_mix_config + 24];       // k[1]
-    ld.const.s32    %r_bnd, [d_mix_config + 8];       // boundary[1]
+    ld.const.f32    %f_kb, [d_mix_config + 24];
+    ld.const.s32    %r_bnd, [d_mix_config + 8];
     setp.lt.u32     %p_in_band, %idx, %r_bnd;
     @%p_in_band bra PW_BANDS_DONE;
 
-    // Band 2
-    ld.const.f32    %f_kb, [d_mix_config + 28];       // k[2]
-    ld.const.s32    %r_bnd, [d_mix_config + 12];      // boundary[2]
+    ld.const.f32    %f_kb, [d_mix_config + 28];
+    ld.const.s32    %r_bnd, [d_mix_config + 12];
     setp.lt.u32     %p_in_band, %idx, %r_bnd;
     @%p_in_band bra PW_BANDS_DONE;
 
-    // Band 3 (fallthrough — always taken if we got here)
-    ld.const.f32    %f_kb, [d_mix_config + 32];       // k[3]
+    ld.const.f32    %f_kb, [d_mix_config + 32];
 
 PW_BANDS_DONE:
-    // Apply band scale: sigma_z *= k_b
     mul.f32         %f_sigma_z, %f_sigma_z, %f_kb;
 
     // === PROPAGATION ===
@@ -401,7 +390,6 @@ PW_ICDF_OK:
     mov.f32         %f_eps, %f_z;
 
     // Student-t state noise: eps = z * sqrt(nu / chi2)
-    // chi2 is pre-generated on host and loaded from param_chi2 array
     setp.gt.f32     %p_t_state, %f_nu_state, 0f00000000;
     @!%p_t_state bra PW_TRANS;
 
@@ -415,8 +403,6 @@ PW_ICDF_OK:
     mul.f32         %f_eps, %f_z, %f_scale;
 
 PW_TRANS:
-    // h = mu + rho*(h-mu) + sigma_z*eps
-    // sigma_z already scaled by k_b from band lookup
     .reg .f32 %f_dev;
     sub.f32         %f_dev, %f_hi, %f_mu;
     mul.f32         %f_dev, %f_rho, %f_dev;
@@ -426,43 +412,39 @@ PW_TRANS:
 
 PW_WEIGHT:
     // === OBSERVATION WEIGHT ===
-    // No importance weight correction — observation likelihood does natural selection.
-    // Wide-band particles in wrong region get low p(y|h) naturally.
     .reg .f32 %f_neg_half, %f_exp_arg;
     mov.f32         %f_neg_half, 0fBF000000;
     mul.f32         %f_exp_arg, %f_hi, %f_neg_half;
-    mul.f32         %f_exp_arg, %f_exp_arg, 0f3FB8AA3B;   // *log2(e)
+    mul.f32         %f_exp_arg, %f_exp_arg, 0f3FB8AA3B;
     ex2.approx.f32  %f_exp_arg, %f_exp_arg;
     mul.f32         %f_eta, %f_yt, %f_exp_arg;
 
     setp.gt.f32     %p_t_obs, %f_nu_obs, 0f00000000;
     @%p_t_obs bra   PW_T_OBS;
 
-    // Gaussian obs: log_w = -0.5*log(2pi) - 0.5*eta^2 - 0.5*h
+    // Gaussian obs
     mul.f32         %f_eta2, %f_eta, %f_eta;
-    mov.f32         %f_log_w, 0fBF6B3F8E;     // -0.5*log(2pi)
+    mov.f32         %f_log_w, 0fBF6B3F8E;
     fma.rn.f32      %f_log_w, %f_neg_half, %f_eta2, %f_log_w;
     fma.rn.f32      %f_log_w, %f_neg_half, %f_hi, %f_log_w;
     bra             PW_STORE;
 
 PW_T_OBS:
-    // Student-t obs: C_obs precomputed on host
-    // log_w = C_obs - (nu+1)/2 * log(1 + eta^2/nu) - 0.5*h
+    // Student-t obs
     .reg .f32 %f_nu_p1h, %f_t_arg, %f_log_t;
 
     add.f32         %f_nu_p1h, %f_nu_obs, 0f3F800000;
-    mul.f32         %f_nu_p1h, %f_nu_p1h, 0f3F000000;    // (nu+1)/2
+    mul.f32         %f_nu_p1h, %f_nu_p1h, 0f3F000000;
 
     mul.f32         %f_eta2, %f_eta, %f_eta;
     div.approx.f32  %f_t_arg, %f_eta2, %f_nu_obs;
-    add.f32         %f_t_arg, %f_t_arg, 0f3F800000;       // 1 + eta^2/nu
+    add.f32         %f_t_arg, %f_t_arg, 0f3F800000;
     lg2.approx.f32  %f_log_t, %f_t_arg;
-    mul.f32         %f_log_t, %f_log_t, 0f3F317218;       // *ln2
+    mul.f32         %f_log_t, %f_log_t, 0f3F317218;
     .reg .f32 %f_neg_nph;
     neg.f32         %f_neg_nph, %f_nu_p1h;
-    mul.f32         %f_log_t, %f_neg_nph, %f_log_t;       // -(nu+1)/2 * log(...)
+    mul.f32         %f_log_t, %f_neg_nph, %f_log_t;
 
-    // Assemble: C_obs + log_t - 0.5*h
     add.f32         %f_log_w, %f_C_obs, %f_log_t;
     fma.rn.f32      %f_log_w, %f_neg_half, %f_hi, %f_log_w;
 
@@ -493,7 +475,13 @@ PW_EXIT:
 
 
 // =============================================================================
-// Kernel 5: bpf_reduce_max   Block->atomicMax(CAS)
+// Kernel 5: bpf_reduce_max   (v2: warp shuffle)
+//
+//   Inter-warp: shared memory tree reduction (s >= 32) with bar.sync
+//   Intra-warp: shfl.sync.bfly (s = 16..1) — 5 rounds, no bar.sync
+//   Final:      CAS loop for float atomicMax (native f32 max not in SM_120 ptxas)
+//
+//   Saves 5 bar.sync + 15 shared memory ops per invocation
 // =============================================================================
 
 .visible .entry bpf_reduce_max(
@@ -505,8 +493,10 @@ PW_EXIT:
     .reg .u32   %r_tid, %idx, %r_ctaid, %r_n, %r_s, %r_partner, %r_ntid;
     .reg .u64   %rd_in, %rd_out, %rd_off;
     .reg .u64   %rd_smem_base, %rd_smem, %rd_smem_partner;
-    .reg .f32   %f_val, %f_other, %f_max;
-    .reg .pred  %p_bound, %p_active, %p_tid0, %p_loop;
+    .reg .f32   %f_val, %f_other, %f_max, %f_shfl;
+    .reg .pred  %p_bound, %p_active, %p_tid0, %p_warp, %p_cas;
+    .reg .u32   %r_old, %r_assumed, %r_new;
+    .reg .f32   %f_old, %f_cmp;
 
     ld.param.u64 %rd_in,  [param_in];
     ld.param.u64 %rd_out, [param_out];
@@ -517,6 +507,7 @@ PW_EXIT:
     mad.lo.u32 %idx, %r_ctaid, %r_ntid, %r_tid;
     mov.u64 %rd_smem_base, smem_raw;
 
+    // Load or -inf sentinel
     mov.f32 %f_val, 0fF49A4F80;
     setp.lt.u32 %p_bound, %idx, %r_n;
     @!%p_bound bra RM_LD;
@@ -531,10 +522,11 @@ RM_LD:
     st.shared.f32 [%rd_smem], %f_val;
     bar.sync 0;
 
+    // === Inter-warp reduction (s >= 32): shared memory + bar.sync ===
     shr.u32 %r_s, %r_ntid, 1;
 RM_LP:
-    setp.eq.u32 %p_loop, %r_s, 0;
-    @%p_loop bra RM_DN;
+    setp.lt.u32 %p_warp, %r_s, 32;
+    @%p_warp bra RM_WARP;
     setp.lt.u32 %p_active, %r_tid, %r_s;
     @!%p_active bra RM_SK;
     add.u32 %r_partner, %r_tid, %r_s;
@@ -548,13 +540,27 @@ RM_SK:
     bar.sync 0;
     shr.u32 %r_s, %r_s, 1;
     bra RM_LP;
-RM_DN:
+
+RM_WARP:
+    // === Intra-warp reduction: shfl.sync.bfly — no bar.sync needed ===
+    // After inter-warp phase, smem[0..31] holds 32 partial maxima.
+    // Each warp loads its own slot; only warp 0's result matters.
+    ld.shared.f32 %f_val, [%rd_smem];
+
+    shfl.sync.bfly.b32 %f_shfl, %f_val, 16, 31, 0xFFFFFFFF;
+    max.f32 %f_val, %f_val, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_val, 8, 31, 0xFFFFFFFF;
+    max.f32 %f_val, %f_val, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_val, 4, 31, 0xFFFFFFFF;
+    max.f32 %f_val, %f_val, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_val, 2, 31, 0xFFFFFFFF;
+    max.f32 %f_val, %f_val, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_val, 1, 31, 0xFFFFFFFF;
+    max.f32 %f_val, %f_val, %f_shfl;
+
+    // === tid 0: float atomicMax via CAS loop ===
     setp.eq.u32 %p_tid0, %r_tid, 0;
     @!%p_tid0 bra RM_EX;
-    ld.shared.f32 %f_val, [%rd_smem];
-    .reg .u32 %r_old, %r_assumed, %r_new;
-    .reg .f32 %f_old, %f_cmp;
-    .reg .pred %p_cas;
     ld.global.u32 %r_old, [%rd_out];
 RM_CAS:
     mov.u32 %r_assumed, %r_old;
@@ -570,7 +576,10 @@ RM_EX:
 
 
 // =============================================================================
-// Kernel 6: bpf_reduce_sum   Block->atomicAdd.f32
+// Kernel 6: bpf_reduce_sum   (v2: warp shuffle)
+//
+//   Same hybrid strategy: shared memory for inter-warp, shfl for intra-warp.
+//   atom.global.add.f32 unchanged (already single instruction).
 // =============================================================================
 
 .visible .entry bpf_reduce_sum(
@@ -582,8 +591,8 @@ RM_EX:
     .reg .u32   %r_tid, %idx, %r_ctaid, %r_n, %r_s, %r_partner, %r_ntid;
     .reg .u64   %rd_in, %rd_out, %rd_off;
     .reg .u64   %rd_smem_base, %rd_smem, %rd_smem_partner;
-    .reg .f32   %f_val, %f_other, %f_sum;
-    .reg .pred  %p_bound, %p_active, %p_tid0, %p_loop;
+    .reg .f32   %f_val, %f_other, %f_sum, %f_shfl;
+    .reg .pred  %p_bound, %p_active, %p_tid0, %p_warp;
 
     ld.param.u64 %rd_in,  [param_in];
     ld.param.u64 %rd_out, [param_out];
@@ -608,10 +617,11 @@ RS_LD:
     st.shared.f32 [%rd_smem], %f_val;
     bar.sync 0;
 
+    // === Inter-warp reduction (s >= 32): shared memory + bar.sync ===
     shr.u32 %r_s, %r_ntid, 1;
 RS_LP:
-    setp.eq.u32 %p_loop, %r_s, 0;
-    @%p_loop bra RS_DN;
+    setp.lt.u32 %p_warp, %r_s, 32;
+    @%p_warp bra RS_WARP;
     setp.lt.u32 %p_active, %r_tid, %r_s;
     @!%p_active bra RS_SK;
     add.u32 %r_partner, %r_tid, %r_s;
@@ -625,10 +635,24 @@ RS_SK:
     bar.sync 0;
     shr.u32 %r_s, %r_s, 1;
     bra RS_LP;
-RS_DN:
+
+RS_WARP:
+    // === Intra-warp reduction: shfl.sync.bfly ===
+    ld.shared.f32 %f_val, [%rd_smem];
+
+    shfl.sync.bfly.b32 %f_shfl, %f_val, 16, 31, 0xFFFFFFFF;
+    add.f32 %f_val, %f_val, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_val, 8, 31, 0xFFFFFFFF;
+    add.f32 %f_val, %f_val, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_val, 4, 31, 0xFFFFFFFF;
+    add.f32 %f_val, %f_val, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_val, 2, 31, 0xFFFFFFFF;
+    add.f32 %f_val, %f_val, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_val, 1, 31, 0xFFFFFFFF;
+    add.f32 %f_val, %f_val, %f_shfl;
+
     setp.eq.u32 %p_tid0, %r_tid, 0;
     @!%p_tid0 bra RS_EX;
-    ld.shared.f32 %f_val, [%rd_smem];
     atom.global.add.f32 %f_val, [%rd_out], %f_val;
 RS_EX:
     ret;
@@ -818,7 +842,10 @@ RE_EX:
 
 
 // =============================================================================
-// Kernel 11: bpf_compute_var   sum((h[i]-mean)^2) -> atomicAdd to *d_var
+// Kernel 11: bpf_compute_var   (v2: warp shuffle)
+//
+//   sum((h[i]-mean)^2) -> atomicAdd to *d_var
+//   Same hybrid reduction as kernels 5/6.
 // =============================================================================
 
 .visible .entry bpf_compute_var(
@@ -831,8 +858,8 @@ RE_EX:
     .reg .u32 %idx, %r_tid, %r_ctaid, %r_ntid, %r_n, %r_s, %r_partner;
     .reg .u64 %rd_h, %rd_var, %rd_off;
     .reg .u64 %rd_smem_base, %rd_smem, %rd_smem_partner;
-    .reg .f32 %f_h, %f_mean, %f_dev, %f_d2, %f_other, %f_val;
-    .reg .pred %p_bound, %p_active, %p_tid0, %p_loop;
+    .reg .f32 %f_h, %f_mean, %f_dev, %f_d2, %f_other, %f_val, %f_shfl;
+    .reg .pred %p_bound, %p_active, %p_tid0, %p_warp;
 
     ld.param.u64 %rd_h,    [param_h];
     ld.param.u64 %rd_var,  [param_d_var];
@@ -860,10 +887,11 @@ CV_SM:
     st.shared.f32 [%rd_smem], %f_d2;
     bar.sync 0;
 
+    // === Inter-warp reduction (s >= 32): shared memory + bar.sync ===
     shr.u32 %r_s, %r_ntid, 1;
 CV_LP:
-    setp.eq.u32 %p_loop, %r_s, 0;
-    @%p_loop bra CV_DN;
+    setp.lt.u32 %p_warp, %r_s, 32;
+    @%p_warp bra CV_WARP;
     setp.lt.u32 %p_active, %r_tid, %r_s;
     @!%p_active bra CV_SK;
     add.u32 %r_partner, %r_tid, %r_s;
@@ -877,10 +905,24 @@ CV_SK:
     bar.sync 0;
     shr.u32 %r_s, %r_s, 1;
     bra CV_LP;
-CV_DN:
+
+CV_WARP:
+    // === Intra-warp reduction: shfl.sync.bfly ===
+    ld.shared.f32 %f_val, [%rd_smem];
+
+    shfl.sync.bfly.b32 %f_shfl, %f_val, 16, 31, 0xFFFFFFFF;
+    add.f32 %f_val, %f_val, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_val, 8, 31, 0xFFFFFFFF;
+    add.f32 %f_val, %f_val, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_val, 4, 31, 0xFFFFFFFF;
+    add.f32 %f_val, %f_val, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_val, 2, 31, 0xFFFFFFFF;
+    add.f32 %f_val, %f_val, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_val, 1, 31, 0xFFFFFFFF;
+    add.f32 %f_val, %f_val, %f_shfl;
+
     setp.eq.u32 %p_tid0, %r_tid, 0;
     @!%p_tid0 bra CV_EX;
-    ld.shared.f32 %f_val, [%rd_smem];
     atom.global.add.f32 %f_val, [%rd_var], %f_val;
 CV_EX:
     ret;
