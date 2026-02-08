@@ -549,13 +549,14 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
     }
 
     // 8b. ESS: sum(w_i^2) -> d_scalars[4]
-    bpf_square_weights_k<<<g, b, 0, st>>>(s->d_w, s->d_wh, n);
+    // Use d_h2 as scratch buffer — d_wh holds w*h and must stay intact
+    bpf_square_weights_k<<<g, b, 0, st>>>(s->d_w, s->d_h2, n);
     {
         CUdeviceptr ptr = dscal + 4 * sizeof(float);
         float val = 0.0f;
         void* p1[] = { &ptr, &val };
         ptx_launch(g_ptx.set_scalar, st, 1, 1, 0, p1);
-        void* p2[] = { &dwh, &ptr, &n };
+        void* p2[] = { &dh2, &ptr, &n };
         ptx_launch(g_ptx.reduce_sum, st, g, b, smem, p2);
     }
 
@@ -650,9 +651,10 @@ BpfResult gpu_bpf_get_result(GpuBpfState* s) {
 BpfResult gpu_bpf_step(GpuBpfState* s, float y_t) {
     gpu_bpf_step_async(s, y_t);
     cudaStreamSynchronize(s->stream);
-    // Compute surprise BEFORE get_result overwrites last_h_est
+    BpfResult r = gpu_bpf_get_result(s);  // updates last_h_est to CURRENT tick
+    // Surprise uses current tick's h_est → 1-tick regime lag (was 2-tick)
     s->last_surprise = fabsf(y_t) * expf(-s->last_h_est * 0.5f);
-    return gpu_bpf_get_result(s);  // this updates last_h_est
+    return r;
 }
 
 // =============================================================================
