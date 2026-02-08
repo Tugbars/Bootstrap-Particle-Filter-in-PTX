@@ -35,7 +35,7 @@ typedef struct {
     float* d_cdf;
     float* d_wh;
     curandState* d_rng;
-    float* d_scalars;       // [4]: max_lw, sum_w, h_est, log_lik
+    float* d_scalars;       // [5]: max_lw, sum_w, h_est, log_lik, sum_w_sq
     float* d_noise;         // [N]: standard normal samples for Silverman jitter
     float* d_var;           // [1]: variance accumulator scalar
     int n_particles;
@@ -43,6 +43,7 @@ typedef struct {
     cudaStream_t stream;
     float rho, sigma_z, mu, nu_state, nu_obs;
     float silverman_shrink; // 0.0 = off, 0.5 = conservative, 0.7 = moderate
+    int ess_adaptive;       // 1 = ESS-scaled Silverman bandwidth, 0 = fixed
     unsigned long long host_rng_state;
     float last_h_est;           // h_est from previous tick (for adaptive bands)
     float last_surprise;        // surprise score from previous tick (delayed switching)

@@ -304,6 +304,18 @@ __global__ void bpf_resample(float* h_out, const float* h_in,
 }
 
 // =============================================================================
+// Kernels: ESS computation
+// =============================================================================
+
+// Square normalized weights into output buffer for ESS = 1/sum(w²)
+__global__ void bpf_square_weights(const float* __restrict__ w,
+                                    float* __restrict__ w_sq, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    w_sq[i] = w[i] * w[i];
+}
+
+// =============================================================================
 // Kernels: Silverman kernel smoothing
 // =============================================================================
 
@@ -386,6 +398,7 @@ GpuBpfState* gpu_bpf_create(int n_particles, float rho, float sigma_z, float mu,
     s->last_h_est = mu;  // initial guess = long-run mean
     s->last_surprise = 0.0f;
     s->silverman_shrink = 0.5f;  // ← TOGGLE HERE: 0.0 = off, 0.5 = conservative
+    s->ess_adaptive = 1;         // ← TOGGLE: 1 = ESS-scaled jitter, 0 = fixed bandwidth
 
     // ── Band-based mixture proposal ──
     // Default: single band (standard BPF). Call gpu_bpf_set_adaptive_bands() to enable.
@@ -404,7 +417,7 @@ GpuBpfState* gpu_bpf_create(int n_particles, float rho, float sigma_z, float mu,
     cudaMalloc(&s->d_cdf,     n_particles * sizeof(float));
     cudaMalloc(&s->d_wh,      n_particles * sizeof(float));
     cudaMalloc(&s->d_rng,     n_particles * sizeof(curandState));
-    cudaMalloc(&s->d_scalars, 4 * sizeof(float));  // max_lw, sum_w, h_est, log_lik
+    cudaMalloc(&s->d_scalars, 5 * sizeof(float));  // max_lw, sum_w, h_est, log_lik, sum_w_sq
     cudaMalloc(&s->d_noise,   n_particles * sizeof(float));
     cudaMalloc(&s->d_var,     sizeof(float));
 
@@ -482,6 +495,12 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
     // 7. log_lik → d_scalars[3]
     bpf_compute_loglik<<<1, 1, 0, st>>>(s->d_scalars, n);
 
+    // 7b. ESS: sum(w_i²) → d_scalars[4].  ESS = 1/sum_w_sq.
+    //     Reuses d_wh as scratch (free after step 6).
+    bpf_square_weights<<<g, b, 0, st>>>(s->d_w, s->d_wh, n);
+    bpf_set_scalar<<<1, 1, 0, st>>>(s->d_scalars + 4, 0.0f);
+    bpf_reduce_sum<<<g, b, smem, st>>>(s->d_wh, s->d_scalars + 4, n);
+
     // 8. Inclusive scan for CDF (thrust on stream — device→device, no host sync)
     thrust::inclusive_scan(
         thrust::cuda::par.on(st),
@@ -496,21 +515,28 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
     // Swap particle buffers
     float* tmp = s->d_h; s->d_h = s->d_h2; s->d_h2 = tmp;
 
-    // ─── 10. Silverman kernel smoothing (post-resample jitter) ───
+    // ─── 10. Silverman kernel smoothing (post-resample, ESS-adaptive jitter) ───
     //
     // After resampling, many particles are duplicates. Silverman jitter
     // adds bandwidth-scaled Gaussian noise to restore diversity.
     //
-    // Bandwidth = shrink * sigma_hat * (4/(3N))^(1/5)
+    // Base bandwidth = shrink * sigma_hat * (4/(3N))^(1/5)
     //
-    // This requires a sync to read h_mean and var back to host for the
-    // bandwidth calculation. The noise generation itself is on-device via cuRAND.
+    // ESS scaling: bw *= (N/ESS)^0.5
+    //   ESS ≈ N → scale ≈ 1 (normal conditions, standard jitter)
+    //   ESS << N → scale >> 1 (heavy degeneracy, wider jitter)
     //
     if (s->silverman_shrink > 0.0f) {
-        // Need h_mean from step 6 — must sync to read d_scalars[2]
+        // Sync to read h_mean and sum_w_sq (both already computed on stream)
         cudaStreamSynchronize(st);
-        float h_mean;
-        cudaMemcpy(&h_mean, s->d_scalars + 2, sizeof(float), cudaMemcpyDeviceToHost);
+        float host_scalars[5];
+        cudaMemcpy(host_scalars, s->d_scalars, 5 * sizeof(float), cudaMemcpyDeviceToHost);
+        float h_mean = host_scalars[2];
+        float sum_w_sq = host_scalars[4];
+
+        // ESS = 1/sum(w²), ESS_N = ESS/N
+        float ess = 1.0f / fmaxf(sum_w_sq, 1e-30f);
+        float ess_n = ess / (float)n;
 
         // 10a. Compute variance of resampled particles
         bpf_set_scalar<<<1, 1, 0, st>>>(s->d_var, 0.0f);
@@ -526,6 +552,14 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
         // Silverman bandwidth: shrink * sigma * (4/(3N))^(1/5)
         // (4/3)^(1/5) ≈ 1.05922
         float bw = s->silverman_shrink * sigma_hat * 1.05922f * powf((float)n, -0.2f);
+
+        // ESS scaling: widen jitter when particle diversity is low
+        // sqrt(N/ESS) = sqrt(1/ESS_N).  Clamp to avoid extreme jitter.
+        if (s->ess_adaptive) {
+            float ess_scale = sqrtf(1.0f / fmaxf(ess_n, 0.01f));  // max 10× widening
+            ess_scale = fminf(ess_scale, 10.0f);
+            bw *= ess_scale;
+        }
 
         // 10b. Generate noise on device (reuses cuRAND states — advances them)
         bpf_gen_noise<<<g, b, 0, st>>>(s->d_noise, s->d_rng, n);

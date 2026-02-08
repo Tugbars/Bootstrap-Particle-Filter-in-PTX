@@ -363,6 +363,23 @@ if(TARGET ptx_cubin_full)
 endif()
 
 # ==============================================================================
+# Target: test_bpf_adaptive_stress (adaptive bands stress test — brutal DGPs)
+# ==============================================================================
+
+add_executable(test_bpf_adaptive_stress tests/test_bpf_adaptive_stress.cu)
+
+target_link_libraries(test_bpf_adaptive_stress PRIVATE
+    gpu_bpf
+    CUDA::cudart
+    CUDA::curand
+)
+
+set_target_properties(test_bpf_adaptive_stress PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+# ==============================================================================
 # Print summary
 # ==============================================================================
 

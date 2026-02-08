@@ -351,9 +351,7 @@ int main(int argc, char** argv) {
     // TEST 7: Adaptive bands — best of both worlds
     // ─────────────────────────────────────────────────────────────────────
     printf("\n--- TEST 7: Adaptive bands (surprise-driven regime switching) ---\n");
-    printf("  Calm:  99%% std + 1%% wide    (|eta| < 2)\n");
-    printf("  Alert: 90/5/3/2 x [1,2,4,8]  (|eta| < 4)\n");
-    printf("  Panic: 70/15/10/5 x [1,2,5,12] (|eta| >= 4)\n\n");
+    printf("  Adaptive bands with 1-tick delayed surprise switching\n\n");
 
     // 7a: Oracle params
     SvData d7o = generate_sv(n_ticks, true_rho, true_sz, true_mu, seed + 7);
@@ -394,17 +392,52 @@ int main(int argc, char** argv) {
     printf("  Spikes:     Standard=%.4f  Adaptive=%.4f (%+.1f%%)\n",
            rmse7k_base, rmse7k_adapt, 100.0*(rmse7k_adapt/rmse7k_base - 1.0));
 
-    // 7e: Threshold sweep
-    printf("\n  Threshold sweep (severe misspec 4x):\n");
-    float thresholds[][2] = {
-        {1.5f, 3.0f}, {2.0f, 4.0f}, {2.5f, 5.0f}, {3.0f, 6.0f}
+    // ─────────────────────────────────────────────────────────────────────
+    // TEST 8: ESS-adaptive Silverman jitter
+    // ─────────────────────────────────────────────────────────────────────
+    printf("\n--- TEST 8: ESS-adaptive Silverman (bands + ESS jitter vs bands only) ---\n");
+
+    // Helper lambda: run with specific ess_adaptive setting
+    auto run_ess_test = [&](const SvData* d, int ess_on) -> double {
+        GpuBpfState* s = gpu_bpf_create(N, true_rho, true_sz, true_mu, 0, 0, seed);
+        s->ess_adaptive = ess_on;
+
+        // Enable adaptive bands
+        float cf[] = {0.99f, 0.01f};       float cs[] = {1.0f, 4.0f};
+        float af[] = {0.90f,0.05f,0.03f,0.02f}; float as[] = {1,2,4,8};
+        float pf[] = {0.70f,0.15f,0.10f,0.05f}; float ps[] = {1,2,5,12};
+        gpu_bpf_set_adaptive_bands(N, cf,cs,2, af,as,4, pf,ps,4, 2.0f,4.0f);
+
+        int skip = 100;
+        double sum_sq = 0.0;
+        int count = 0;
+        for (int t = 0; t < d->n; t++) {
+            BpfResult r = gpu_bpf_step(s, (float)d->returns[t]);
+            if (t >= skip) {
+                double err = (double)r.h_mean - d->h[t];
+                sum_sq += err * err;
+                count++;
+            }
+        }
+        gpu_bpf_destroy(s);
+        float f1[] = {1.0f}; float s1[] = {1.0f};
+        gpu_bpf_set_bands(N, 1, f1, s1);
+        return sqrt(sum_sq / fmax(count, 1));
     };
-    for (int t = 0; t < 4; t++) {
-        double rm = run_bpf_rmse_adaptive(&d7s, N, true_rho, true_sz, true_mu,
-                                           0, 0, seed, thresholds[t][0], thresholds[t][1]);
-        printf("    alert=%.1f panic=%.1f → RMSE=%.4f (%+.1f%%)\n",
-               thresholds[t][0], thresholds[t][1],
-               rm, 100.0*(rm/rmse7s_base - 1.0));
+
+    struct { const char* name; const SvData* data; } scenarios9[] = {
+        {"Oracle",     &d7o},
+        {"Misspec2x",  &d7m},
+        {"Misspec4x",  &d7s},
+        {"Spikes",     &d7k},
+    };
+
+    for (int i = 0; i < 4; i++) {
+        double fixed = run_ess_test(scenarios9[i].data, 0);
+        double adaptive = run_ess_test(scenarios9[i].data, 1);
+        printf("  %-12s  Fixed Silv=%.4f  ESS-Adapt=%.4f  (%+.1f%%)\n",
+               scenarios9[i].name, fixed, adaptive,
+               100.0*(adaptive/fixed - 1.0));
     }
 
     free_sv(&d7o);
