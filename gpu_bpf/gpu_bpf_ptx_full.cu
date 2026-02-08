@@ -2,10 +2,10 @@
  * @file gpu_bpf_ptx_full.cu
  * @brief GPU BPF — 100% hand-written PTX, zero cuRAND for BPF
  *
- * All 13 BPF kernels from bpf_kernels_full.ptx:
+ * BPF kernels from bpf_kernels_full.ptx:
  *   1.  bpf_init_rng          — PCG32 seeding
  *   2.  bpf_init_particles    — Draw N(mu, sigma_stat^2) via ICDF
- *   3.  bpf_propagate_weight  — OU + Student-t + obs weight (fused)
+ *   3.  bpf_propagate_weight  — OU + Student-t + obs weight (bootstrap)
  *   4.  bpf_set_scalar
  *   5.  bpf_reduce_max
  *   6.  bpf_reduce_sum
@@ -16,14 +16,20 @@
  *  11.  bpf_compute_var
  *  12.  bpf_gen_noise
  *  13.  bpf_silverman_jitter
+ *  14.  bpf_propagate_weight_opt — Mode-matched Gaussian optimal proposal
+ *
+ * Kernel 14 is a drop-in replacement for kernel 3. Instead of blind OU
+ * proposal, it finds the mode of log p(y|h) + log p(h|h_{t-1}) via 3
+ * Newton iterations, samples from N(h_mode, -1/g''), and corrects
+ * importance weights. Toggle: gpu_bpf_use_optimal_proposal(1).
  *
  * PCG32 state: 16 bytes/particle (2 x u64) vs curandState ~48 bytes/particle.
  * Normal generation: ICDF (Acklam rational approx) — 1 uniform per normal.
  *
- * APF/IMM still nvcc + cuRAND.
+ * APF still nvcc + cuRAND.
  *
  * Build:
- *   nvcc -O3 test_bpf_matched_dgp.cu gpu_bpf_ptx_full.cu -o test_bpf_full -lcuda -lcurand
+ *   nvcc -O3 gpu_bpf_ptx_full.cu -o test -lcuda -lcurand
  *
  * Runtime: needs bpf_kernels_full.cubin or bpf_kernels_full.ptx in cwd
  */
@@ -81,7 +87,7 @@ __global__ void bpf_accumulate_lw_k(float* __restrict__ log_w,
 }
 
 // =============================================================================
-// PTX Module — 13 kernels
+// PTX Module — 14 kernels
 // =============================================================================
 
 static CUmodule g_ptx_module = NULL;
@@ -100,10 +106,12 @@ typedef struct {
     CUfunction compute_var;
     CUfunction gen_noise;
     CUfunction silverman_jitter;
+    CUfunction propagate_weight_opt;  // Kernel 14: mode-matched optimal proposal
 } PtxFunctions;
 
 static PtxFunctions g_ptx;
 static int          g_ptx_loaded = 0;
+static int          g_use_optimal_proposal = 0;  // 0=bootstrap(k3), 1=optimal(k14)
 
 // Constant memory for band config
 static CUdeviceptr  g_d_mix_config = 0;
@@ -120,8 +128,8 @@ static void ensure_ptx_loaded() {
     if (g_ptx_loaded) return;
     cudaFree(0);
 
-    const char* cubin_paths[] = { "bpf_kernels_full.cubin", NULL };
-    const char* ptx_paths[]   = { "bpf_kernels_full.ptx", NULL };
+    const char* cubin_paths[] = { "bpf_kernels_full.cubin", "bpf_kernels.cubin", NULL };
+    const char* ptx_paths[]   = { "bpf_kernels_full.ptx", "bpf_kernels.ptx", NULL };
 
     for (int i = 0; cubin_paths[i]; i++) {
         FILE* f = fopen(cubin_paths[i], "rb");
@@ -195,8 +203,20 @@ extract:
     cuModuleGetFunction(&g_ptx.gen_noise,         g_ptx_module, "bpf_gen_noise");
     cuModuleGetFunction(&g_ptx.silverman_jitter,  g_ptx_module, "bpf_silverman_jitter");
 
+    // Kernel 14: optimal proposal (soft-fail if PTX doesn't have it)
+    CUresult opt_err = cuModuleGetFunction(&g_ptx.propagate_weight_opt,
+                                            g_ptx_module, "bpf_propagate_weight_opt");
+    int has_optimal = (opt_err == CUDA_SUCCESS);
+
     g_ptx_loaded = 1;
-    fprintf(stderr, "[PTX-FULL] All 13 kernels loaded\n");
+    fprintf(stderr, "[PTX-FULL] %d kernels loaded (optimal proposal: %s)\n",
+            has_optimal ? 14 : 13, has_optimal ? "YES" : "NO");
+
+    if (g_use_optimal_proposal && !has_optimal) {
+        fprintf(stderr, "[PTX-FULL] WARNING: optimal proposal requested but kernel 14 "
+                        "not found in PTX. Falling back to bootstrap.\n");
+        g_use_optimal_proposal = 0;
+    }
 
     // Get constant memory symbol for band config
     cuModuleGetGlobal(&g_d_mix_config, &g_d_mix_config_size,
@@ -445,7 +465,7 @@ void gpu_bpf_destroy(GpuBpfState* s) {
 }
 
 // =============================================================================
-// gpu_bpf_step_async — ALL PTX (13 kernels)
+// gpu_bpf_step_async — ALL PTX (14 kernels)
 // =============================================================================
 
 void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
@@ -482,7 +502,9 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
         mix_maybe_switch_regime(s->last_surprise);
     }
 
-    // 2. Propagate + weight (PTX: fused PCG32 + ICDF + OU + obs weight)
+    // 2. Propagate + weight
+    //    Bootstrap (kernel 3): blind OU proposal, obs-only weight
+    //    Optimal   (kernel 14): mode-matched Gaussian, importance-corrected weight
     {
         int do_prop = (s->timestep > 0) ? 1 : 0;
         void* params[] = {
@@ -490,7 +512,10 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
             &s->rho, &s->sigma_z, &s->mu, &s->nu_state, &s->nu_obs,
             &s->C_obs, &y_t, &n, &do_prop
         };
-        ptx_launch(g_ptx.propagate_weight, st, g, b, 0, params);
+        CUfunction prop_fn = (g_use_optimal_proposal && g_ptx.propagate_weight_opt)
+                           ? g_ptx.propagate_weight_opt
+                           : g_ptx.propagate_weight;
+        ptx_launch(prop_fn, st, g, b, 0, params);
     }
 
     // 2b. Accumulate previous log-weights if we skipped resampling last tick
@@ -691,6 +716,29 @@ void gpu_bpf_set_ess_threshold(GpuBpfState* s, float threshold) {
 
 int gpu_bpf_get_resample_count(GpuBpfState* s) {
     return s->resample_count;
+}
+
+// =============================================================================
+// Optimal proposal toggle
+//
+// Call gpu_bpf_use_optimal_proposal(1) BEFORE gpu_bpf_create() to use
+// kernel 14 (mode-matched Gaussian) instead of kernel 3 (bootstrap).
+// Same signature, same launch config — just smarter particle placement.
+//
+// If kernel 14 is not in the PTX file, silently falls back to bootstrap.
+// =============================================================================
+
+void gpu_bpf_use_optimal_proposal(int enable) {
+    g_use_optimal_proposal = enable;
+    if (g_ptx_loaded && enable && !g_ptx.propagate_weight_opt) {
+        fprintf(stderr, "[PTX-FULL] WARNING: optimal proposal kernel not loaded. "
+                        "Falling back to bootstrap.\n");
+        g_use_optimal_proposal = 0;
+    }
+}
+
+int gpu_bpf_get_optimal_proposal(void) {
+    return g_use_optimal_proposal;
 }
 
 // =============================================================================
@@ -1017,111 +1065,4 @@ double gpu_apf_run_rmse(
     }
     gpu_apf_destroy(st);
     return sqrt(sse / (double)count);
-}
-
-// =============================================================================
-// IMM (uses gpu_bpf_* which is now full PTX for BPF)
-// =============================================================================
-
-static double log_sum_exp(const double* x, int n) {
-    double mx = -1e30;
-    for (int i = 0; i < n; i++) if (x[i] > mx) mx = x[i];
-    double s = 0.0;
-    for (int i = 0; i < n; i++) s += exp(x[i] - mx);
-    return mx + log(s);
-}
-
-GpuImmState* gpu_imm_create(
-    const ImmModelParams* models, int n_models, int n_particles_per_model,
-    const float* transition_matrix, int seed
-) {
-    if (n_models > IMM_MAX_MODELS) {
-        fprintf(stderr, "IMM: n_models=%d > max=%d\n", n_models, IMM_MAX_MODELS);
-        return NULL;
-    }
-    GpuImmState* s = (GpuImmState*)calloc(1, sizeof(GpuImmState));
-    s->n_models = n_models;
-    s->n_particles_per_model = n_particles_per_model;
-    s->timestep = 0;
-    s->filters = (GpuBpfState**)malloc(n_models * sizeof(GpuBpfState*));
-    for (int k = 0; k < n_models; k++)
-        s->filters[k] = gpu_bpf_create(n_particles_per_model,
-            models[k].rho, models[k].sigma_z, models[k].mu,
-            models[k].nu_state, models[k].nu_obs, seed + k * 7919);
-    s->log_pi = (double*)malloc(n_models * sizeof(double));
-    s->log_pi_pred = (double*)malloc(n_models * sizeof(double));
-    double log_u = -log((double)n_models);
-    for (int k = 0; k < n_models; k++) s->log_pi[k] = log_u;
-    s->log_T = (double*)malloc(n_models * n_models * sizeof(double));
-    if (transition_matrix) {
-        for (int i = 0; i < n_models * n_models; i++)
-            s->log_T[i] = log(fmax((double)transition_matrix[i], 1e-30));
-    } else {
-        double p_stay = 0.95, p_sw = (n_models > 1) ? (1.0 - p_stay) / (n_models - 1) : 0.0;
-        for (int i = 0; i < n_models; i++)
-            for (int j = 0; j < n_models; j++)
-                s->log_T[i * n_models + j] = log(fmax((i == j) ? p_stay : p_sw, 1e-30));
-    }
-    return s;
-}
-
-void gpu_imm_destroy(GpuImmState* s) {
-    if (!s) return;
-    for (int k = 0; k < s->n_models; k++) gpu_bpf_destroy(s->filters[k]);
-    free(s->filters); free(s->log_pi); free(s->log_pi_pred); free(s->log_T); free(s);
-}
-
-ImmResult gpu_imm_step(GpuImmState* s, float y_t) {
-    int K = s->n_models;
-    for (int k = 0; k < K; k++) {
-        double terms[IMM_MAX_MODELS];
-        for (int j = 0; j < K; j++) terms[j] = s->log_T[j * K + k] + s->log_pi[j];
-        s->log_pi_pred[k] = log_sum_exp(terms, K);
-    }
-    for (int k = 0; k < K; k++) gpu_bpf_step_async(s->filters[k], y_t);
-    cudaDeviceSynchronize();
-    double log_liks[IMM_MAX_MODELS]; float h_ests[IMM_MAX_MODELS];
-    for (int k = 0; k < K; k++) {
-        BpfResult r = gpu_bpf_get_result(s->filters[k]);
-        h_ests[k] = r.h_mean; log_liks[k] = (double)r.log_lik;
-    }
-    double log_joint[IMM_MAX_MODELS];
-    for (int k = 0; k < K; k++) log_joint[k] = s->log_pi_pred[k] + log_liks[k];
-    double log_Z = log_sum_exp(log_joint, K);
-    for (int k = 0; k < K; k++) s->log_pi[k] = log_joint[k] - log_Z;
-    double h_mixed = 0.0; int best_k = 0; double best_lp = -1e30;
-    for (int k = 0; k < K; k++) {
-        h_mixed += exp(s->log_pi[k]) * (double)h_ests[k];
-        if (s->log_pi[k] > best_lp) { best_lp = s->log_pi[k]; best_k = k; }
-    }
-    s->timestep++;
-    ImmResult r;
-    r.h_mean = (float)h_mixed; r.vol = expf((float)h_mixed * 0.5f);
-    r.log_lik = (float)log_Z; r.best_model = best_k; r.best_prob = (float)exp(best_lp);
-    return r;
-}
-
-float gpu_imm_get_prob(const GpuImmState* s, int k) {
-    return (k >= 0 && k < s->n_models) ? (float)exp(s->log_pi[k]) : 0.0f;
-}
-void gpu_imm_get_probs(const GpuImmState* s, float* out) {
-    for (int k = 0; k < s->n_models; k++) out[k] = (float)exp(s->log_pi[k]);
-}
-
-ImmModelParams* gpu_imm_build_grid(
-    const float* rhos, int n_rho, const float* sigma_zs, int n_sigma,
-    const float* mus, int n_mu, float nu_state, float nu_obs, int* out_n
-) {
-    int total = n_rho * n_sigma * n_mu;
-    ImmModelParams* g = (ImmModelParams*)malloc(total * sizeof(ImmModelParams));
-    int idx = 0;
-    for (int r = 0; r < n_rho; r++)
-        for (int s = 0; s < n_sigma; s++)
-            for (int m = 0; m < n_mu; m++) {
-                g[idx].rho = rhos[r]; g[idx].sigma_z = sigma_zs[s];
-                g[idx].mu = mus[m]; g[idx].nu_state = nu_state;
-                g[idx].nu_obs = nu_obs; idx++;
-            }
-    *out_n = total;
-    return g;
 }

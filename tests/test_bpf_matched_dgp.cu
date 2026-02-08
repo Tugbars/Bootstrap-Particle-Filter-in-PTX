@@ -1,33 +1,33 @@
 /**
  * @file test_bpf_matched_dgp.cu
- * @brief Perfectly OU-matched DGP test suite for GPU BPF / APF / IMM
+ * @brief Matched-DGP test suite: BPF bootstrap vs BPF optimal proposal
  *
  * All scenarios generate data from the EXACT SV model:
  *   State:       h_t = mu + rho*(h_{t-1} - mu) + sigma_z * eps_t
  *   Observation: y_t = exp(h_t / 2) * eta_t
  *
- * Zero model mismatch — any remaining error is purely from Monte Carlo variance
- * and particle degeneracy.
+ * Zero model mismatch — any remaining error is purely from Monte Carlo
+ * variance and particle degeneracy.
+ *
+ * The core A/B test: bootstrap proposal (kernel 3) vs mode-matched
+ * Gaussian optimal proposal (kernel 14). Same particles, same RNG seed,
+ * same everything — only the proposal distribution differs.
  *
  * Tests:
- *   1. Full comparison table: KF bound vs BPF vs APF vs EWMA vs GARCH
- *   2. BPF particle sweep (find the efficiency knee)
- *   3. APF vs BPF head-to-head at equal particle counts
- *   4. IMM grid test (parameter uncertainty)
- *   5. Bias analysis across seeds (Monte Carlo variance of estimators)
+ *   1. Full comparison: KF bound vs Bootstrap vs Optimal vs EWMA vs GARCH
+ *   2. Particle sweep (both proposals)
+ *   3. Bootstrap vs Optimal head-to-head at equal particle counts
+ *   4. Monte Carlo variance (multi-seed bias analysis)
+ *   5. Throughput benchmark
  *
  * Build:
- *   nvcc -O3 test_bpf_matched_dgp.cu gpu_bpf.cu -o test_bpf -lcurand
+ *   nvcc -O3 test_bpf_matched_dgp.cu gpu_bpf_ptx_full.cu -o test_bpf -lcuda -lcurand
  *
  * Run:
- *   ./test_bpf [--ticks N] [--seed S] [--bpf-particles N] [--apf-particles N]
+ *   ./test_bpf [--ticks N] [--seed S] [--particles N]
  */
 
-#ifdef USE_PTX_FULL
 #include "gpu_bpf_full.cuh"
-#else
-#include "gpu_bpf.cuh"
-#endif
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -58,7 +58,7 @@ static double get_time_us(void) {
 }
 
 // =============================================================================
-// PCG32 RNG
+// PCG32 RNG (DGP generation)
 // =============================================================================
 
 typedef struct { uint64_t state; uint64_t inc; } pcg32_dgp_t;
@@ -118,8 +118,8 @@ typedef struct {
     double  dgp_rho;
     double  dgp_sigma_z;
     double  dgp_mu;
-    double  dgp_nu_state;   // 0 = Gaussian
-    double  dgp_nu_obs;     // 0 = Gaussian
+    double  dgp_nu_state;
+    double  dgp_nu_obs;
 } MatchedTestData;
 
 static MatchedTestData* alloc_matched_data(int n) {
@@ -263,6 +263,17 @@ static MatchedTestData* gen_gaussian(int n, int seed) {
     return d;
 }
 
+// Stress scenarios where bootstrap proposal is known to struggle
+static MatchedTestData* gen_fast_revert_highvol(int n, int seed) {
+    MatchedTestData* d = alloc_matched_data(n);
+    d->scenario_id   = 9;
+    d->scenario_name = "FastRev+HighVoV";
+    d->scenario_desc = "rho=0.85 sz=0.50 mu=-4.5 t(5)/t(5) — bootstrap worst case";
+    pcg32_dgp_t rng; pcg32_dgp_seed(&rng, seed);
+    generate_matched_series(d, 0.85, 0.50, -4.5, 5.0, 5.0, &rng);
+    return d;
+}
+
 typedef MatchedTestData* (*ScenarioGenFn)(int, int);
 
 static const struct {
@@ -276,17 +287,13 @@ static const struct {
     { gen_high_vol },
     { gen_fast_revert },
     { gen_gaussian },
+    { gen_fast_revert_highvol },
 };
 static const int N_SCENARIOS = sizeof(ALL_SCENARIOS) / sizeof(ALL_SCENARIOS[0]);
 
 // =============================================================================
 // Kalman Steady-State RMSE (Analytical Lower Bound)
 // =============================================================================
-//
-// Linearize: y* = log(y²) = h + log(η²)
-// Gaussian η: Var(log η²) = π²/2 ≈ 4.9348
-// Student-t(ν): Var(log η²) ≈ π²/2 + 2·ψ₁(ν/2)
-// Steady-state Riccati: a·P² + P·(Q + R·(1−a)) − Q·R = 0
 
 static double kalman_steady_state_rmse(double rho, double sigma_z, double nu_obs) {
     double Q = sigma_z * sigma_z;
@@ -294,9 +301,8 @@ static double kalman_steady_state_rmse(double rho, double sigma_z, double nu_obs
 
     double R;
     if (nu_obs <= 0 || nu_obs > 100.0) {
-        R = 4.9348;   // π²/2
+        R = 4.9348;
     } else {
-        // Approximate trigamma(ν/2)
         double tg;
         if      (nu_obs < 3.5) tg = 1.50;
         else if (nu_obs < 4.5) tg = 0.80;
@@ -317,7 +323,6 @@ static double kalman_steady_state_rmse(double rho, double sigma_z, double nu_obs
 // Classical Baselines
 // =============================================================================
 
-// EWMA: σ²_t = λ·σ²_{t-1} + (1−λ)·y²_{t-1}
 static double ewma_rmse(const MatchedTestData* data, double lambda) {
     int n = data->n_ticks;
     int skip = 100;
@@ -346,7 +351,6 @@ static double ewma_rmse(const MatchedTestData* data, double lambda) {
     return sqrt(sum_sq / count);
 }
 
-// GARCH(1,1): σ²_t = ω + α·y²_{t-1} + β·σ²_{t-1}
 static double garch_rmse(const MatchedTestData* data,
                          double omega, double alpha, double beta) {
     int n = data->n_ticks;
@@ -408,12 +412,14 @@ typedef struct {
 } FilterMetrics;
 
 // =============================================================================
-// Run GPU BPF with per-step h_mean collection
+// Run BPF with specified proposal (0=bootstrap, 1=optimal)
 // =============================================================================
 
 static FilterMetrics run_bpf_metrics(
-    const MatchedTestData* data, int n_particles, int seed
+    const MatchedTestData* data, int n_particles, int seed, int use_optimal
 ) {
+    gpu_bpf_use_optimal_proposal(use_optimal);
+
     int n = data->n_ticks;
     GpuBpfState* f = gpu_bpf_create(
         n_particles,
@@ -448,184 +454,60 @@ static FilterMetrics run_bpf_metrics(
 }
 
 // =============================================================================
-// Run GPU APF with per-step h_mean collection
+// Test 1: Full Comparison — Bootstrap vs Optimal vs Baselines
 // =============================================================================
 
-static FilterMetrics run_apf_metrics(
-    const MatchedTestData* data, int n_particles, int seed
-) {
-    int n = data->n_ticks;
-    GpuApfState* f = gpu_apf_create(
-        n_particles,
-        (float)data->dgp_rho, (float)data->dgp_sigma_z, (float)data->dgp_mu,
-        (float)data->dgp_nu_state, (float)data->dgp_nu_obs, seed);
-
-    int skip = 100;
-    double sum_sq = 0.0, sum_abs = 0.0, sum_bias = 0.0;
-    int count = 0;
-
-    double t0 = get_time_us();
-    for (int t = 0; t < n; t++) {
-        BpfResult r = gpu_apf_step(f, (float)data->returns[t]);
-        if (t >= skip) {
-            double err = (double)r.h_mean - data->true_h[t];
-            sum_sq  += err * err;
-            sum_abs += fabs(err);
-            sum_bias += err;
-            count++;
-        }
-    }
-    double elapsed = (get_time_us() - t0) / 1000.0;
-
-    gpu_apf_destroy(f);
-
-    FilterMetrics m;
-    m.rmse       = sqrt(sum_sq / count);
-    m.mae        = sum_abs / count;
-    m.bias       = sum_bias / count;
-    m.elapsed_ms = elapsed;
-    return m;
-}
-
-// =============================================================================
-// Run GPU IMM
-// =============================================================================
-
-typedef struct {
-    double rmse;
-    double mae;
-    double bias;
-    double elapsed_ms;
-    int    dominant_model;
-    float  dominant_prob;
-} ImmMetrics;
-
-static ImmMetrics run_imm_metrics(
-    const MatchedTestData* data, int n_particles_per, int seed
-) {
-    // Build a 3×3 grid around the true parameters
-    // rho:     true ± 0.01
-    // sigma_z: true ± 0.05
-    // mu:      true ± 0.5
-    float rho_true = (float)data->dgp_rho;
-    float sz_true  = (float)data->dgp_sigma_z;
-    float mu_true  = (float)data->dgp_mu;
-
-    float rhos[]    = { fmaxf(rho_true - 0.01f, 0.80f), rho_true, fminf(rho_true + 0.01f, 0.999f) };
-    float sigmas[]  = { fmaxf(sz_true  - 0.05f, 0.05f), sz_true,  sz_true + 0.05f };
-    float mus[]     = { mu_true - 0.5f,                  mu_true,  mu_true + 0.5f };
-
-    int n_models;
-    ImmModelParams* grid = gpu_imm_build_grid(
-        rhos, 3, sigmas, 3, mus, 3,
-        (float)data->dgp_nu_state, (float)data->dgp_nu_obs,
-        &n_models);
-
-    GpuImmState* imm = gpu_imm_create(grid, n_models, n_particles_per, NULL, seed);
-    free(grid);
-
-    if (!imm) {
-        ImmMetrics m = {0};
-        m.rmse = -1.0;
-        return m;
-    }
-
-    int n = data->n_ticks;
-    int skip = 100;
-    double sum_sq = 0.0, sum_abs = 0.0, sum_bias = 0.0;
-    int count = 0;
-    int last_best = 0;
-    float last_prob = 0.0f;
-
-    double t0 = get_time_us();
-    for (int t = 0; t < n; t++) {
-        ImmResult r = gpu_imm_step(imm, (float)data->returns[t]);
-        if (t >= skip) {
-            // IMM outputs h_mean as mixed estimate; convert to log-vol
-            // h_mean from IMM is already in log-vol space
-            double err = (double)r.h_mean - data->true_h[t];
-            sum_sq  += err * err;
-            sum_abs += fabs(err);
-            sum_bias += err;
-            count++;
-        }
-        last_best = r.best_model;
-        last_prob = r.best_prob;
-    }
-    double elapsed = (get_time_us() - t0) / 1000.0;
-
-    gpu_imm_destroy(imm);
-
-    ImmMetrics m;
-    m.rmse           = sqrt(sum_sq / count);
-    m.mae            = sum_abs / count;
-    m.bias           = sum_bias / count;
-    m.elapsed_ms     = elapsed;
-    m.dominant_model = last_best;
-    m.dominant_prob  = last_prob;
-    return m;
-}
-
-// =============================================================================
-// Test 1: Full Comparison Table
-// =============================================================================
-
-static void test_full_comparison(int n_ticks, int bpf_n, int apf_n,
-                                  int imm_per_model, int base_seed) {
+static void test_full_comparison(int n_ticks, int n_particles, int base_seed) {
     printf("\n");
-    printf("═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
-    printf("  TEST 1: FULL COMPARISON — KF bound vs BPF(%dK) vs APF(%dK) vs IMM(27×%d) vs EWMA vs GARCH\n",
-           bpf_n / 1000, apf_n / 1000, imm_per_model);
+    printf("══════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
+    printf("  TEST 1: FULL COMPARISON — KF bound vs Bootstrap(%dK) vs Optimal(%dK) vs EWMA vs GARCH\n",
+           n_particles / 1000, n_particles / 1000);
     printf("  %d ticks, skip 100 warmup, matched DGP (zero model mismatch)\n", n_ticks);
-    printf("═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
-    printf("  %-18s │ %7s │ %7s %7s │ %7s %7s │ %7s │ %7s %7s │ %7s %7s\n",
+    printf("══════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
+    printf("  %-18s │ %7s │ %7s %7s │ %7s %7s │ %7s │ %7s %7s\n",
            "Scenario", "KF bnd",
-           "BPF", "ms", "APF", "ms",
-           "IMM", "EWMA94", "GARCH", "BPFbias", "APFbias");
-    printf("  ──────────────────┼─────────┼─────────────────┼─────────────────┼─────────┼─────────────────┼─────────────────\n");
+           "Boot", "ms", "Optim", "ms",
+           "Δ%%", "EWMA94", "GARCH");
+    printf("  ──────────────────┼─────────┼─────────────────┼─────────────────┼─────────┼─────────────────\n");
 
     for (int i = 0; i < N_SCENARIOS; i++) {
         MatchedTestData* data = ALL_SCENARIOS[i].gen(n_ticks, base_seed + i);
 
         double kf = kalman_steady_state_rmse(data->dgp_rho, data->dgp_sigma_z, data->dgp_nu_obs);
 
-        FilterMetrics bpf = run_bpf_metrics(data, bpf_n, base_seed + 100 + i);
-        FilterMetrics apf = run_apf_metrics(data, apf_n, base_seed + 200 + i);
-        ImmMetrics    imm = {0};
-        if (imm_per_model > 0)
-            imm = run_imm_metrics(data, imm_per_model, base_seed + 300 + i);
-
+        FilterMetrics boot = run_bpf_metrics(data, n_particles, base_seed + 100 + i, 0);
+        FilterMetrics opt  = run_bpf_metrics(data, n_particles, base_seed + 100 + i, 1);
         double ew  = ewma_rmse(data, 0.94);
         double ga  = garch_best_rmse(data);
 
-        printf("  %-18s │ %7.4f │ %7.4f %5.0fms │ %7.4f %5.0fms │ %7.4f │ %7.4f %7.4f │ %+7.4f %+7.4f\n",
+        double delta_pct = 100.0 * (boot.rmse - opt.rmse) / boot.rmse;
+
+        printf("  %-18s │ %7.4f │ %7.4f %5.0fms │ %7.4f %5.0fms │ %+6.1f%% │ %7.4f %7.4f\n",
                data->scenario_name, kf,
-               bpf.rmse, bpf.elapsed_ms,
-               apf.rmse, apf.elapsed_ms,
-               imm.rmse,
-               ew, ga,
-               bpf.bias, apf.bias);
+               boot.rmse, boot.elapsed_ms,
+               opt.rmse, opt.elapsed_ms,
+               delta_pct, ew, ga);
 
         free_matched_data(data);
     }
-    printf("═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
+    printf("══════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
     printf("  KF bnd = linearized Kalman steady-state (theoretical floor)\n");
-    printf("  EWMA94 = exponentially weighted λ=0.94 | GARCH = best grid-search GARCH(1,1)\n");
-    printf("  All particle filters use TRUE parameters (zero model mismatch)\n");
+    printf("  Δ%% = (Boot-Opt)/Boot × 100  (positive = optimal wins)\n");
+    printf("  Boot = kernel 3 (blind OU) | Optim = kernel 14 (Newton mode-matched)\n");
 }
 
 // =============================================================================
-// Test 2: BPF Particle Sweep
+// Test 2: Particle Sweep (both proposals)
 // =============================================================================
 
-static void test_bpf_particle_sweep(int n_ticks, int base_seed) {
+static void test_particle_sweep(int n_ticks, int base_seed) {
     printf("\n");
-    printf("═══════════════════════════════════════════════════════════════════════════════\n");
-    printf("  TEST 2: BPF PARTICLE SWEEP (Student-t scenario)\n");
-    printf("═══════════════════════════════════════════════════════════════════════════════\n");
-    printf("  %10s │ %8s %8s %9s │ %8s\n",
-           "Particles", "RMSE", "MAE", "Bias", "ms");
-    printf("  ──────────┼──────────────────────────────┼──────────\n");
+    printf("══════════════════════════════════════════════════════════════════════════════════════════════════\n");
+    printf("  TEST 2: PARTICLE SWEEP — Bootstrap vs Optimal (Student-t scenario)\n");
+    printf("══════════════════════════════════════════════════════════════════════════════════════════════════\n");
+    printf("  %10s │ %8s %8s │ %8s %8s │ %7s\n",
+           "Particles", "Boot", "ms", "Optim", "ms", "Δ%%");
+    printf("  ──────────┼───────────────────┼───────────────────┼─────────\n");
 
     MatchedTestData* data = gen_student_t(n_ticks, base_seed + 1);
     double kf = kalman_steady_state_rmse(data->dgp_rho, data->dgp_sigma_z, data->dgp_nu_obs);
@@ -634,150 +516,125 @@ static void test_bpf_particle_sweep(int n_ticks, int base_seed) {
     int nc = sizeof(counts) / sizeof(counts[0]);
 
     for (int c = 0; c < nc; c++) {
-        FilterMetrics m = run_bpf_metrics(data, counts[c], base_seed + 400);
-        printf("  %10d │ %8.4f %8.4f %+9.4f │ %7.1fms\n",
-               counts[c], m.rmse, m.mae, m.bias, m.elapsed_ms);
-    }
+        FilterMetrics boot = run_bpf_metrics(data, counts[c], base_seed + 400, 0);
+        FilterMetrics opt  = run_bpf_metrics(data, counts[c], base_seed + 400, 1);
+        double delta = 100.0 * (boot.rmse - opt.rmse) / boot.rmse;
 
-    printf("  ──────────┼──────────────────────────────┼──────────\n");
-    printf("  KF bound  │ %8.4f                       │\n", kf);
-    printf("═══════════════════════════════════════════════════════════════════════════════\n");
-
-    free_matched_data(data);
-}
-
-// =============================================================================
-// Test 3: APF vs BPF Head-to-Head
-// =============================================================================
-
-static void test_apf_vs_bpf(int n_ticks, int base_seed) {
-    printf("\n");
-    printf("═══════════════════════════════════════════════════════════════════════════════════════════\n");
-    printf("  TEST 3: APF vs BPF HEAD-TO-HEAD (equal particles, Student-t scenario)\n");
-    printf("═══════════════════════════════════════════════════════════════════════════════════════════\n");
-    printf("  %10s │ %8s %8s %8s │ %8s %8s %8s │ %s\n",
-           "Particles", "BPF", "BPF ms", "BPF bias", "APF", "APF ms", "APF bias", "Winner");
-    printf("  ──────────┼──────────────────────────────┼──────────────────────────────┼────────\n");
-
-    MatchedTestData* data = gen_student_t(n_ticks, base_seed + 1);
-
-    int counts[] = {1024, 4096, 16384, 65536};
-    int nc = sizeof(counts) / sizeof(counts[0]);
-
-    for (int c = 0; c < nc; c++) {
-        FilterMetrics bpf = run_bpf_metrics(data, counts[c], base_seed + 500);
-        FilterMetrics apf = run_apf_metrics(data, counts[c], base_seed + 600);
-
-        const char* winner = (apf.rmse < bpf.rmse) ? "APF" : "BPF";
-        double pct = 100.0 * (bpf.rmse - apf.rmse) / bpf.rmse;
-
-        printf("  %10d │ %8.4f %6.0fms %+8.4f │ %8.4f %6.0fms %+8.4f │ %s (%.1f%%)\n",
+        printf("  %10d │ %8.4f %6.1fms │ %8.4f %6.1fms │ %+6.1f%%\n",
                counts[c],
-               bpf.rmse, bpf.elapsed_ms, bpf.bias,
-               apf.rmse, apf.elapsed_ms, apf.bias,
-               winner, fabs(pct));
+               boot.rmse, boot.elapsed_ms,
+               opt.rmse, opt.elapsed_ms,
+               delta);
     }
-    printf("═══════════════════════════════════════════════════════════════════════════════════════════\n");
+
+    printf("  ──────────┼───────────────────┼───────────────────┼─────────\n");
+    printf("  KF bound  │ %8.4f          │ %8.4f          │\n", kf, kf);
+    printf("══════════════════════════════════════════════════════════════════════════════════════════════════\n");
 
     free_matched_data(data);
 }
 
 // =============================================================================
-// Test 4: IMM Model Selection
+// Test 3: Head-to-Head on worst-case scenarios
 // =============================================================================
 
-static void test_imm_selection(int n_ticks, int n_per_model, int base_seed) {
+static void test_head_to_head(int n_ticks, int n_particles, int base_seed) {
     printf("\n");
-    printf("═══════════════════════════════════════════════════════════════════════════════════════════\n");
-    printf("  TEST 4: IMM MODEL SELECTION (27 models = 3×3×3 grid, %d particles/model)\n", n_per_model);
-    printf("═══════════════════════════════════════════════════════════════════════════════════════════\n");
-    printf("  %-18s │ %7s │ %7s │ %12s │ %8s │ %s\n",
-           "Scenario", "BPF*", "IMM", "Best Model", "Prob", "ms");
-    printf("  ──────────────────┼─────────┼─────────┼──────────────┼──────────┼──────────\n");
+    printf("══════════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
+    printf("  TEST 3: BOOTSTRAP vs OPTIMAL HEAD-TO-HEAD (%dK particles)\n", n_particles / 1000);
+    printf("  Focus: scenarios where bootstrap proposal struggles (fast revert, high vol-of-vol)\n");
+    printf("══════════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
+    printf("  %-18s │ %8s %9s %8s │ %8s %9s %8s │ %7s %s\n",
+           "Scenario", "Boot", "Bias", "ms",
+           "Optim", "Bias", "ms", "Δ%%", "Winner");
+    printf("  ──────────────────┼──────────────────────────────┼──────────────────────────────┼────────────────\n");
 
     for (int i = 0; i < N_SCENARIOS; i++) {
         MatchedTestData* data = ALL_SCENARIOS[i].gen(n_ticks, base_seed + i);
 
-        // BPF with true params as oracle
-        FilterMetrics bpf = run_bpf_metrics(data, 10000, base_seed + 700 + i);
-        ImmMetrics    imm = run_imm_metrics(data, n_per_model, base_seed + 800 + i);
+        // Same seed for both — isolates proposal effect
+        FilterMetrics boot = run_bpf_metrics(data, n_particles, base_seed + 100 + i, 0);
+        FilterMetrics opt  = run_bpf_metrics(data, n_particles, base_seed + 100 + i, 1);
 
-        printf("  %-18s │ %7.4f │ %7.4f │ model %-6d │ %7.1f%% │ %6.0fms\n",
+        double delta = 100.0 * (boot.rmse - opt.rmse) / boot.rmse;
+        const char* winner = (opt.rmse < boot.rmse) ? "OPTIMAL" : "boot";
+
+        printf("  %-18s │ %8.4f %+9.4f %6.0fms │ %8.4f %+9.4f %6.0fms │ %+6.1f%% %s\n",
                data->scenario_name,
-               bpf.rmse, imm.rmse, imm.dominant_model,
-               imm.dominant_prob * 100.0f, imm.elapsed_ms);
+               boot.rmse, boot.bias, boot.elapsed_ms,
+               opt.rmse, opt.bias, opt.elapsed_ms,
+               delta, winner);
 
         free_matched_data(data);
     }
-    printf("═══════════════════════════════════════════════════════════════════════════════════════════\n");
-    printf("  BPF* = oracle BPF 10K with true params\n");
-    printf("  IMM grid: rho ±0.01, sigma_z ±0.05, mu ±0.5 around true values\n");
+    printf("══════════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
 }
 
 // =============================================================================
-// Test 5: Monte Carlo Variance (multi-seed bias analysis)
+// Test 4: Monte Carlo Variance (multi-seed)
 // =============================================================================
 
 static void test_mc_variance(int n_ticks, int n_particles, int base_seed) {
     int n_seeds = 10;
 
     printf("\n");
-    printf("═══════════════════════════════════════════════════════════════════════════════════════════\n");
-    printf("  TEST 5: MONTE CARLO VARIANCE (%d seeds, %d particles, Student-t scenario)\n",
-           n_seeds, n_particles);
-    printf("═══════════════════════════════════════════════════════════════════════════════════════════\n");
-    printf("  %-6s │ %8s %8s %9s │ %8s %8s %9s\n",
-           "Seed", "BPF RMSE", "BPF MAE", "BPF Bias", "APF RMSE", "APF MAE", "APF Bias");
-    printf("  ──────┼──────────────────────────────┼──────────────────────────────\n");
+    printf("══════════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
+    printf("  TEST 4: MONTE CARLO VARIANCE (%d seeds × %dK particles, Student-t scenario)\n",
+           n_seeds, n_particles / 1000);
+    printf("══════════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
+    printf("  %-6s │ %8s %9s │ %8s %9s\n",
+           "Seed", "Boot", "Bias", "Optim", "Bias");
+    printf("  ──────┼────────────────────┼────────────────────\n");
 
-    // Same DGP data, vary filter seed
     MatchedTestData* data = gen_student_t(n_ticks, base_seed);
 
-    double bpf_rmse_sum = 0, bpf_rmse_sq = 0;
-    double apf_rmse_sum = 0, apf_rmse_sq = 0;
-    double bpf_bias_sum = 0, apf_bias_sum = 0;
+    double boot_rmse_sum = 0, boot_rmse_sq = 0, boot_bias_sum = 0;
+    double opt_rmse_sum  = 0, opt_rmse_sq  = 0, opt_bias_sum  = 0;
 
     for (int s = 0; s < n_seeds; s++) {
         int filter_seed = base_seed + 1000 + s * 137;
 
-        FilterMetrics bpf = run_bpf_metrics(data, n_particles, filter_seed);
-        FilterMetrics apf = run_apf_metrics(data, n_particles, filter_seed + 50000);
+        FilterMetrics boot = run_bpf_metrics(data, n_particles, filter_seed, 0);
+        FilterMetrics opt  = run_bpf_metrics(data, n_particles, filter_seed, 1);
 
-        printf("  %-6d │ %8.4f %8.4f %+9.4f │ %8.4f %8.4f %+9.4f\n",
-               s, bpf.rmse, bpf.mae, bpf.bias, apf.rmse, apf.mae, apf.bias);
+        printf("  %-6d │ %8.4f %+9.4f │ %8.4f %+9.4f\n",
+               s, boot.rmse, boot.bias, opt.rmse, opt.bias);
 
-        bpf_rmse_sum += bpf.rmse;  bpf_rmse_sq += bpf.rmse * bpf.rmse;
-        apf_rmse_sum += apf.rmse;  apf_rmse_sq += apf.rmse * apf.rmse;
-        bpf_bias_sum += bpf.bias;  apf_bias_sum += apf.bias;
+        boot_rmse_sum += boot.rmse;  boot_rmse_sq += boot.rmse * boot.rmse;
+        boot_bias_sum += boot.bias;
+        opt_rmse_sum  += opt.rmse;   opt_rmse_sq  += opt.rmse * opt.rmse;
+        opt_bias_sum  += opt.bias;
     }
 
-    double bpf_mean = bpf_rmse_sum / n_seeds;
-    double apf_mean = apf_rmse_sum / n_seeds;
-    double bpf_std  = sqrt(bpf_rmse_sq / n_seeds - bpf_mean * bpf_mean);
-    double apf_std  = sqrt(apf_rmse_sq / n_seeds - apf_mean * apf_mean);
+    double boot_mean = boot_rmse_sum / n_seeds;
+    double opt_mean  = opt_rmse_sum  / n_seeds;
+    double boot_std  = sqrt(boot_rmse_sq / n_seeds - boot_mean * boot_mean);
+    double opt_std   = sqrt(opt_rmse_sq  / n_seeds - opt_mean  * opt_mean);
 
-    printf("  ──────┼──────────────────────────────┼──────────────────────────────\n");
-    printf("  Mean  │ %8.4f          %+9.4f │ %8.4f          %+9.4f\n",
-           bpf_mean, bpf_bias_sum / n_seeds,
-           apf_mean, apf_bias_sum / n_seeds);
-    printf("  Std   │ %8.4f                     │ %8.4f\n", bpf_std, apf_std);
-    printf("═══════════════════════════════════════════════════════════════════════════════════════════\n");
+    printf("  ──────┼────────────────────┼────────────────────\n");
+    printf("  Mean  │ %8.4f %+9.4f │ %8.4f %+9.4f\n",
+           boot_mean, boot_bias_sum / n_seeds,
+           opt_mean,  opt_bias_sum  / n_seeds);
+    printf("  Std   │ %8.4f           │ %8.4f\n", boot_std, opt_std);
+    printf("  Δ%%    │                    │ %+6.1f%%\n",
+           100.0 * (boot_mean - opt_mean) / boot_mean);
+    printf("══════════════════════════════════════════════════════════════════════════════════════════════════════════════\n");
 
     free_matched_data(data);
 }
 
 // =============================================================================
-// Test 6: Throughput Benchmark
+// Test 5: Throughput Benchmark
 // =============================================================================
 
 static void test_throughput(int base_seed) {
     printf("\n");
-    printf("═══════════════════════════════════════════════════════════════════════════════\n");
-    printf("  TEST 6: THROUGHPUT BENCHMARK (ticks/sec at various particle counts)\n");
-    printf("═══════════════════════════════════════════════════════════════════════════════\n");
-    printf("  %10s │ %12s %12s │ %12s %12s\n",
-           "Particles", "BPF t/s", "BPF µs/tick", "APF t/s", "APF µs/tick");
-    printf("  ──────────┼───────────────────────────┼───────────────────────────\n");
+    printf("══════════════════════════════════════════════════════════════════════════════════════════════════\n");
+    printf("  TEST 5: THROUGHPUT BENCHMARK (ticks/sec, Student-t scenario)\n");
+    printf("══════════════════════════════════════════════════════════════════════════════════════════════════\n");
+    printf("  %10s │ %10s %10s │ %10s %10s │ %s\n",
+           "Particles", "Boot t/s", "µs/tick", "Optim t/s", "µs/tick", "Overhead");
+    printf("  ──────────┼─────────────────────────┼─────────────────────────┼──────────\n");
 
     int bench_ticks = 2000;
     MatchedTestData* data = gen_student_t(bench_ticks, base_seed);
@@ -786,76 +643,65 @@ static void test_throughput(int base_seed) {
     int nc = sizeof(counts) / sizeof(counts[0]);
 
     for (int c = 0; c < nc; c++) {
-        // BPF
+        // Bootstrap
+        gpu_bpf_use_optimal_proposal(0);
         GpuBpfState* bf = gpu_bpf_create(
             counts[c], (float)data->dgp_rho, (float)data->dgp_sigma_z,
             (float)data->dgp_mu, (float)data->dgp_nu_state,
             (float)data->dgp_nu_obs, base_seed + 900);
-
-        // Warmup
         for (int t = 0; t < 100; t++)
             gpu_bpf_step(bf, (float)data->returns[t % bench_ticks]);
         cudaDeviceSynchronize();
-
         double t0 = get_time_us();
         for (int t = 0; t < bench_ticks; t++)
             gpu_bpf_step(bf, (float)data->returns[t]);
         cudaDeviceSynchronize();
-        double bpf_us = get_time_us() - t0;
+        double boot_us = get_time_us() - t0;
         gpu_bpf_destroy(bf);
 
-        // APF
-        GpuApfState* af = gpu_apf_create(
+        // Optimal
+        gpu_bpf_use_optimal_proposal(1);
+        GpuBpfState* of = gpu_bpf_create(
             counts[c], (float)data->dgp_rho, (float)data->dgp_sigma_z,
             (float)data->dgp_mu, (float)data->dgp_nu_state,
-            (float)data->dgp_nu_obs, base_seed + 950);
-
+            (float)data->dgp_nu_obs, base_seed + 900);
         for (int t = 0; t < 100; t++)
-            gpu_apf_step(af, (float)data->returns[t % bench_ticks]);
+            gpu_bpf_step(of, (float)data->returns[t % bench_ticks]);
         cudaDeviceSynchronize();
-
         t0 = get_time_us();
         for (int t = 0; t < bench_ticks; t++)
-            gpu_apf_step(af, (float)data->returns[t]);
+            gpu_bpf_step(of, (float)data->returns[t]);
         cudaDeviceSynchronize();
-        double apf_us = get_time_us() - t0;
-        gpu_apf_destroy(af);
+        double opt_us = get_time_us() - t0;
+        gpu_bpf_destroy(of);
 
-        double bpf_tps = bench_ticks / (bpf_us * 1e-6);
-        double apf_tps = bench_ticks / (apf_us * 1e-6);
+        double boot_tps = bench_ticks / (boot_us * 1e-6);
+        double opt_tps  = bench_ticks / (opt_us  * 1e-6);
+        double overhead = 100.0 * (opt_us - boot_us) / boot_us;
 
-        printf("  %10d │ %10.0f %10.1fµs │ %10.0f %10.1fµs\n",
+        printf("  %10d │ %10.0f %8.1fµs │ %10.0f %8.1fµs │ %+5.1f%%\n",
                counts[c],
-               bpf_tps, bpf_us / bench_ticks,
-               apf_tps, apf_us / bench_ticks);
+               boot_tps, boot_us / bench_ticks,
+               opt_tps,  opt_us  / bench_ticks,
+               overhead);
     }
-    printf("═══════════════════════════════════════════════════════════════════════════════\n");
+    printf("══════════════════════════════════════════════════════════════════════════════════════════════════\n");
+    printf("  Overhead = extra cost of 3 Newton iterations per particle (~15 FLOPs)\n");
 
     free_matched_data(data);
 }
 
 // =============================================================================
-// CSV Export — per-tick filtered output for all estimators
+// CSV Export — per-tick filtered output
 // =============================================================================
-//
-// Columns:
-//   tick, scenario, true_h, true_vol, return,
-//   bpf_h, bpf_loglik, apf_h, apf_loglik, imm_h, imm_best_model, imm_best_prob,
-//   ewma_h, garch_h
-//
-// Usage: --csv <filename> [--csv-scenario N]  (0 = all scenarios, default)
-//
 
 static void export_csv(
-    const char* csv_path, int n_ticks,
-    int bpf_particles, int apf_particles, int imm_per_model,
+    const char* csv_path, int n_ticks, int n_particles,
     int base_seed, int csv_scenario
 ) {
     FILE* fp = fopen(csv_path, "w");
     if (!fp) {
-        // Try creating parent directory (csv_bank/)
 #ifdef _WIN32
-        // Extract directory from path and create it
         char dir[512];
         strncpy(dir, csv_path, sizeof(dir) - 1);
         dir[sizeof(dir) - 1] = '\0';
@@ -867,7 +713,6 @@ static void export_csv(
         }
         fp = fopen(csv_path, "w");
 #else
-        // POSIX: mkdir -p on parent
         char dir[512];
         strncpy(dir, csv_path, sizeof(dir) - 1);
         dir[sizeof(dir) - 1] = '\0';
@@ -886,18 +731,15 @@ static void export_csv(
         return;
     }
 
-    // Header
     fprintf(fp, "tick,scenario_id,scenario_name,"
                 "true_h,true_vol,return,"
-                "bpf_h,bpf_loglik,"
-                "apf_h,apf_loglik,"
-                "imm_h,imm_best_model,imm_best_prob,"
+                "boot_h,boot_loglik,"
+                "opt_h,opt_loglik,"
                 "ewma_h,garch_h\n");
 
     for (int si = 0; si < N_SCENARIOS; si++) {
         MatchedTestData* data = ALL_SCENARIOS[si].gen(n_ticks, base_seed);
 
-        // Filter by scenario if requested (1-indexed)
         if (csv_scenario > 0 && data->scenario_id != csv_scenario) {
             free_matched_data(data);
             continue;
@@ -906,35 +748,21 @@ static void export_csv(
         printf("  CSV: exporting scenario %d/%d [%s] ...\n",
                data->scenario_id, N_SCENARIOS, data->scenario_name);
 
-        // --- Create filters ---
-        GpuBpfState* bpf = gpu_bpf_create(
-            bpf_particles,
+        // Bootstrap BPF
+        gpu_bpf_use_optimal_proposal(0);
+        GpuBpfState* bpf_boot = gpu_bpf_create(
+            n_particles,
             (float)data->dgp_rho, (float)data->dgp_sigma_z, (float)data->dgp_mu,
             (float)data->dgp_nu_state, (float)data->dgp_nu_obs, base_seed);
 
-        GpuApfState* apf = gpu_apf_create(
-            apf_particles,
+        // Optimal BPF
+        gpu_bpf_use_optimal_proposal(1);
+        GpuBpfState* bpf_opt = gpu_bpf_create(
+            n_particles,
             (float)data->dgp_rho, (float)data->dgp_sigma_z, (float)data->dgp_mu,
-            (float)data->dgp_nu_state, (float)data->dgp_nu_obs, base_seed + 1);
+            (float)data->dgp_nu_state, (float)data->dgp_nu_obs, base_seed);
 
-        // IMM grid (skip if imm_per_model == 0)
-        GpuImmState* imm = NULL;
-        if (imm_per_model > 0) {
-            float rho_true = (float)data->dgp_rho;
-            float sz_true  = (float)data->dgp_sigma_z;
-            float mu_true  = (float)data->dgp_mu;
-            float rhos[]   = { fmaxf(rho_true - 0.01f, 0.80f), rho_true, fminf(rho_true + 0.01f, 0.999f) };
-            float sigmas[] = { fmaxf(sz_true  - 0.05f, 0.05f), sz_true,  sz_true + 0.05f };
-            float mus[]    = { mu_true - 0.5f,                  mu_true,  mu_true + 0.5f };
-            int n_models;
-            ImmModelParams* grid = gpu_imm_build_grid(
-                rhos, 3, sigmas, 3, mus, 3,
-                (float)data->dgp_nu_state, (float)data->dgp_nu_obs, &n_models);
-            imm = gpu_imm_create(grid, n_models, imm_per_model, NULL, base_seed + 2);
-            free(grid);
-        }
-
-        // --- EWMA state (lambda=0.94) ---
+        // EWMA
         double ewma_var = 0.0;
         {
             int init_n = (n_ticks < 20) ? n_ticks : 20;
@@ -944,7 +772,7 @@ static void export_csv(
             if (ewma_var < 1e-10) ewma_var = 1e-10;
         }
 
-        // --- GARCH state: grid-search best params first ---
+        // GARCH
         double garch_omega = 0.0, garch_alpha = 0.05, garch_beta = 0.90;
         {
             double best_rmse = 1e10;
@@ -975,52 +803,39 @@ static void export_csv(
             ? garch_omega / (1.0 - garch_alpha - garch_beta) : 0.01;
         if (garch_var < 1e-10) garch_var = 1e-10;
 
-        // --- Tick loop ---
+        // Tick loop
         for (int t = 0; t < n_ticks; t++) {
             float obs = (float)data->returns[t];
 
-            // BPF
-            BpfResult br = gpu_bpf_step(bpf, obs);
+            gpu_bpf_use_optimal_proposal(0);
+            BpfResult br = gpu_bpf_step(bpf_boot, obs);
 
-            // APF
-            BpfResult ar = gpu_apf_step(apf, obs);
+            gpu_bpf_use_optimal_proposal(1);
+            BpfResult or_ = gpu_bpf_step(bpf_opt, obs);
 
-            // IMM
-            ImmResult ir = {0};
-            if (imm) ir = gpu_imm_step(imm, obs);
-
-            // EWMA
             double ewma_h = log(ewma_var);
             double y2 = (double)obs * (double)obs;
             ewma_var = 0.94 * ewma_var + 0.06 * y2;
             if (ewma_var < 1e-10) ewma_var = 1e-10;
 
-            // GARCH
             double garch_h = log(garch_var);
             garch_var = garch_omega + garch_alpha * y2 + garch_beta * garch_var;
             if (garch_var < 1e-10) garch_var = 1e-10;
 
-            // Write row
             fprintf(fp, "%d,%d,\"%s\","
                         "%.8f,%.8f,%.8f,"
                         "%.8f,%.6f,"
                         "%.8f,%.6f,"
-                        "%.8f,%d,%.6f,"
                         "%.8f,%.8f\n",
                     t, data->scenario_id, data->scenario_name,
                     data->true_h[t], data->true_vol[t], data->returns[t],
                     (double)br.h_mean, (double)br.log_lik,
-                    (double)ar.h_mean, (double)ar.log_lik,
-                    imm ? (double)ir.h_mean : 0.0,
-                    imm ? ir.best_model : -1,
-                    imm ? (double)ir.best_prob : 0.0,
+                    (double)or_.h_mean, (double)or_.log_lik,
                     ewma_h, garch_h);
         }
 
-        // Cleanup
-        gpu_bpf_destroy(bpf);
-        gpu_apf_destroy(apf);
-        if (imm) gpu_imm_destroy(imm);
+        gpu_bpf_destroy(bpf_boot);
+        gpu_bpf_destroy(bpf_opt);
         free_matched_data(data);
     }
 
@@ -1034,25 +849,18 @@ static void export_csv(
 
 int main(int argc, char** argv) {
     int n_ticks       = 5000;
-    int bpf_particles = 50000;
-    int apf_particles = 50000;
-    int imm_per_model = 2000;
+    int n_particles   = 50000;
     int mc_particles  = 10000;
     int base_seed     = 42;
     const char* csv_path = NULL;
-    int csv_scenario     = 0;    // 0 = all
-    int csv_only         = 0;    // if --csv-only, skip tests
-    int no_imm           = 0;    // if --no-imm, skip IMM everywhere
+    int csv_scenario     = 0;
+    int csv_only         = 0;
 
     for (int i = 1; i < argc; i++) {
         if      (strcmp(argv[i], "--ticks") == 0 && i+1 < argc)
             n_ticks = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--bpf-particles") == 0 && i+1 < argc)
-            bpf_particles = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--apf-particles") == 0 && i+1 < argc)
-            apf_particles = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--imm-per-model") == 0 && i+1 < argc)
-            imm_per_model = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--particles") == 0 && i+1 < argc)
+            n_particles = atoi(argv[++i]);
         else if (strcmp(argv[i], "--mc-particles") == 0 && i+1 < argc)
             mc_particles = atoi(argv[++i]);
         else if (strcmp(argv[i], "--seed") == 0 && i+1 < argc)
@@ -1063,48 +871,34 @@ int main(int argc, char** argv) {
             csv_scenario = atoi(argv[++i]);
         else if (strcmp(argv[i], "--csv-only") == 0)
             csv_only = 1;
-        else if (strcmp(argv[i], "--no-imm") == 0)
-            no_imm = 1;
     }
 
-    // Print GPU info
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
-    printf("═══════════════════════════════════════════════════════════════════════════════\n");
-    printf("  GPU BPF / APF / IMM — MATCHED-DGP TEST SUITE\n");
+    printf("══════════════════════════════════════════════════════════════════════════════\n");
+    printf("  GPU BPF — BOOTSTRAP vs OPTIMAL PROPOSAL TEST SUITE\n");
     printf("  Device: %s (SM %d.%d, %d SMs)\n",
            prop.name, prop.major, prop.minor, prop.multiProcessorCount);
     printf("  Zero model mismatch — all filters use TRUE DGP parameters\n");
-    printf("═══════════════════════════════════════════════════════════════════════════════\n");
-    if (no_imm)
-        printf("  Config: %d ticks, BPF=%dK, APF=%dK, IMM=OFF, MC=%dK\n",
-               n_ticks, bpf_particles / 1000, apf_particles / 1000,
-               mc_particles / 1000);
-    else
-        printf("  Config: %d ticks, BPF=%dK, APF=%dK, IMM=27x%d, MC=%dK\n",
-               n_ticks, bpf_particles / 1000, apf_particles / 1000,
-               imm_per_model, mc_particles / 1000);
+    printf("══════════════════════════════════════════════════════════════════════════════\n");
+    printf("  Config: %d ticks, %dK particles, MC=%dK\n",
+           n_ticks, n_particles / 1000, mc_particles / 1000);
+    printf("  Kernel 3 = bootstrap (blind OU) | Kernel 14 = optimal (Newton mode-matched)\n");
     if (csv_path)
         printf("  CSV output: %s (scenario=%s)\n",
                csv_path, csv_scenario ? "filtered" : "all");
 
-    // Export CSV if requested (runs BEFORE tests — independent)
     if (csv_path) {
-        export_csv(csv_path, n_ticks, bpf_particles, apf_particles,
-                   no_imm ? 0 : imm_per_model, base_seed, csv_scenario);
+        export_csv(csv_path, n_ticks, n_particles, base_seed, csv_scenario);
         if (csv_only) {
             printf("\n--csv-only: skipping test suite.\n");
             return 0;
         }
     }
 
-    // Run all tests
-    test_full_comparison(n_ticks, bpf_particles, apf_particles,
-                         no_imm ? 0 : imm_per_model, base_seed);
-    test_bpf_particle_sweep(n_ticks, base_seed);
-    test_apf_vs_bpf(n_ticks, base_seed);
-    if (!no_imm)
-        test_imm_selection(n_ticks, imm_per_model, base_seed);
+    test_full_comparison(n_ticks, n_particles, base_seed);
+    test_particle_sweep(n_ticks, base_seed);
+    test_head_to_head(n_ticks, n_particles, base_seed);
     test_mc_variance(n_ticks, mc_particles, base_seed);
     test_throughput(base_seed);
 

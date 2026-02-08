@@ -2,7 +2,7 @@
 # CMakeLists.txt — BPF PTX Educational Project
 #
 # Directory layout:
-#   gpu_bpf/          — Host-side BPF/APF/IMM implementations
+#   gpu_bpf/          — Host-side BPF/APF implementations + PTX driver
 #   ptx_assembly/     — Hand-written PTX kernels and pre-compiled cubins
 #   smc2/             — SMC² batch parameter learner (BPF inner filter)
 #   tests/            — Test harnesses and diagnostics
@@ -140,7 +140,7 @@ if(EXISTS "${PTX_SOURCE}")
     configure_file("${PTX_SOURCE}" "${CMAKE_CURRENT_BINARY_DIR}/bpf_kernels.ptx" COPYONLY)
 endif()
 
-# --- Full PTX (13 kernels) ---
+# --- Full PTX (14 kernels) ---
 set(PTX_FULL_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/ptx_assembly/bpf_kernels_full.ptx")
 set(CUBIN_FULL_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/bpf_kernels_full.cubin")
 
@@ -164,7 +164,7 @@ if(EXISTS "${PTX_FULL_SOURCE}")
 endif()
 
 # ==============================================================================
-# Library: gpu_bpf (BPF + APF + IMM — nvcc compiled kernels)
+# Library: gpu_bpf (BPF + APF — nvcc compiled kernels, legacy)
 # ==============================================================================
 
 add_library(gpu_bpf STATIC gpu_bpf/gpu_bpf.cu)
@@ -209,8 +209,9 @@ set_target_properties(gpu_bpf_ptx PROPERTIES
 # ==============================================================================
 # Library: gpu_bpf_ptx_full (100% PTX BPF + cuRAND chi2 pregeneration)
 #
-# All 13 BPF kernels in hand-written PTX. PCG32 PRNG, ICDF normals.
-# cuRAND used only for bulk chi2 generation. APF/IMM still nvcc-compiled.
+# 14 BPF kernels in hand-written PTX. PCG32 PRNG, ICDF normals.
+# Kernel 14: mode-matched Gaussian optimal proposal (runtime toggle).
+# cuRAND used only for bulk chi2 generation. APF still nvcc-compiled.
 # ==============================================================================
 
 add_library(gpu_bpf_ptx_full STATIC gpu_bpf/gpu_bpf_ptx_full.cu)
@@ -279,22 +280,7 @@ if(TARGET ptx_cubin)
     add_dependencies(bpf_ptx_demo ptx_cubin)
 endif()
 
-# ==============================================================================
-# Target: test_bpf_matched_dgp (matched-DGP test suite — nvcc kernels)
-# ==============================================================================
 
-add_executable(test_bpf_matched_dgp tests/test_bpf_matched_dgp.cu)
-
-target_link_libraries(test_bpf_matched_dgp PRIVATE
-    gpu_bpf
-    CUDA::cudart
-    CUDA::curand
-)
-
-set_target_properties(test_bpf_matched_dgp PROPERTIES
-    CUDA_SEPARABLE_COMPILATION OFF
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-)
 
 # ==============================================================================
 # Target: test_mix_bands (band-based mixture proposal validation)
@@ -313,31 +299,13 @@ set_target_properties(test_mix_bands PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
 )
 
-# ==============================================================================
-# Target: test_bpf_ptx (matched-DGP — PTX hybrid path)
-# ==============================================================================
 
-add_executable(test_bpf_ptx tests/test_bpf_matched_dgp.cu)
-
-target_link_libraries(test_bpf_ptx PRIVATE
-    gpu_bpf_ptx
-    CUDA::cuda_driver
-    CUDA::cudart
-    CUDA::curand
-)
-
-set_target_properties(test_bpf_ptx PROPERTIES
-    CUDA_SEPARABLE_COMPILATION OFF
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-)
 
 # ==============================================================================
-# Target: test_bpf_ptx_full (full PTX BPF + nvcc APF)
+# Target: test_bpf_ptx_full (bootstrap vs optimal proposal A/B test suite)
 # ==============================================================================
 
 add_executable(test_bpf_ptx_full tests/test_bpf_matched_dgp.cu)
-
-target_compile_definitions(test_bpf_ptx_full PRIVATE USE_PTX_FULL=1)
 
 target_link_libraries(test_bpf_ptx_full PRIVATE
     gpu_bpf_ptx_full
