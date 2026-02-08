@@ -413,6 +413,39 @@ set_target_properties(test_liu_west PROPERTIES
 )
 
 # ==============================================================================
+# Target: test_cpmmh (Correlated PMMH parameter learning — CPU only)
+# ==============================================================================
+
+add_executable(test_cpmmh tests/test_cpmmh.cu)
+
+set_target_properties(test_cpmmh PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+# ==============================================================================
+# Target: test_pmmh (PMMH parameter learning — CPU only)
+# ==============================================================================
+
+add_executable(test_pmmh tests/test_pmmh.cu)
+
+set_target_properties(test_pmmh PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+# ==============================================================================
+# Target: test_pmmh_scaling (PMMH particle scaling — CPU, find convergence threshold)
+# ==============================================================================
+
+add_executable(test_pmmh_scaling tests/test_pmmh_scaling.cu)
+
+set_target_properties(test_pmmh_scaling PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+# ==============================================================================
 # Print summary
 # ==============================================================================
 
