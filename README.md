@@ -199,14 +199,6 @@ only one actually writes. Critical for the binary search in resampling.
    Student-t state noise. Fast (adds ~10μs/tick) but means the BPF isn't
    fully cuRAND-free when nu_state > 0.
 
-3. **Warp-level Primitives** — SM_120 supports `shfl.sync` for warp-level
-   reductions. The current reduce kernels use shared memory; warp shuffles
-   would save ~30% on the reduction passes.
-
-4. **APF / IMM** — The Auxiliary Particle Filter and Interacting Multiple
-   Model filter remain nvcc-compiled. They share the same test harness but
-   use cuRAND throughout.
-
 ## SM_120 (Blackwell) Specifics
 
 - 128 CUDA cores per SM, up from 128 on Ada (SM_100)
