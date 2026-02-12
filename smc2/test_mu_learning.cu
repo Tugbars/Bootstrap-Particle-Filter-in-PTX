@@ -59,7 +59,8 @@ static double host_sample_t(unsigned long long* rng, double nu) {
 typedef struct {
     double* h;
     double* y;
-    double* mu_true;   // per-tick true mu for reference
+    double* mu_true;    // per-tick true mu for reference
+    double* rho_true;   // per-tick true rho for reference
     int     T;
     int     t_switch;
     double  mu1, mu2;
@@ -76,18 +77,21 @@ static SvRegimeData generate_sv_mu_regime(
     d.t_switch = t_switch;
     d.mu1 = mu1; d.mu2 = mu2;
     d.rho = rho; d.sigma_z = sigma_z; d.nu_obs = nu_obs;
-    d.h      = (double*)malloc(T * sizeof(double));
-    d.y      = (double*)malloc(T * sizeof(double));
-    d.mu_true = (double*)malloc(T * sizeof(double));
+    d.h        = (double*)malloc(T * sizeof(double));
+    d.y        = (double*)malloc(T * sizeof(double));
+    d.mu_true  = (double*)malloc(T * sizeof(double));
+    d.rho_true = (double*)malloc(T * sizeof(double));
 
     unsigned long long rng = seed;
     double std_stat = sigma_z / sqrt(fmax(1.0 - rho * rho, 1e-10));
     d.h[0] = mu1 + std_stat * host_randn(&rng);
     d.mu_true[0] = mu1;
+    d.rho_true[0] = rho;
 
     for (int t = 1; t < T; t++) {
         double mu = (t < t_switch) ? mu1 : mu2;
         d.mu_true[t] = mu;
+        d.rho_true[t] = rho;
         d.h[t] = mu + rho * (d.h[t - 1] - mu) + sigma_z * host_randn(&rng);
     }
     for (int t = 0; t < T; t++) {
@@ -97,8 +101,43 @@ static SvRegimeData generate_sv_mu_regime(
     return d;
 }
 
+// DGP with rho regime change (mu constant)
+static SvRegimeData generate_sv_rho_regime(
+    int T, double mu, double rho1, double rho2, int t_switch,
+    double sigma_z, double nu_obs,
+    unsigned long long seed)
+{
+    SvRegimeData d;
+    d.T = T;
+    d.t_switch = t_switch;
+    d.mu1 = mu; d.mu2 = mu;
+    d.rho = rho1; d.sigma_z = sigma_z; d.nu_obs = nu_obs;
+    d.h        = (double*)malloc(T * sizeof(double));
+    d.y        = (double*)malloc(T * sizeof(double));
+    d.mu_true  = (double*)malloc(T * sizeof(double));
+    d.rho_true = (double*)malloc(T * sizeof(double));
+
+    unsigned long long rng = seed;
+    double std_stat = sigma_z / sqrt(fmax(1.0 - rho1 * rho1, 1e-10));
+    d.h[0] = mu + std_stat * host_randn(&rng);
+    d.mu_true[0] = mu;
+    d.rho_true[0] = rho1;
+
+    for (int t = 1; t < T; t++) {
+        double rho_t = (t < t_switch) ? rho1 : rho2;
+        d.mu_true[t] = mu;
+        d.rho_true[t] = rho_t;
+        d.h[t] = mu + rho_t * (d.h[t - 1] - mu) + sigma_z * host_randn(&rng);
+    }
+    for (int t = 0; t < T; t++) {
+        double vol = exp(d.h[t] / 2.0);
+        d.y[t] = vol * host_sample_t(&rng, nu_obs);
+    }
+    return d;
+}
+
 static void free_sv_regime(SvRegimeData* d) {
-    free(d->h); free(d->y); free(d->mu_true);
+    free(d->h); free(d->y); free(d->mu_true); free(d->rho_true);
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -110,16 +149,19 @@ typedef struct {
     double rmse_phase1;
     double rmse_phase2;
     float  mu_final;
+    float  rho_final;
 } RunResult;
 
 static RunResult run_bpf(
     const SvRegimeData* data,
     int N,               // particles
     float init_mu,       // starting mu (= SMC²'s last known)
-    float rho,
+    float init_rho,      // starting rho
+    float rho,           // DGP rho (for reference, init_rho may differ)
     float sigma_z,
     float nu_obs,
     int   learn_mode,    // 0=vanilla, 1=natural gradient, 2=robbins-monro
+    int   learn_rho,     // 0=off, 1=also learn rho
     float rm_c,
     int   update_K,
     float rm_t0,
@@ -130,12 +172,16 @@ static RunResult run_bpf(
     int T = data->T;
     int t_switch = data->t_switch;
     int skip = 50;
+    (void)rho;  // DGP reference only, init_rho goes to create
 
-    GpuBpfState* s = gpu_bpf_create(N, rho, sigma_z, init_mu,
+    GpuBpfState* s = gpu_bpf_create(N, init_rho, sigma_z, init_mu,
                                       0.0f, nu_obs, seed);
 
     if (learn_mode > 0) {
         gpu_bpf_enable_mu_learning(s, learn_mode, update_K, rm_c, rm_t0, rm_gamma);
+        if (learn_rho) {
+            gpu_bpf_enable_rho_learning(s, 1);
+        }
     }
 
     double sse_total = 0.0, sse_p1 = 0.0, sse_p2 = 0.0;
@@ -167,6 +213,7 @@ static RunResult run_bpf(
 
     RunResult res;
     res.mu_final    = gpu_bpf_get_mu(s);
+    res.rho_final   = gpu_bpf_get_rho(s);
     res.rmse_total  = (cnt_total > 0) ? sqrt(sse_total / cnt_total) : -1;
     res.rmse_phase1 = (cnt_p1 > 0)    ? sqrt(sse_p1 / cnt_p1)      : -1;
     res.rmse_phase2 = (cnt_p2 > 0)    ? sqrt(sse_p2 / cnt_p2)      : -1;
@@ -195,12 +242,12 @@ static void test_head_to_head(void) {
         T, mu1, mu2, t_switch, rho, sigma_z, nu_obs, 42ULL);
 
     printf("  ── Vanilla BPF (mu=-1.0 fixed) ──\n");
-    RunResult r_vanilla = run_bpf(&data, N, -1.0f, rho, sigma_z, nu_obs,
-                                    0, 0, 0, 0, 0, 42, 500);
+    RunResult r_vanilla = run_bpf(&data, N, -1.0f, rho, rho, sigma_z, nu_obs,
+                                    0, 0, 0, 0, 0, 0, 42, 500);
 
     printf("\n  ── BPF + natural gradient (K=50, c=0.1, t0=10, γ=2/3) ──\n");
-    RunResult r_learn = run_bpf(&data, N, -1.0f, rho, sigma_z, nu_obs,
-                                  1, 0.1f, 50, 10.0f, 0.667f, 42, 500);
+    RunResult r_learn = run_bpf(&data, N, -1.0f, rho, rho, sigma_z, nu_obs,
+                                  1, 0, 0.1f, 50, 10.0f, 0.667f, 42, 500);
 
     printf("\n  ┌─────────────────────┬───────────────┬───────────────┐\n");
     printf("  │                     │ Vanilla BPF   │ BPF+nat_grad  │\n");
@@ -256,10 +303,10 @@ static void test_multi_seed(void) {
         SvRegimeData data = generate_sv_mu_regime(
             T, -1.0, -2.5, t_switch, rho, sigma_z, nu_obs, seed);
 
-        RunResult rv = run_bpf(&data, N, -1.0f, rho, sigma_z, nu_obs,
-                                 0, 0, 0, 0, 0, (int)seed, 0);
-        RunResult rl = run_bpf(&data, N, -1.0f, rho, sigma_z, nu_obs,
-                                 1, 0.1f, 50, 10.0f, 0.667f, (int)seed, 0);
+        RunResult rv = run_bpf(&data, N, -1.0f, rho, rho, sigma_z, nu_obs,
+                                 0, 0, 0, 0, 0, 0, (int)seed, 0);
+        RunResult rl = run_bpf(&data, N, -1.0f, rho, rho, sigma_z, nu_obs,
+                                 1, 0, 0.1f, 50, 10.0f, 0.667f, (int)seed, 0);
 
         const char* winner = (rl.rmse_phase2 < rv.rmse_phase2) ? "LEARN" : "vanilla";
         if (rl.rmse_phase2 < rv.rmse_phase2) learn_wins_p2++; else vanilla_wins_p2++;
@@ -315,10 +362,10 @@ static void test_no_regime_change(void) {
         SvRegimeData data = generate_sv_mu_regime(
             T, -1.0, -1.0, T, rho, sigma_z, nu_obs, seed);
 
-        RunResult rv = run_bpf(&data, N, -1.0f, rho, sigma_z, nu_obs,
-                                 0, 0, 0, 0, 0, (int)seed, 0);
-        RunResult rl = run_bpf(&data, N, -1.0f, rho, sigma_z, nu_obs,
-                                 1, 0.1f, 50, 10.0f, 0.667f, (int)seed, 0);
+        RunResult rv = run_bpf(&data, N, -1.0f, rho, rho, sigma_z, nu_obs,
+                                 0, 0, 0, 0, 0, 0, (int)seed, 0);
+        RunResult rl = run_bpf(&data, N, -1.0f, rho, rho, sigma_z, nu_obs,
+                                 1, 0, 0.1f, 50, 10.0f, 0.667f, (int)seed, 0);
 
         sum_van += rv.rmse_total;
         sum_lrn += rl.rmse_total;
@@ -415,20 +462,92 @@ static void test_smc2_correction(void) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// TEST 5: ρ regime change — does rho learning help?
+// ═══════════════════════════════════════════════════════════════════
+
+static void test_rho_learning(void) {
+    printf("═══════════════════════════════════════════════════════════════════\n");
+    printf("  TEST 5: ρ regime change — vanilla vs mu-only vs mu+rho learning\n");
+    printf("  DGP: ρ=0.98 (t<2500) → ρ=0.90 (t≥2500), μ=-1.0 constant\n");
+    printf("       sigma_z=0.15  nu_obs=5.0  T=5000  N=4096\n");
+    printf("═══════════════════════════════════════════════════════════════════\n\n");
+
+    int T = 5000, t_switch = 2500, N = 4096;
+    float sigma_z = 0.15f, nu_obs = 5.0f;
+    double rho1 = 0.98, rho2 = 0.90;
+    int n_seeds = 10;
+
+    double sum_van_p2 = 0, sum_mu_p2 = 0, sum_both_p2 = 0;
+    double sum_van_tot = 0, sum_mu_tot = 0, sum_both_tot = 0;
+    int mu_wins = 0, both_wins = 0, van_wins = 0;
+
+    printf("  %-5s  %-8s %-8s %-8s  %-8s %-8s  %s\n",
+           "Seed", "Van P2", "mu P2", "mu+ρ P2", "ρ_final", "μ_final", "Winner");
+    printf("  ─────  ──────── ──────── ────────  ──────── ────────  ─────────\n");
+
+    for (int si = 0; si < n_seeds; si++) {
+        unsigned long long seed = 42ULL + si * 1337ULL;
+
+        SvRegimeData data = generate_sv_rho_regime(
+            T, -1.0, rho1, rho2, t_switch, sigma_z, nu_obs, seed);
+
+        // Vanilla: fixed rho=0.98, mu=-1.0
+        RunResult rv = run_bpf(&data, N, -1.0f, (float)rho1, (float)rho1, sigma_z, nu_obs,
+                                 0, 0, 0, 0, 0, 0, (int)seed, 0);
+
+        // Mu learning only: rho fixed at 0.98
+        RunResult rm = run_bpf(&data, N, -1.0f, (float)rho1, (float)rho1, sigma_z, nu_obs,
+                                 1, 0, 0.1f, 50, 10.0f, 0.667f, (int)seed, 0);
+
+        // Mu + rho learning: both adapt
+        RunResult rb = run_bpf(&data, N, -1.0f, (float)rho1, (float)rho1, sigma_z, nu_obs,
+                                 1, 1, 0.1f, 50, 10.0f, 0.667f, (int)seed, 0);
+
+        sum_van_p2  += rv.rmse_phase2;   sum_van_tot  += rv.rmse_total;
+        sum_mu_p2   += rm.rmse_phase2;   sum_mu_tot   += rm.rmse_total;
+        sum_both_p2 += rb.rmse_phase2;   sum_both_tot += rb.rmse_total;
+
+        // Best of 3
+        const char* winner;
+        if (rb.rmse_phase2 <= rm.rmse_phase2 && rb.rmse_phase2 <= rv.rmse_phase2) {
+            winner = "mu+ρ"; both_wins++;
+        } else if (rm.rmse_phase2 <= rv.rmse_phase2) {
+            winner = "mu"; mu_wins++;
+        } else {
+            winner = "vanilla"; van_wins++;
+        }
+
+        printf("  %-5d  %.4f   %.4f   %.4f    %.4f   %+.4f   %s\n",
+               si, rv.rmse_phase2, rm.rmse_phase2, rb.rmse_phase2,
+               rb.rho_final, rb.mu_final, winner);
+
+        free_sv_regime(&data);
+    }
+
+    printf("\n  ── Summary ──\n");
+    printf("  Phase 2 wins: vanilla=%d  mu=%d  mu+ρ=%d\n", van_wins, mu_wins, both_wins);
+    printf("  Mean P2 RMSE:  vanilla=%.4f  mu=%.4f  mu+ρ=%.4f\n",
+           sum_van_p2/n_seeds, sum_mu_p2/n_seeds, sum_both_p2/n_seeds);
+    printf("  Mean Total:    vanilla=%.4f  mu=%.4f  mu+ρ=%.4f\n\n",
+           sum_van_tot/n_seeds, sum_mu_tot/n_seeds, sum_both_tot/n_seeds);
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Main
 // ═══════════════════════════════════════════════════════════════════
 
 int main(void) {
     printf("\n");
     printf("═══════════════════════════════════════════════════════════════════\n");
-    printf("  BPF Online mu Learning — Natural Gradient + Robbins-Monro\n");
-    printf("  Vanilla BPF (bands) vs BPF + kernel 14 Fisher-normalized gradient\n");
+    printf("  BPF Online Parameter Learning — Natural Gradient + Robbins-Monro\n");
+    printf("  Kernel 14: Fisher-normalized gradient for μ and ρ\n");
     printf("═══════════════════════════════════════════════════════════════════\n\n");
 
     test_head_to_head();
     test_multi_seed();
     test_no_regime_change();
     test_smc2_correction();
+    test_rho_learning();
 
     return 0;
 }

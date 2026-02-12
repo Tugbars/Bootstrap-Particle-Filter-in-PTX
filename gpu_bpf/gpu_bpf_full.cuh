@@ -85,10 +85,12 @@ typedef struct {
     float*    d_cdf;            /**< CDF for systematic resampling [N]              */
     float*    d_wh;             /**< Weight × state products [N]                    */
     uint64_t* d_rng;            /**< PCG32 state: 2×u64 per particle [2N]           */
-    float*    d_scalars;        /**< [6]: max_lw, sum_w, h_est, log_lik, sum_w_sq, grad_alpha */
+    float*    d_scalars;        /**< [9]: max_lw, sum_w, h_est, log_lik, sum_w_sq,
+                                         grad_mu, fisher_mu, grad_rho, fisher_rho */
     float*    d_noise;          /**< Standard normals for Silverman jitter [N]      */
     float*    d_var;            /**< Variance accumulator [1]                       */
     float*    d_log_w_prev;     /**< Saved log-weights for non-resample ticks [N]   */
+    float*    d_h_prev;         /**< Saved h_{t-1} for ρ gradient (∂h/∂ρ = h_{t-1}-μ) [N] */
     float*    d_chi2;           /**< Pre-generated chi2 variates [N] (or NULL)      */
     float*    d_chi2_normals;   /**< Temp normals for chi2 generation [N×nu_int]    */
     void*     curand_gen;       /**< curandGenerator_t for chi2 (void* for compat)  */
@@ -113,6 +115,7 @@ typedef struct {
 
     // ── Online mu learning (kernel 14: natural gradient + Robbins-Monro) ────
     int       learn_mode;       /**< 0=off, 1=natural gradient, 2=robbins-monro   */
+    int       learn_rho;        /**< 0=off, 1=also learn ρ via natural gradient    */
     int       update_K;         /**< Accumulate K ticks between updates            */
     float     grad_clip;        /**< Max |natural gradient| per step (0=no clip)   */
     int       grad_count;       /**< Ticks since last update                       */
@@ -197,19 +200,34 @@ void gpu_bpf_enable_mu_learning(GpuBpfState* state, int mode, int K,
 /** @brief Disable online mu learning. Mu stays at current value. */
 void gpu_bpf_disable_mu_learning(GpuBpfState* state);
 
+/** @brief Enable/disable online rho learning (requires learn_mode > 0). */
+void gpu_bpf_enable_rho_learning(GpuBpfState* state, int enable);
+
 /** @brief Get current mu value (may have been updated by online learning). */
 float gpu_bpf_get_mu(GpuBpfState* state);
+
+/** @brief Get current rho value (may have been updated by online learning). */
+float gpu_bpf_get_rho(GpuBpfState* state);
 
 /**
  * @brief Set mu from external source (e.g. SMC² parameter push).
  *
- * Resets Adam optimizer state so online learning starts fresh.
- * Use when SMC²+RBPF pushes corrected parameters.
+ * Resets Robbins-Monro counter so online learning starts fresh.
  *
  * @param state  BPF instance
  * @param mu     New mu value
  */
 void gpu_bpf_set_mu(GpuBpfState* state, float mu);
+
+/**
+ * @brief Set rho from external source (e.g. SMC² parameter push).
+ *
+ * Resets Robbins-Monro counter. Clamps to (0.001, 0.999).
+ *
+ * @param state  BPF instance
+ * @param rho    New rho value
+ */
+void gpu_bpf_set_rho(GpuBpfState* state, float rho);
 
 // ── Adaptive band API ───────────────────────────────────────────────────────
 

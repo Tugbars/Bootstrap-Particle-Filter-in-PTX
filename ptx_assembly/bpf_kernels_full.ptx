@@ -1085,46 +1085,59 @@ SJ_EX:
 
 // =============================================================================
 //
-// Computes per-particle gradient AND Fisher information contributions:
-//   grad_scratch[i]   = w[i] * dlw_dh[i]       → reduce → g_α (score)
-//   fisher_scratch[i] = w[i] * dlw_dh[i]²      → reduce → F_α (Fisher info)
+// Computes per-particle gradient + Fisher for BOTH α (mu) and ρ:
 //
-// Natural gradient step: Δα = η_k · g_α / F_α
-//   - Near optimum: F large (high curvature), g ≈ 0 → tiny steps
-//   - Away from optimum: g/F consistent → tracks
+//   grad_mu[i]     = w[i] * dlw                    → Σ → g_α
+//   fisher_mu[i]   = w[i] * dlw²                   → Σ → F_α
+//   grad_rho[i]    = w[i] * dlw * (h_prev - mu)    → Σ → g_ρ
+//   fisher_rho[i]  = w[i] * dlw² * (h_prev - mu)²  → Σ → F_ρ
 //
-// dlw_dh = ∂log_w/∂h:
-//   Gaussian:  -0.5 + 0.5·η²         where η² = y_t²·exp(-h)
+// where dlw = ∂log_w/∂h:
+//   Gaussian:  -0.5 + 0.5·η²         (η² = y²·exp(-h))
 //   Student-t: -0.5 + (ν+1)/2·η²/(ν+η²)
 //
-// ∂h/∂α = 1  (h = α + ρ·h_{t-1} + σ_z·ε), so the α-score = dlw_dh
+// Chain rule:
+//   ∂h/∂α = 1              (h = α + ρ·h_{t-1} + σ_z·ε)
+//   ∂h/∂ρ = h_{t-1} - μ    (since α = μ(1-ρ))
+//
+// All 4 outputs computed in one pass. Host reduces into d_scalars[5..8].
 // =============================================================================
 
 .visible .entry bpf_grad_alpha(
-    .param .u64 param_grad_scratch,
-    .param .u64 param_fisher_scratch,
-    .param .u64 param_w,
-    .param .u64 param_h,
+    .param .u64 param_grad_mu,          // scratch [N]: w * dlw
+    .param .u64 param_fisher_mu,        // scratch [N]: w * dlw²
+    .param .u64 param_grad_rho,         // scratch [N]: w * dlw * dhdr
+    .param .u64 param_fisher_rho,       // scratch [N]: w * dlw² * dhdr²
+    .param .u64 param_w,                // normalized weights [N]
+    .param .u64 param_h,                // current h_t [N]
+    .param .u64 param_h_prev,           // previous h_{t-1} [N]
     .param .f32 param_y_t,
     .param .f32 param_nu_obs,
+    .param .f32 param_mu,
     .param .s32 param_n
 )
 {
     .reg .u32   %idx, %r_tid, %r_ctaid, %r_ntid, %r_n;
-    .reg .u64   %rd_grad, %rd_fish, %rd_w, %rd_h, %rd_off;
-    .reg .f32   %f_yt, %f_nu, %f_h, %f_w;
+    .reg .u64   %rd_gm, %rd_fm, %rd_gr, %rd_fr;
+    .reg .u64   %rd_w, %rd_h, %rd_hp, %rd_off;
+    .reg .f32   %f_yt, %f_nu, %f_mu, %f_h, %f_w, %f_hp;
     .reg .f32   %f_yt2, %f_neg_h, %f_exp_neg_h, %f_eta_sq;
     .reg .f32   %f_nup1h, %f_denom, %f_ratio, %f_dlw;
-    .reg .f32   %f_grad_val, %f_dlw2, %f_fish_val;
+    .reg .f32   %f_dlw2, %f_dhdr, %f_dhdr2;
+    .reg .f32   %f_v0, %f_v1, %f_v2, %f_v3;
     .reg .pred  %p_bound, %p_t_obs;
 
-    ld.param.u64    %rd_grad,    [param_grad_scratch];
-    ld.param.u64    %rd_fish,    [param_fisher_scratch];
-    ld.param.u64    %rd_w,       [param_w];
-    ld.param.u64    %rd_h,       [param_h];
-    ld.param.f32    %f_yt,       [param_y_t];
-    ld.param.f32    %f_nu,       [param_nu_obs];
-    ld.param.s32    %r_n,        [param_n];
+    ld.param.u64    %rd_gm,  [param_grad_mu];
+    ld.param.u64    %rd_fm,  [param_fisher_mu];
+    ld.param.u64    %rd_gr,  [param_grad_rho];
+    ld.param.u64    %rd_fr,  [param_fisher_rho];
+    ld.param.u64    %rd_w,   [param_w];
+    ld.param.u64    %rd_h,   [param_h];
+    ld.param.u64    %rd_hp,  [param_h_prev];
+    ld.param.f32    %f_yt,   [param_y_t];
+    ld.param.f32    %f_nu,   [param_nu_obs];
+    ld.param.f32    %f_mu,   [param_mu];
+    ld.param.s32    %r_n,    [param_n];
 
     mov.u32         %r_tid,   %tid.x;
     mov.u32         %r_ctaid, %ctaid.x;
@@ -1134,15 +1147,17 @@ SJ_EX:
     setp.ge.u32     %p_bound, %idx, %r_n;
     @%p_bound bra   GA_EXIT;
 
-    // Load h[i] and w[i]
+    // Load w[i], h[i], h_prev[i]
     mul.wide.u32    %rd_off, %idx, 4;
-    .reg .u64 %rd_h_addr, %rd_w_addr, %rd_g_addr, %rd_f_addr;
-    add.u64         %rd_h_addr, %rd_h, %rd_off;
-    add.u64         %rd_w_addr, %rd_w, %rd_off;
-    ld.global.f32   %f_h, [%rd_h_addr];
-    ld.global.f32   %f_w, [%rd_w_addr];
+    .reg .u64 %a0, %a1, %a2, %a3, %a4, %a5, %a6;
+    add.u64         %a0, %rd_h,  %rd_off;
+    add.u64         %a1, %rd_w,  %rd_off;
+    add.u64         %a2, %rd_hp, %rd_off;
+    ld.global.f32   %f_h,  [%a0];
+    ld.global.f32   %f_w,  [%a1];
+    ld.global.f32   %f_hp, [%a2];
 
-    // eta_sq = y_t^2 * exp(-h)
+    // eta_sq = y_t² * exp(-h)
     mul.f32         %f_yt2, %f_yt, %f_yt;
     neg.f32         %f_neg_h, %f_h;
     mul.f32         %f_neg_h, %f_neg_h, 0f3FB8AA3B;      // * log2(e)
@@ -1153,29 +1168,44 @@ SJ_EX:
     setp.gt.f32     %p_t_obs, %f_nu, 0f00000000;
     @%p_t_obs bra   GA_T_OBS;
 
-    // Gaussian: dlw_dh = -0.5 + 0.5 * eta_sq
+    // Gaussian: dlw = -0.5 + 0.5 * eta_sq
     fma.rn.f32      %f_dlw, %f_eta_sq, 0f3F000000, 0fBF000000;
-    bra             GA_STORE;
+    bra             GA_COMPUTE;
 
 GA_T_OBS:
-    // Student-t: dlw_dh = -0.5 + (nu+1)/2 * eta_sq / (nu + eta_sq)
+    // Student-t: dlw = -0.5 + (nu+1)/2 * eta_sq / (nu + eta_sq)
     add.f32         %f_nup1h, %f_nu, 0f3F800000;          // nu + 1
     mul.f32         %f_nup1h, %f_nup1h, 0f3F000000;       // (nu+1)/2
     add.f32         %f_denom, %f_nu, %f_eta_sq;            // nu + eta_sq
-    div.approx.f32  %f_ratio, %f_eta_sq, %f_denom;        // eta_sq / (nu + eta_sq)
-    fma.rn.f32      %f_dlw, %f_nup1h, %f_ratio, 0fBF000000; // -0.5 + nup1h * ratio
+    div.approx.f32  %f_ratio, %f_eta_sq, %f_denom;
+    fma.rn.f32      %f_dlw, %f_nup1h, %f_ratio, 0fBF000000;
 
-GA_STORE:
-    // grad_scratch[i] = w[i] * dlw_dh
-    mul.f32         %f_grad_val, %f_w, %f_dlw;
-    add.u64         %rd_g_addr, %rd_grad, %rd_off;
-    st.global.f32   [%rd_g_addr], %f_grad_val;
+GA_COMPUTE:
+    // dhdr = h_prev - mu  (∂h/∂ρ)
+    sub.f32         %f_dhdr, %f_hp, %f_mu;
 
-    // fisher_scratch[i] = w[i] * dlw_dh^2
-    mul.f32         %f_dlw2, %f_dlw, %f_dlw;
-    mul.f32         %f_fish_val, %f_w, %f_dlw2;
-    add.u64         %rd_f_addr, %rd_fish, %rd_off;
-    st.global.f32   [%rd_f_addr], %f_fish_val;
+    // dlw² and dhdr²
+    mul.f32         %f_dlw2,  %f_dlw,  %f_dlw;
+    mul.f32         %f_dhdr2, %f_dhdr, %f_dhdr;
+
+    // v0 = w * dlw              (grad_mu)
+    mul.f32         %f_v0, %f_w, %f_dlw;
+    // v1 = w * dlw²             (fisher_mu)
+    mul.f32         %f_v1, %f_w, %f_dlw2;
+    // v2 = w * dlw * dhdr       (grad_rho)
+    mul.f32         %f_v2, %f_v0, %f_dhdr;
+    // v3 = w * dlw² * dhdr²     (fisher_rho)
+    mul.f32         %f_v3, %f_v1, %f_dhdr2;
+
+    // Store all 4
+    add.u64         %a3, %rd_gm, %rd_off;
+    add.u64         %a4, %rd_fm, %rd_off;
+    add.u64         %a5, %rd_gr, %rd_off;
+    add.u64         %a6, %rd_fr, %rd_off;
+    st.global.f32   [%a3], %f_v0;
+    st.global.f32   [%a4], %f_v1;
+    st.global.f32   [%a5], %f_v2;
+    st.global.f32   [%a6], %f_v3;
 
 GA_EXIT:
     ret;

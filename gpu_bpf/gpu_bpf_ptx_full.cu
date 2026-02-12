@@ -361,6 +361,7 @@ GpuBpfState* gpu_bpf_create(int n_particles, float rho, float sigma_z, float mu,
 
     // [NEW] Online mu learning — off by default
     s->learn_mode = 0;
+    s->learn_rho  = 0;
     s->update_K   = 50;
     s->grad_clip  = 5.0f;
     s->grad_count = 0;
@@ -379,11 +380,13 @@ GpuBpfState* gpu_bpf_create(int n_particles, float rho, float sigma_z, float mu,
     cudaMalloc(&s->d_wh,      n_particles * sizeof(float));
     // PCG32: 2 x u64 per particle = 16 bytes each
     cudaMalloc(&s->d_rng,     n_particles * 2 * sizeof(uint64_t));
-    // [CHANGED] 7 scalars: max_lw, sum_w, h_est, log_lik, sum_w_sq, grad_alpha, fisher_alpha
-    cudaMalloc(&s->d_scalars, 7 * sizeof(float));
+    // [CHANGED] 9 scalars: max_lw, sum_w, h_est, log_lik, sum_w_sq,
+    //                      grad_mu, fisher_mu, grad_rho, fisher_rho
+    cudaMalloc(&s->d_scalars, 9 * sizeof(float));
     cudaMalloc(&s->d_noise,   n_particles * sizeof(float));
     cudaMalloc(&s->d_var,     sizeof(float));
     cudaMalloc(&s->d_log_w_prev, n_particles * sizeof(float));
+    cudaMalloc(&s->d_h_prev,  n_particles * sizeof(float));
 
     // Chi2 pre-generation for Student-t state noise
     s->nu_int = (nu_state > 0.0f) ? (int)(nu_state + 0.5f) : 0;
@@ -452,6 +455,7 @@ void gpu_bpf_destroy(GpuBpfState* s) {
     cudaFree(s->d_noise);
     cudaFree(s->d_var);
     cudaFree(s->d_log_w_prev);
+    cudaFree(s->d_h_prev);
     if (s->d_chi2) cudaFree(s->d_chi2);
     if (s->d_chi2_normals) cudaFree(s->d_chi2_normals);
     if (s->curand_gen) curandDestroyGenerator((curandGenerator_t)s->curand_gen);
@@ -459,37 +463,56 @@ void gpu_bpf_destroy(GpuBpfState* s) {
 }
 
 // =============================================================================
-// [NEW] Online mu learning — natural gradient + Robbins-Monro
+// [NEW] Online mu/rho learning — natural gradient + Robbins-Monro
 // =============================================================================
 
 static void bpf_grad_and_update(GpuBpfState* s, float y_t,
                                  CUdeviceptr dh, CUdeviceptr dw,
                                  CUdeviceptr dscal,
-                                 CUdeviceptr d_grad_scratch,
-                                 CUdeviceptr d_fish_scratch,
+                                 CUdeviceptr d_grad_mu,     // scratch: d_h2
+                                 CUdeviceptr d_fisher_mu,   // scratch: d_noise
+                                 CUdeviceptr d_grad_rho,    // scratch: d_wh
+                                 CUdeviceptr d_fisher_rho,  // scratch: d_cdf
+                                 CUdeviceptr d_h_prev,
                                  int n, int g, int b, cudaStream_t st,
                                  size_t smem)
 {
     if (!s->learn_mode) return;
 
-    // Kernel 14: grad_scratch[i] = w[i]*dlw_dh[i], fisher_scratch[i] = w[i]*dlw_dh[i]²
+    // Kernel 14: compute all 4 per-particle quantities in one pass
     {
-        void* params[] = { &d_grad_scratch, &d_fish_scratch,
-                           &dw, &dh, &y_t, &s->nu_obs, &n };
+        void* params[] = { &d_grad_mu, &d_fisher_mu,
+                           &d_grad_rho, &d_fisher_rho,
+                           &dw, &dh, &d_h_prev,
+                           &y_t, &s->nu_obs, &s->mu, &n };
         ptx_launch(g_ptx.grad_alpha, st, g, b, 0, params);
     }
 
-    // Reduce gradient into d_scalars[5]
+    // Reduce grad_mu → scalars[5]
     {
         CUdeviceptr ptr = dscal + 5 * sizeof(float);
-        void* p[] = { &d_grad_scratch, &ptr, &n };
+        void* p[] = { &d_grad_mu, &ptr, &n };
         ptx_launch(g_ptx.reduce_sum, st, g, b, smem, p);
     }
 
-    // Reduce Fisher into d_scalars[6] (only needed for natural gradient mode)
-    if (s->learn_mode == 1) {
+    // Reduce fisher_mu → scalars[6]
+    {
         CUdeviceptr ptr = dscal + 6 * sizeof(float);
-        void* p[] = { &d_fish_scratch, &ptr, &n };
+        void* p[] = { &d_fisher_mu, &ptr, &n };
+        ptx_launch(g_ptx.reduce_sum, st, g, b, smem, p);
+    }
+
+    // Reduce grad_rho → scalars[7]  (always compute — cheap)
+    {
+        CUdeviceptr ptr = dscal + 7 * sizeof(float);
+        void* p[] = { &d_grad_rho, &ptr, &n };
+        ptx_launch(g_ptx.reduce_sum, st, g, b, smem, p);
+    }
+
+    // Reduce fisher_rho → scalars[8]
+    {
+        CUdeviceptr ptr = dscal + 8 * sizeof(float);
+        void* p[] = { &d_fisher_rho, &ptr, &n };
         ptx_launch(g_ptx.reduce_sum, st, g, b, smem, p);
     }
 
@@ -499,45 +522,46 @@ static void bpf_grad_and_update(GpuBpfState* s, float y_t,
     if (s->grad_count >= s->update_K) {
         cudaStreamSynchronize(st);
 
-        float g_alpha, f_alpha;
-        cudaMemcpy(&g_alpha, s->d_scalars + 5, sizeof(float), cudaMemcpyDeviceToHost);
-        if (s->learn_mode == 1) {
-            cudaMemcpy(&f_alpha, s->d_scalars + 6, sizeof(float), cudaMemcpyDeviceToHost);
-        }
+        float sums[4];  // [grad_mu, fisher_mu, grad_rho, fisher_rho]
+        cudaMemcpy(sums, s->d_scalars + 5, 4 * sizeof(float), cudaMemcpyDeviceToHost);
 
         // Robbins-Monro step size: η = c / (step + t0)^gamma
         s->rm_step++;
         float eta = s->rm_c / powf((float)s->rm_step + s->rm_t0, s->rm_gamma);
 
-        // Compute update direction
-        float direction;
-        if (s->learn_mode == 1) {
-            // Natural gradient: g / F (Fisher-normalized)
-            float mean_g = g_alpha / (float)s->grad_count;
-            float mean_f = f_alpha / (float)s->grad_count;
-            direction = mean_g / fmaxf(mean_f, 1e-8f);
-        } else {
-            // Vanilla Robbins-Monro: just the gradient
-            direction = g_alpha / (float)s->grad_count;
+        float K_inv = 1.0f / (float)s->grad_count;
+
+        // ── μ update (natural gradient: score / Fisher) ──
+        {
+            float mean_g = sums[0] * K_inv;
+            float mean_f = sums[1] * K_inv;
+            float dir = mean_g / fmaxf(mean_f, 1e-8f);
+
+            if (s->grad_clip > 0.0f && fabsf(dir) > s->grad_clip)
+                dir *= s->grad_clip / fabsf(dir);
+
+            float alpha = s->mu * (1.0f - s->rho);
+            alpha += eta * dir;
+            float mu_new = alpha / fmaxf(1.0f - s->rho, 1e-6f);
+            s->mu = fmaxf(fminf(mu_new, 2.0f), -5.0f);
         }
 
-        // Clip natural gradient direction
-        if (s->grad_clip > 0.0f) {
-            float ad = fabsf(direction);
-            if (ad > s->grad_clip)
-                direction *= s->grad_clip / ad;
+        // ── ρ update (natural gradient: score / Fisher) ──
+        if (s->learn_rho) {
+            float mean_g = sums[2] * K_inv;
+            float mean_f = sums[3] * K_inv;
+            float dir = mean_g / fmaxf(mean_f, 1e-8f);
+
+            if (s->grad_clip > 0.0f && fabsf(dir) > s->grad_clip)
+                dir *= s->grad_clip / fabsf(dir);
+
+            float rho_new = s->rho + eta * dir;
+            s->rho = fmaxf(fminf(rho_new, 0.999f), 0.001f);
         }
 
-        // Update alpha, convert to mu
-        float alpha = s->mu * (1.0f - s->rho);
-        alpha += eta * direction;
-        float mu_new = alpha / fmaxf(1.0f - s->rho, 1e-6f);
-        mu_new = fmaxf(fminf(mu_new, 2.0f), -5.0f);
-        s->mu = mu_new;
-
-        // Reset accumulators
-        float zeros[2] = {0.0f, 0.0f};
-        cudaMemcpy(s->d_scalars + 5, zeros, 2 * sizeof(float), cudaMemcpyHostToDevice);
+        // Reset all 4 accumulators
+        float zeros[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        cudaMemcpy(s->d_scalars + 5, zeros, 4 * sizeof(float), cudaMemcpyHostToDevice);
         s->grad_count = 0;
     }
 }
@@ -564,7 +588,13 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
     CUdeviceptr dnoise= (CUdeviceptr)(uintptr_t)s->d_noise;
     CUdeviceptr dvar  = (CUdeviceptr)(uintptr_t)s->d_var;
 
-    // 1. Generate chi2 variates if Student-t state noise
+    // 1. Save h_{t-1} for ρ gradient (must be before propagation overwrites d_h)
+    if (s->learn_mode && s->timestep > 0) {
+        cudaMemcpyAsync(s->d_h_prev, s->d_h,
+                         n * sizeof(float), cudaMemcpyDeviceToDevice, st);
+    }
+
+    // 1b. Generate chi2 variates if Student-t state noise
     CUdeviceptr dchi2 = (CUdeviceptr)(uintptr_t)s->d_chi2;
     if (s->nu_int > 0 && s->timestep > 0) {
         curandGenerator_t gen = (curandGenerator_t)s->curand_gen;
@@ -658,12 +688,14 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
         ptx_launch(g_ptx.reduce_sum, st, g, b, smem, p2);
     }
 
-    // ─── [NEW] Kernel 14: gradient + Fisher + natural gradient update ───
-    // d_h2 = gradient scratch (ESS done, resampling hasn't started)
-    // d_noise = Fisher scratch (safe: Silverman jitter is post-resample)
+    // ─── [NEW] Kernel 14: gradient + Fisher for μ and ρ ───
+    // Scratch buffers (all free between ESS and resampling):
+    //   d_h2    → grad_mu    d_noise → fisher_mu
+    //   d_wh    → grad_rho   d_cdf   → fisher_rho
     {
-        CUdeviceptr d_fish_scratch = (CUdeviceptr)(uintptr_t)s->d_noise;
-        bpf_grad_and_update(s, y_t, dh, dw, dscal, dh2, d_fish_scratch,
+        CUdeviceptr d_hp = (CUdeviceptr)(uintptr_t)s->d_h_prev;
+        bpf_grad_and_update(s, y_t, dh, dw, dscal,
+                            dh2, dnoise, dwh, dcdf, d_hp,
                             n, g, b, st, smem);
     }
 
@@ -765,12 +797,12 @@ BpfResult gpu_bpf_step(GpuBpfState* s, float y_t) {
 }
 
 // =============================================================================
-// [NEW] Online mu learning API — natural gradient + Robbins-Monro
+// [NEW] Online mu/rho learning API — natural gradient + Robbins-Monro
 // =============================================================================
 
 void gpu_bpf_enable_mu_learning(GpuBpfState* s, int mode, int K,
                                  float c, float t0, float gamma) {
-    s->learn_mode = mode;   // 1=natural gradient, 2=robbins-monro
+    s->learn_mode = mode;   // 1=natural gradient
     s->update_K   = K;
     s->grad_clip  = 5.0f;
     s->grad_count = 0;
@@ -779,17 +811,26 @@ void gpu_bpf_enable_mu_learning(GpuBpfState* s, int mode, int K,
     s->rm_t0      = t0;
     s->rm_gamma   = gamma;
 
-    // Zero both device accumulators (grad + Fisher)
-    float zeros[2] = {0.0f, 0.0f};
-    cudaMemcpy(s->d_scalars + 5, zeros, 2 * sizeof(float), cudaMemcpyHostToDevice);
+    // Zero all 4 device accumulators
+    float zeros[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    cudaMemcpy(s->d_scalars + 5, zeros, 4 * sizeof(float), cudaMemcpyHostToDevice);
 }
 
 void gpu_bpf_disable_mu_learning(GpuBpfState* s) {
     s->learn_mode = 0;
+    s->learn_rho  = 0;
+}
+
+void gpu_bpf_enable_rho_learning(GpuBpfState* s, int enable) {
+    s->learn_rho = enable;
 }
 
 float gpu_bpf_get_mu(GpuBpfState* s) {
     return s->mu;
+}
+
+float gpu_bpf_get_rho(GpuBpfState* s) {
+    return s->rho;
 }
 
 // Called by SMC² when it pushes corrected params.
@@ -799,8 +840,17 @@ void gpu_bpf_set_mu(GpuBpfState* s, float mu) {
     s->rm_step    = 0;
     s->grad_count = 0;
 
-    float zeros[2] = {0.0f, 0.0f};
-    cudaMemcpy(s->d_scalars + 5, zeros, 2 * sizeof(float), cudaMemcpyHostToDevice);
+    float zeros[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    cudaMemcpy(s->d_scalars + 5, zeros, 4 * sizeof(float), cudaMemcpyHostToDevice);
+}
+
+void gpu_bpf_set_rho(GpuBpfState* s, float rho) {
+    s->rho = fmaxf(fminf(rho, 0.999f), 0.001f);
+    s->rm_step    = 0;
+    s->grad_count = 0;
+
+    float zeros[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    cudaMemcpy(s->d_scalars + 5, zeros, 4 * sizeof(float), cudaMemcpyHostToDevice);
 }
 
 // =============================================================================
