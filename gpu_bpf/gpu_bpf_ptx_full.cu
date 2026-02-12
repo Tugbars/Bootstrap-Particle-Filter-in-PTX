@@ -16,7 +16,7 @@
  *  11.  bpf_compute_var
  *  12.  bpf_gen_noise
  *  13.  bpf_silverman_jitter
- *  14.  bpf_grad_alpha         — [NEW] Online mu learning gradient
+ *  14.  bpf_grad_alpha         — [FUSED] Online mu/rho learning: compute + reduce + atomicAdd
  *
  * PCG32 state: 16 bytes/particle (2 x u64) vs curandState ~48 bytes/particle.
  * Normal generation: ICDF (Acklam rational approx) — 1 uniform per normal.
@@ -469,51 +469,18 @@ void gpu_bpf_destroy(GpuBpfState* s) {
 static void bpf_grad_and_update(GpuBpfState* s, float y_t,
                                  CUdeviceptr dh, CUdeviceptr dw,
                                  CUdeviceptr dscal,
-                                 CUdeviceptr d_grad_mu,     // scratch: d_h2
-                                 CUdeviceptr d_fisher_mu,   // scratch: d_noise
-                                 CUdeviceptr d_grad_rho,    // scratch: d_wh
-                                 CUdeviceptr d_fisher_rho,  // scratch: d_cdf
                                  CUdeviceptr d_h_prev,
-                                 int n, int g, int b, cudaStream_t st,
-                                 size_t smem)
+                                 int n, int g, int b, cudaStream_t st)
 {
     if (!s->learn_mode) return;
 
-    // Kernel 14: compute all 4 per-particle quantities in one pass
+    // Fused kernel 14: compute + warp reduce + atomicAdd to scalars[5..8]
+    // Single launch replaces: old kernel14 + 4× reduce_sum
     {
-        void* params[] = { &d_grad_mu, &d_fisher_mu,
-                           &d_grad_rho, &d_fisher_rho,
-                           &dw, &dh, &d_h_prev,
+        size_t grad_smem = 4 * (b / 32) * sizeof(float);  // 4 values × nwarps
+        void* params[] = { &dscal, &dw, &dh, &d_h_prev,
                            &y_t, &s->nu_obs, &s->mu, &n };
-        ptx_launch(g_ptx.grad_alpha, st, g, b, 0, params);
-    }
-
-    // Reduce grad_mu → scalars[5]
-    {
-        CUdeviceptr ptr = dscal + 5 * sizeof(float);
-        void* p[] = { &d_grad_mu, &ptr, &n };
-        ptx_launch(g_ptx.reduce_sum, st, g, b, smem, p);
-    }
-
-    // Reduce fisher_mu → scalars[6]
-    {
-        CUdeviceptr ptr = dscal + 6 * sizeof(float);
-        void* p[] = { &d_fisher_mu, &ptr, &n };
-        ptx_launch(g_ptx.reduce_sum, st, g, b, smem, p);
-    }
-
-    // Reduce grad_rho → scalars[7]  (always compute — cheap)
-    {
-        CUdeviceptr ptr = dscal + 7 * sizeof(float);
-        void* p[] = { &d_grad_rho, &ptr, &n };
-        ptx_launch(g_ptx.reduce_sum, st, g, b, smem, p);
-    }
-
-    // Reduce fisher_rho → scalars[8]
-    {
-        CUdeviceptr ptr = dscal + 8 * sizeof(float);
-        void* p[] = { &d_fisher_rho, &ptr, &n };
-        ptx_launch(g_ptx.reduce_sum, st, g, b, smem, p);
+        ptx_launch(g_ptx.grad_alpha, st, g, b, grad_smem, params);
     }
 
     s->grad_count++;
@@ -688,15 +655,12 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
         ptx_launch(g_ptx.reduce_sum, st, g, b, smem, p2);
     }
 
-    // ─── [NEW] Kernel 14: gradient + Fisher for μ and ρ ───
-    // Scratch buffers (all free between ESS and resampling):
-    //   d_h2    → grad_mu    d_noise → fisher_mu
-    //   d_wh    → grad_rho   d_cdf   → fisher_rho
+    // ─── [FUSED] Kernel 14: gradient compute + reduce + atomicAdd ───
+    // No scratch buffers needed — fused kernel reduces in-register via warp shuffles
     {
         CUdeviceptr d_hp = (CUdeviceptr)(uintptr_t)s->d_h_prev;
-        bpf_grad_and_update(s, y_t, dh, dw, dscal,
-                            dh2, dnoise, dwh, dcdf, d_hp,
-                            n, g, b, st, smem);
+        bpf_grad_and_update(s, y_t, dh, dw, dscal, d_hp,
+                            n, g, b, st);
     }
 
     // ─── Conditional resampling decision ───

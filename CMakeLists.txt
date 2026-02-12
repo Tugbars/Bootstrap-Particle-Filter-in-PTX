@@ -410,6 +410,25 @@ set_target_properties(test_mu_learning PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
 )
 
+# ==============================================================================
+# Bench: gradient kernel overhead (baseline before fusion)
+# ==============================================================================
+
+add_executable(bench_grad_overhead tests/bench_grad_overhead.cu)
+
+target_include_directories(bench_grad_overhead PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+target_link_libraries(bench_grad_overhead PRIVATE
+    gpu_bpf_ptx_full
+    smc2_bpf
+    CUDA::cuda_driver
+    CUDA::cudart
+    CUDA::curand
+)
+
 
 # ==============================================================================
 # Print summary
