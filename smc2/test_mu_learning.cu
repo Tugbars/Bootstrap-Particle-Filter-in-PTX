@@ -119,10 +119,11 @@ static RunResult run_bpf(
     float rho,
     float sigma_z,
     float nu_obs,
-    int   learn_mu,      // 0=vanilla, 1=online learning
-    float lr,
+    int   learn_mode,    // 0=vanilla, 1=natural gradient, 2=robbins-monro
+    float rm_c,
     int   update_K,
-    float grad_clip,
+    float rm_t0,
+    float rm_gamma,
     int   seed,
     int   log_every)     // 0 = no logging
 {
@@ -133,8 +134,8 @@ static RunResult run_bpf(
     GpuBpfState* s = gpu_bpf_create(N, rho, sigma_z, init_mu,
                                       0.0f, nu_obs, seed);
 
-    if (learn_mu) {
-        gpu_bpf_enable_mu_learning(s, lr, update_K, grad_clip);
+    if (learn_mode > 0) {
+        gpu_bpf_enable_mu_learning(s, learn_mode, update_K, rm_c, rm_t0, rm_gamma);
     }
 
     double sse_total = 0.0, sse_p1 = 0.0, sse_p2 = 0.0;
@@ -180,13 +181,13 @@ static RunResult run_bpf(
 
 static void test_head_to_head(void) {
     printf("═══════════════════════════════════════════════════════════════════\n");
-    printf("  TEST 1: Vanilla BPF vs BPF+mu_learning — Regime Change\n");
+    printf("  TEST 1: Vanilla BPF vs BPF+natural_gradient — Regime Change\n");
     printf("  DGP: mu=-1.0 (t<2500) → mu=-2.5 (t≥2500)\n");
-    printf("       rho=0.98  sigma_z=0.15  nu_obs=5.0  T=5000  N=512\n");
+    printf("       rho=0.98  sigma_z=0.15  nu_obs=5.0  T=5000  N=4096\n");
     printf("  Both start at mu=-1.0 (SMC²'s last known value)\n");
     printf("═══════════════════════════════════════════════════════════════════\n\n");
 
-    int T = 5000, t_switch = 2500, N = 512;
+    int T = 5000, t_switch = 2500, N = 4096;
     float rho = 0.98f, sigma_z = 0.15f, nu_obs = 5.0f;
     double mu1 = -1.0, mu2 = -2.5;
 
@@ -195,14 +196,14 @@ static void test_head_to_head(void) {
 
     printf("  ── Vanilla BPF (mu=-1.0 fixed) ──\n");
     RunResult r_vanilla = run_bpf(&data, N, -1.0f, rho, sigma_z, nu_obs,
-                                    0, 0, 0, 0, 42, 500);
+                                    0, 0, 0, 0, 0, 42, 500);
 
-    printf("\n  ── BPF + mu learning (K=50, lr=0.003) ──\n");
+    printf("\n  ── BPF + natural gradient (K=50, c=0.1, t0=10, γ=2/3) ──\n");
     RunResult r_learn = run_bpf(&data, N, -1.0f, rho, sigma_z, nu_obs,
-                                  1, 0.003f, 50, 1.0f, 42, 500);
+                                  1, 0.1f, 50, 10.0f, 0.667f, 42, 500);
 
     printf("\n  ┌─────────────────────┬───────────────┬───────────────┐\n");
-    printf("  │                     │ Vanilla BPF   │ BPF+mu_learn  │\n");
+    printf("  │                     │ Vanilla BPF   │ BPF+nat_grad  │\n");
     printf("  ├─────────────────────┼───────────────┼───────────────┤\n");
     printf("  │ Phase 1 RMSE        │    %.4f     │    %.4f     │\n",
            r_vanilla.rmse_phase1, r_learn.rmse_phase1);
@@ -220,9 +221,9 @@ static void test_head_to_head(void) {
     printf("  Phase 2 improvement: %+.1f%%\n", p2_improvement);
 
     if (r_learn.rmse_phase2 < r_vanilla.rmse_phase2)
-        printf("  ✓ mu learning WINS in phase 2\n\n");
+        printf("  ✓ natural gradient WINS in phase 2\n\n");
     else
-        printf("  ✗ mu learning did NOT help in phase 2\n\n");
+        printf("  ✗ natural gradient did NOT help in phase 2\n\n");
 
     free_sv_regime(&data);
 }
@@ -237,7 +238,7 @@ static void test_multi_seed(void) {
     printf("  DGP: mu=-1.0 → mu=-2.5 at T/2\n");
     printf("═══════════════════════════════════════════════════════════════════\n\n");
 
-    int T = 5000, t_switch = 2500, N = 512;
+    int T = 5000, t_switch = 2500, N = 4096;
     float rho = 0.98f, sigma_z = 0.15f, nu_obs = 5.0f;
     int n_seeds = 10;
 
@@ -256,9 +257,9 @@ static void test_multi_seed(void) {
             T, -1.0, -2.5, t_switch, rho, sigma_z, nu_obs, seed);
 
         RunResult rv = run_bpf(&data, N, -1.0f, rho, sigma_z, nu_obs,
-                                 0, 0, 0, 0, (int)seed, 0);
+                                 0, 0, 0, 0, 0, (int)seed, 0);
         RunResult rl = run_bpf(&data, N, -1.0f, rho, sigma_z, nu_obs,
-                                 1, 0.003f, 50, 1.0f, (int)seed, 0);
+                                 1, 0.1f, 50, 10.0f, 0.667f, (int)seed, 0);
 
         const char* winner = (rl.rmse_phase2 < rv.rmse_phase2) ? "LEARN" : "vanilla";
         if (rl.rmse_phase2 < rv.rmse_phase2) learn_wins_p2++; else vanilla_wins_p2++;
@@ -296,7 +297,7 @@ static void test_no_regime_change(void) {
     printf("  If learning drifts away, it's harmful.\n");
     printf("═══════════════════════════════════════════════════════════════════\n\n");
 
-    int T = 5000, N = 512;
+    int T = 5000, N = 4096;
     float rho = 0.98f, sigma_z = 0.15f, nu_obs = 5.0f;
     int n_seeds = 10;
 
@@ -315,9 +316,9 @@ static void test_no_regime_change(void) {
             T, -1.0, -1.0, T, rho, sigma_z, nu_obs, seed);
 
         RunResult rv = run_bpf(&data, N, -1.0f, rho, sigma_z, nu_obs,
-                                 0, 0, 0, 0, (int)seed, 0);
+                                 0, 0, 0, 0, 0, (int)seed, 0);
         RunResult rl = run_bpf(&data, N, -1.0f, rho, sigma_z, nu_obs,
-                                 1, 0.003f, 50, 1.0f, (int)seed, 0);
+                                 1, 0.1f, 50, 10.0f, 0.667f, (int)seed, 0);
 
         sum_van += rv.rmse_total;
         sum_lrn += rl.rmse_total;
@@ -350,7 +351,7 @@ static void test_smc2_correction(void) {
     printf("  Question: does online learning maintain the correction?\n");
     printf("═══════════════════════════════════════════════════════════════════\n\n");
 
-    int T = 5000, t_switch = 2000, N = 512;
+    int T = 5000, t_switch = 2000, N = 4096;
     float rho = 0.98f, sigma_z = 0.15f, nu_obs = 5.0f;
     int t_smc2 = 3000;
     int skip = 50;
@@ -363,7 +364,7 @@ static void test_smc2_correction(void) {
 
     // Learning: SMC² corrects at t=3000, online continues
     GpuBpfState* s_lrn = gpu_bpf_create(N, rho, sigma_z, -1.0f, 0.0f, nu_obs, 42);
-    gpu_bpf_enable_mu_learning(s_lrn, 0.003f, 50, 1.0f);
+    gpu_bpf_enable_mu_learning(s_lrn, 1, 50, 0.1f, 10.0f, 0.667f);
 
     double sse_van_post = 0, sse_lrn_post = 0;
     int cnt_post = 0;
@@ -420,8 +421,8 @@ static void test_smc2_correction(void) {
 int main(void) {
     printf("\n");
     printf("═══════════════════════════════════════════════════════════════════\n");
-    printf("  BPF Online mu Learning — Accuracy Test\n");
-    printf("  Vanilla BPF (bands) vs BPF + kernel 14 gradient + Adam\n");
+    printf("  BPF Online mu Learning — Natural Gradient + Robbins-Monro\n");
+    printf("  Vanilla BPF (bands) vs BPF + kernel 14 Fisher-normalized gradient\n");
     printf("═══════════════════════════════════════════════════════════════════\n\n");
 
     test_head_to_head();

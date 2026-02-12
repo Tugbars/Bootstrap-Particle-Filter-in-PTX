@@ -1083,21 +1083,26 @@ SJ_EX:
     ret;
 }
 
-// Computes per-particle gradient contribution: scratch[i] = w[i] * dlw_dh[i]
-// where dlw_dh = ∂log_w/∂h = observation likelihood gradient
+// =============================================================================
 //
-// For Student-t obs:  dlw_dh = -0.5 + (ν+1)/2 · η²/(ν+η²)
-// For Gaussian obs:   dlw_dh = -0.5 + 0.5 · η²
-// where η² = y_t² · exp(-h[i])
+// Computes per-particle gradient AND Fisher information contributions:
+//   grad_scratch[i]   = w[i] * dlw_dh[i]       → reduce → g_α (score)
+//   fisher_scratch[i] = w[i] * dlw_dh[i]²      → reduce → F_α (Fisher info)
 //
-// After this kernel, use existing bpf_reduce_sum to accumulate into d_scalars[5].
-// Host reads d_scalars[5] every K ticks for Adam update.
+// Natural gradient step: Δα = η_k · g_α / F_α
+//   - Near optimum: F large (high curvature), g ≈ 0 → tiny steps
+//   - Away from optimum: g/F consistent → tracks
 //
-// ∂h/∂α = 1  (h = α + ρ·h_{t-1} + σ_z·ε), so g_α = Σ w̃_i · dlw_dh_i
+// dlw_dh = ∂log_w/∂h:
+//   Gaussian:  -0.5 + 0.5·η²         where η² = y_t²·exp(-h)
+//   Student-t: -0.5 + (ν+1)/2·η²/(ν+η²)
+//
+// ∂h/∂α = 1  (h = α + ρ·h_{t-1} + σ_z·ε), so the α-score = dlw_dh
 // =============================================================================
 
 .visible .entry bpf_grad_alpha(
-    .param .u64 param_scratch,
+    .param .u64 param_grad_scratch,
+    .param .u64 param_fisher_scratch,
     .param .u64 param_w,
     .param .u64 param_h,
     .param .f32 param_y_t,
@@ -1106,13 +1111,15 @@ SJ_EX:
 )
 {
     .reg .u32   %idx, %r_tid, %r_ctaid, %r_ntid, %r_n;
-    .reg .u64   %rd_scratch, %rd_w, %rd_h, %rd_off;
+    .reg .u64   %rd_grad, %rd_fish, %rd_w, %rd_h, %rd_off;
     .reg .f32   %f_yt, %f_nu, %f_h, %f_w;
     .reg .f32   %f_yt2, %f_neg_h, %f_exp_neg_h, %f_eta_sq;
-    .reg .f32   %f_nup1h, %f_denom, %f_ratio, %f_dlw, %f_out;
+    .reg .f32   %f_nup1h, %f_denom, %f_ratio, %f_dlw;
+    .reg .f32   %f_grad_val, %f_dlw2, %f_fish_val;
     .reg .pred  %p_bound, %p_t_obs;
 
-    ld.param.u64    %rd_scratch, [param_scratch];
+    ld.param.u64    %rd_grad,    [param_grad_scratch];
+    ld.param.u64    %rd_fish,    [param_fisher_scratch];
     ld.param.u64    %rd_w,       [param_w];
     ld.param.u64    %rd_h,       [param_h];
     ld.param.f32    %f_yt,       [param_y_t];
@@ -1129,7 +1136,7 @@ SJ_EX:
 
     // Load h[i] and w[i]
     mul.wide.u32    %rd_off, %idx, 4;
-    .reg .u64 %rd_h_addr, %rd_w_addr, %rd_s_addr;
+    .reg .u64 %rd_h_addr, %rd_w_addr, %rd_g_addr, %rd_f_addr;
     add.u64         %rd_h_addr, %rd_h, %rd_off;
     add.u64         %rd_w_addr, %rd_w, %rd_off;
     ld.global.f32   %f_h, [%rd_h_addr];
@@ -1159,13 +1166,17 @@ GA_T_OBS:
     fma.rn.f32      %f_dlw, %f_nup1h, %f_ratio, 0fBF000000; // -0.5 + nup1h * ratio
 
 GA_STORE:
-    // scratch[i] = w[i] * dlw_dh
-    mul.f32         %f_out, %f_w, %f_dlw;
-    add.u64         %rd_s_addr, %rd_scratch, %rd_off;
-    st.global.f32   [%rd_s_addr], %f_out;
+    // grad_scratch[i] = w[i] * dlw_dh
+    mul.f32         %f_grad_val, %f_w, %f_dlw;
+    add.u64         %rd_g_addr, %rd_grad, %rd_off;
+    st.global.f32   [%rd_g_addr], %f_grad_val;
+
+    // fisher_scratch[i] = w[i] * dlw_dh^2
+    mul.f32         %f_dlw2, %f_dlw, %f_dlw;
+    mul.f32         %f_fish_val, %f_w, %f_dlw2;
+    add.u64         %rd_f_addr, %rd_fish, %rd_off;
+    st.global.f32   [%rd_f_addr], %f_fish_val;
 
 GA_EXIT:
     ret;
 }
-
-

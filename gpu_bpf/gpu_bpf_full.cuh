@@ -111,15 +111,15 @@ typedef struct {
     unsigned long long host_rng_state;  /**< Host-side PCG32 for resampling U      */
     int       timestep;         /**< Current tick index                            */
 
-    // ── Online mu learning (kernel 14 + Adam) ──────────────────────────────
-    int       learn_mu;         /**< 0=off, 1=on                                   */
-    int       update_K;         /**< Adam step every K ticks (e.g. 50)             */
-    float     lr;               /**< Learning rate (e.g. 0.003)                    */
-    float     grad_clip;        /**< Gradient clipping norm (e.g. 1.0)             */
-    int       grad_count;       /**< Ticks since last Adam step                    */
-    float     m_alpha;          /**< Adam first moment                             */
-    float     v_alpha;          /**< Adam second moment                            */
-    int       adam_step;        /**< Adam step counter (for bias correction)       */
+    // ── Online mu learning (kernel 14: natural gradient + Robbins-Monro) ────
+    int       learn_mode;       /**< 0=off, 1=natural gradient, 2=robbins-monro   */
+    int       update_K;         /**< Accumulate K ticks between updates            */
+    float     grad_clip;        /**< Max |natural gradient| per step (0=no clip)   */
+    int       grad_count;       /**< Ticks since last update                       */
+    int       rm_step;          /**< Robbins-Monro step counter (resets on push)   */
+    float     rm_c;             /**< RM step: η = c / (step + t0)^gamma           */
+    float     rm_t0;            /**< RM offset (prevents huge initial steps)       */
+    float     rm_gamma;         /**< RM exponent (2/3 for nat grad, 1/2 vanilla)  */
 } GpuBpfState;
 
 /**
@@ -173,17 +173,26 @@ BpfResult gpu_bpf_get_result(GpuBpfState* state);
 // ── Online mu learning API ──────────────────────────────────────────────────
 
 /**
- * @brief Enable online mu learning via kernel 14 gradient + Adam.
+ * @brief Enable online mu learning via natural gradient + Robbins-Monro.
  *
- * Accumulates ∂loglik/∂alpha over K ticks, then applies one Adam step.
- * Adds 2 kernel launches per tick (~2-5% overhead), plus one sync every K ticks.
+ * Mode 1 (natural gradient): Δα = η_k · g_α / F_α
+ *   Fisher information F_α auto-scales steps: small near optimum, large when displaced.
+ *   Robbins-Monro schedule η_k = c/(k+t₀)^γ guarantees convergence.
  *
- * @param state      BPF instance
- * @param lr         Learning rate (recommend 0.001-0.01)
- * @param update_K   Gradient accumulation window (recommend 10-100)
- * @param grad_clip  Max gradient norm (0 = no clipping, recommend 1.0)
+ * Mode 2 (Robbins-Monro only): Δα = η_k · g_α
+ *   Vanilla gradient with decreasing step size. Simpler, no Fisher computation.
+ *
+ * Adds 2-3 kernel launches per tick. One sync every K ticks.
+ *
+ * @param state   BPF instance
+ * @param mode    1=natural gradient, 2=robbins-monro
+ * @param K       Gradient accumulation window (ticks between updates)
+ * @param c       RM step scale (recommend 0.1 for nat grad, 0.003 for vanilla)
+ * @param t0      RM offset (recommend 10)
+ * @param gamma   RM exponent (recommend 0.667 for nat grad, 0.5 for vanilla)
  */
-void gpu_bpf_enable_mu_learning(GpuBpfState* state, float lr, int update_K, float grad_clip);
+void gpu_bpf_enable_mu_learning(GpuBpfState* state, int mode, int K,
+                                 float c, float t0, float gamma);
 
 /** @brief Disable online mu learning. Mu stays at current value. */
 void gpu_bpf_disable_mu_learning(GpuBpfState* state);
