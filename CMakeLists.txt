@@ -185,28 +185,6 @@ set_target_properties(gpu_bpf PROPERTIES
 )
 
 # ==============================================================================
-# Library: gpu_bpf_ptx (HYBRID: PTX weight processing + cuRAND propagation)
-# ==============================================================================
-
-add_library(gpu_bpf_ptx STATIC gpu_bpf/gpu_bpf_ptx.cu)
-
-target_link_libraries(gpu_bpf_ptx PRIVATE
-    CUDA::cuda_driver
-    CUDA::cudart
-    CUDA::curand
-)
-
-target_include_directories(gpu_bpf_ptx PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/gpu_bpf
-    ${CUDAToolkit_INCLUDE_DIRS}
-)
-
-set_target_properties(gpu_bpf_ptx PROPERTIES
-    CUDA_SEPARABLE_COMPILATION OFF
-)
-
-# ==============================================================================
 # Library: gpu_bpf_ptx_full (100% PTX BPF + cuRAND chi2 pregeneration)
 #
 # 13 BPF kernels in hand-written PTX. PCG32 PRNG, ICDF normals.
@@ -254,32 +232,6 @@ target_include_directories(smc2_bpf PUBLIC
 set_target_properties(smc2_bpf PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF
 )
-
-# ==============================================================================
-# Target: bpf_ptx_demo (standalone PTX loader demo)
-# ==============================================================================
-
-add_executable(bpf_ptx_demo gpu_bpf/bpf_ptx_host.cu)
-
-target_link_libraries(bpf_ptx_demo PRIVATE
-    CUDA::cuda_driver
-    CUDA::cudart
-)
-
-target_include_directories(bpf_ptx_demo PRIVATE
-    ${CUDAToolkit_INCLUDE_DIRS}
-)
-
-set_target_properties(bpf_ptx_demo PROPERTIES
-    CUDA_SEPARABLE_COMPILATION OFF
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-)
-
-if(TARGET ptx_cubin)
-    add_dependencies(bpf_ptx_demo ptx_cubin)
-endif()
-
-
 
 # ==============================================================================
 # Target: test_mix_bands (band-based mixture proposal validation)
