@@ -16,6 +16,7 @@
  *  11.  bpf_compute_var
  *  12.  bpf_gen_noise
  *  13.  bpf_silverman_jitter
+ *  14.  bpf_grad_alpha         — [NEW] Online mu learning gradient
  *
  * PCG32 state: 16 bytes/particle (2 x u64) vs curandState ~48 bytes/particle.
  * Normal generation: ICDF (Acklam rational approx) — 1 uniform per normal.
@@ -100,6 +101,7 @@ typedef struct {
     CUfunction compute_var;
     CUfunction gen_noise;
     CUfunction silverman_jitter;
+    CUfunction grad_alpha;              // [NEW] kernel 14
 } PtxFunctions;
 
 static PtxFunctions g_ptx;
@@ -194,9 +196,10 @@ extract:
     cuModuleGetFunction(&g_ptx.compute_var,       g_ptx_module, "bpf_compute_var");
     cuModuleGetFunction(&g_ptx.gen_noise,         g_ptx_module, "bpf_gen_noise");
     cuModuleGetFunction(&g_ptx.silverman_jitter,  g_ptx_module, "bpf_silverman_jitter");
+    cuModuleGetFunction(&g_ptx.grad_alpha,        g_ptx_module, "bpf_grad_alpha");  // [NEW]
 
     g_ptx_loaded = 1;
-    fprintf(stderr, "[PTX-FULL] 13 kernels loaded\n");
+    fprintf(stderr, "[PTX-FULL] 14 kernels loaded\n");
 
     // Get constant memory symbol for band config
     cuModuleGetGlobal(&g_d_mix_config, &g_d_mix_config_size,
@@ -356,6 +359,16 @@ GpuBpfState* gpu_bpf_create(int n_particles, float rho, float sigma_z, float mu,
     s->last_h_est = mu;            // initial estimate for surprise score
     s->last_surprise = 0.0f;
 
+    // [NEW] Online mu learning — off by default
+    s->learn_mu   = 0;
+    s->update_K   = 50;
+    s->lr         = 0.003f;
+    s->grad_clip  = 1.0f;
+    s->grad_count = 0;
+    s->m_alpha    = 0.0f;
+    s->v_alpha    = 0.0f;
+    s->adam_step  = 0;
+
     cudaStreamCreate(&s->stream);
 
     cudaMalloc(&s->d_h,       n_particles * sizeof(float));
@@ -366,7 +379,8 @@ GpuBpfState* gpu_bpf_create(int n_particles, float rho, float sigma_z, float mu,
     cudaMalloc(&s->d_wh,      n_particles * sizeof(float));
     // PCG32: 2 x u64 per particle = 16 bytes each
     cudaMalloc(&s->d_rng,     n_particles * 2 * sizeof(uint64_t));
-    cudaMalloc(&s->d_scalars, 5 * sizeof(float));  // max_lw, sum_w, h_est, log_lik, sum_w_sq
+    // [CHANGED] 6 scalars: max_lw, sum_w, h_est, log_lik, sum_w_sq, grad_alpha
+    cudaMalloc(&s->d_scalars, 6 * sizeof(float));
     cudaMalloc(&s->d_noise,   n_particles * sizeof(float));
     cudaMalloc(&s->d_var,     sizeof(float));
     cudaMalloc(&s->d_log_w_prev, n_particles * sizeof(float));
@@ -442,6 +456,72 @@ void gpu_bpf_destroy(GpuBpfState* s) {
     if (s->d_chi2_normals) cudaFree(s->d_chi2_normals);
     if (s->curand_gen) curandDestroyGenerator((curandGenerator_t)s->curand_gen);
     free(s);
+}
+
+// =============================================================================
+// [NEW] Online mu learning — gradient + Adam
+// =============================================================================
+
+static void bpf_grad_and_adam(GpuBpfState* s, float y_t,
+                               CUdeviceptr dh, CUdeviceptr dw,
+                               CUdeviceptr dscal, CUdeviceptr dh2,
+                               int n, int g, int b, cudaStream_t st,
+                               size_t smem)
+{
+    if (!s->learn_mu) return;
+
+    // Kernel 14: scratch[i] = w[i] * dlw_dh[i]
+    // Reuse d_h2 as scratch — ESS done, resampling hasn't started yet
+    {
+        void* params[] = { &dh2, &dw, &dh, &y_t, &s->nu_obs, &n };
+        ptx_launch(g_ptx.grad_alpha, st, g, b, 0, params);
+    }
+
+    // Reduce scratch into d_scalars[5] (accumulates across ticks, NOT reset each tick)
+    {
+        CUdeviceptr ptr = dscal + 5 * sizeof(float);
+        void* p2[] = { &dh2, &ptr, &n };
+        ptx_launch(g_ptx.reduce_sum, st, g, b, smem, p2);
+    }
+
+    s->grad_count++;
+
+    // Adam update every K ticks
+    if (s->grad_count >= s->update_K) {
+        // Sync + read accumulated gradient from device
+        cudaStreamSynchronize(st);
+        float g_alpha;
+        cudaMemcpy(&g_alpha, s->d_scalars + 5, sizeof(float), cudaMemcpyDeviceToHost);
+
+        // Mean gradient over K ticks, negate (maximize ll → minimize loss)
+        float grad = -g_alpha / (float)s->grad_count;
+
+        // Clip
+        if (s->grad_clip > 0.0f) {
+            float ag = fabsf(grad);
+            if (ag > s->grad_clip)
+                grad *= s->grad_clip / ag;
+        }
+
+        // Adam
+        s->adam_step++;
+        float bc1 = 1.0f - powf(0.9f,   (float)s->adam_step);
+        float bc2 = 1.0f - powf(0.999f,  (float)s->adam_step);
+        s->m_alpha = 0.9f   * s->m_alpha + 0.1f   * grad;
+        s->v_alpha = 0.999f * s->v_alpha + 0.001f * grad * grad;
+        float alpha = s->mu * (1.0f - s->rho);
+        alpha -= s->lr * (s->m_alpha / bc1) / (sqrtf(s->v_alpha / bc2) + 1e-8f);
+
+        // alpha → mu, clamp
+        float mu_new = alpha / fmaxf(1.0f - s->rho, 1e-6f);
+        mu_new = fmaxf(fminf(mu_new, 2.0f), -5.0f);
+        s->mu = mu_new;
+
+        // Reset accumulator on device
+        float zero = 0.0f;
+        cudaMemcpy(s->d_scalars + 5, &zero, sizeof(float), cudaMemcpyHostToDevice);
+        s->grad_count = 0;
+    }
 }
 
 // =============================================================================
@@ -560,6 +640,11 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
         ptx_launch(g_ptx.reduce_sum, st, g, b, smem, p2);
     }
 
+    // ─── [NEW] Kernel 14: gradient + Adam ───
+    // Must be AFTER ESS (uses d_h2 as scratch, ESS is done)
+    // Must be BEFORE resampling (resampling overwrites d_h2)
+    bpf_grad_and_adam(s, y_t, dh, dw, dscal, dh2, n, g, b, st, smem);
+
     // ─── Conditional resampling decision ───
     bool do_resample = true;
     if (s->ess_threshold > 0.0f) {
@@ -655,6 +740,46 @@ BpfResult gpu_bpf_step(GpuBpfState* s, float y_t) {
     // Surprise uses current tick's h_est → 1-tick regime lag (was 2-tick)
     s->last_surprise = fabsf(y_t) * expf(-s->last_h_est * 0.5f);
     return r;
+}
+
+// =============================================================================
+// [NEW] Online mu learning API
+// =============================================================================
+
+void gpu_bpf_enable_mu_learning(GpuBpfState* s, float lr, int update_K, float grad_clip) {
+    s->learn_mu   = 1;
+    s->lr         = lr;
+    s->update_K   = update_K;
+    s->grad_clip  = grad_clip;
+    s->grad_count = 0;
+    s->m_alpha    = 0.0f;
+    s->v_alpha    = 0.0f;
+    s->adam_step  = 0;
+
+    // Zero the device accumulator
+    float zero = 0.0f;
+    cudaMemcpy(s->d_scalars + 5, &zero, sizeof(float), cudaMemcpyHostToDevice);
+}
+
+void gpu_bpf_disable_mu_learning(GpuBpfState* s) {
+    s->learn_mu = 0;
+}
+
+float gpu_bpf_get_mu(GpuBpfState* s) {
+    return s->mu;
+}
+
+// Called by SMC² when it pushes corrected params.
+// Resets Adam state so online learning starts fresh from new value.
+void gpu_bpf_set_mu(GpuBpfState* s, float mu) {
+    s->mu = mu;
+    s->m_alpha    = 0.0f;
+    s->v_alpha    = 0.0f;
+    s->adam_step  = 0;
+    s->grad_count = 0;
+
+    float zero = 0.0f;
+    cudaMemcpy(s->d_scalars + 5, &zero, sizeof(float), cudaMemcpyHostToDevice);
 }
 
 // =============================================================================

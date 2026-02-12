@@ -433,6 +433,33 @@ set_target_properties(test_smc2_bpf PROPERTIES
 )
 
 # ==============================================================================
+# Target: test_smc2_bpf (SMC² + BPF convergence tests)
+#
+# Simulates from known SV model, checks parameter recovery.
+# Tests: single window, multi-window, high-vol stress, CPMMH acceptance,
+#        ρ vs σ_z identifiability.
+# ==============================================================================
+
+add_executable(test_mu_learning smc2/test_mu_learning.cu)
+
+target_link_libraries(test_mu_learning PRIVATE
+    gpu_bpf_ptx_full
+    smc2_bpf
+    CUDA::cuda_driver
+    CUDA::cudart
+    CUDA::curand
+)
+
+target_include_directories(test_mu_learning PRIVATE ${CMAKE_SOURCE_DIR}/gpu_bpf)
+
+
+set_target_properties(test_mu_learning PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+
+# ==============================================================================
 # Print summary
 # ==============================================================================
 

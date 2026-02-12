@@ -1083,3 +1083,89 @@ SJ_EX:
     ret;
 }
 
+// Computes per-particle gradient contribution: scratch[i] = w[i] * dlw_dh[i]
+// where dlw_dh = ∂log_w/∂h = observation likelihood gradient
+//
+// For Student-t obs:  dlw_dh = -0.5 + (ν+1)/2 · η²/(ν+η²)
+// For Gaussian obs:   dlw_dh = -0.5 + 0.5 · η²
+// where η² = y_t² · exp(-h[i])
+//
+// After this kernel, use existing bpf_reduce_sum to accumulate into d_scalars[5].
+// Host reads d_scalars[5] every K ticks for Adam update.
+//
+// ∂h/∂α = 1  (h = α + ρ·h_{t-1} + σ_z·ε), so g_α = Σ w̃_i · dlw_dh_i
+// =============================================================================
+
+.visible .entry bpf_grad_alpha(
+    .param .u64 param_scratch,
+    .param .u64 param_w,
+    .param .u64 param_h,
+    .param .f32 param_y_t,
+    .param .f32 param_nu_obs,
+    .param .s32 param_n
+)
+{
+    .reg .u32   %idx, %r_tid, %r_ctaid, %r_ntid, %r_n;
+    .reg .u64   %rd_scratch, %rd_w, %rd_h, %rd_off;
+    .reg .f32   %f_yt, %f_nu, %f_h, %f_w;
+    .reg .f32   %f_yt2, %f_neg_h, %f_exp_neg_h, %f_eta_sq;
+    .reg .f32   %f_nup1h, %f_denom, %f_ratio, %f_dlw, %f_out;
+    .reg .pred  %p_bound, %p_t_obs;
+
+    ld.param.u64    %rd_scratch, [param_scratch];
+    ld.param.u64    %rd_w,       [param_w];
+    ld.param.u64    %rd_h,       [param_h];
+    ld.param.f32    %f_yt,       [param_y_t];
+    ld.param.f32    %f_nu,       [param_nu_obs];
+    ld.param.s32    %r_n,        [param_n];
+
+    mov.u32         %r_tid,   %tid.x;
+    mov.u32         %r_ctaid, %ctaid.x;
+    mov.u32         %r_ntid,  %ntid.x;
+    mad.lo.u32      %idx,     %r_ctaid, %r_ntid, %r_tid;
+
+    setp.ge.u32     %p_bound, %idx, %r_n;
+    @%p_bound bra   GA_EXIT;
+
+    // Load h[i] and w[i]
+    mul.wide.u32    %rd_off, %idx, 4;
+    .reg .u64 %rd_h_addr, %rd_w_addr, %rd_s_addr;
+    add.u64         %rd_h_addr, %rd_h, %rd_off;
+    add.u64         %rd_w_addr, %rd_w, %rd_off;
+    ld.global.f32   %f_h, [%rd_h_addr];
+    ld.global.f32   %f_w, [%rd_w_addr];
+
+    // eta_sq = y_t^2 * exp(-h)
+    mul.f32         %f_yt2, %f_yt, %f_yt;
+    neg.f32         %f_neg_h, %f_h;
+    mul.f32         %f_neg_h, %f_neg_h, 0f3FB8AA3B;      // * log2(e)
+    ex2.approx.f32  %f_exp_neg_h, %f_neg_h;               // exp(-h)
+    mul.f32         %f_eta_sq, %f_yt2, %f_exp_neg_h;
+
+    // Branch: Student-t vs Gaussian
+    setp.gt.f32     %p_t_obs, %f_nu, 0f00000000;
+    @%p_t_obs bra   GA_T_OBS;
+
+    // Gaussian: dlw_dh = -0.5 + 0.5 * eta_sq
+    fma.rn.f32      %f_dlw, %f_eta_sq, 0f3F000000, 0fBF000000;
+    bra             GA_STORE;
+
+GA_T_OBS:
+    // Student-t: dlw_dh = -0.5 + (nu+1)/2 * eta_sq / (nu + eta_sq)
+    add.f32         %f_nup1h, %f_nu, 0f3F800000;          // nu + 1
+    mul.f32         %f_nup1h, %f_nup1h, 0f3F000000;       // (nu+1)/2
+    add.f32         %f_denom, %f_nu, %f_eta_sq;            // nu + eta_sq
+    div.approx.f32  %f_ratio, %f_eta_sq, %f_denom;        // eta_sq / (nu + eta_sq)
+    fma.rn.f32      %f_dlw, %f_nup1h, %f_ratio, 0fBF000000; // -0.5 + nup1h * ratio
+
+GA_STORE:
+    // scratch[i] = w[i] * dlw_dh
+    mul.f32         %f_out, %f_w, %f_dlw;
+    add.u64         %rd_s_addr, %rd_scratch, %rd_off;
+    st.global.f32   [%rd_s_addr], %f_out;
+
+GA_EXIT:
+    ret;
+}
+
+

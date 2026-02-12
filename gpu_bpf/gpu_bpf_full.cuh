@@ -6,10 +6,8 @@
  *   - BPF: 14 hand-written PTX kernels, PCG32 PRNG (16 bytes/particle)
  *   - APF: nvcc-compiled kernels, cuRAND (48 bytes/particle)
  *
- * Kernel 14 (bpf_propagate_weight_opt) implements a mode-matched Gaussian
- * optimal proposal via 3 Newton iterations on log p(y|h) + log p(h|h_{t-1}).
- * Drop-in replacement for kernel 3 (bootstrap). Toggle at runtime with
- * gpu_bpf_use_optimal_proposal(1) before calling gpu_bpf_create().
+ * Kernel 14 (bpf_grad_alpha) computes per-particle observation likelihood
+ * gradient for online mu learning via Adam optimizer.
  *
  * Zero cuRAND dependency for BPF path. APF still requires cuRAND.
  *
@@ -77,7 +75,7 @@ typedef enum {
  *   - Conditional resampling (ESS threshold)
  *   - Adaptive sigma_z bands (calm/alert/panic regimes)
  *   - Optional Silverman kernel jittering post-resample
- *   - Bootstrap (kernel 3) or optimal (kernel 14) proposal
+ *   - Online mu learning via kernel 14 gradient + Adam optimizer
  */
 typedef struct {
     float*    d_h;              /**< Particle states h_t [N]                        */
@@ -87,7 +85,7 @@ typedef struct {
     float*    d_cdf;            /**< CDF for systematic resampling [N]              */
     float*    d_wh;             /**< Weight × state products [N]                    */
     uint64_t* d_rng;            /**< PCG32 state: 2×u64 per particle [2N]           */
-    float*    d_scalars;        /**< [5]: max_lw, sum_w, h_est, log_lik, sum_w_sq   */
+    float*    d_scalars;        /**< [6]: max_lw, sum_w, h_est, log_lik, sum_w_sq, grad_alpha */
     float*    d_noise;          /**< Standard normals for Silverman jitter [N]      */
     float*    d_var;            /**< Variance accumulator [1]                       */
     float*    d_log_w_prev;     /**< Saved log-weights for non-resample ticks [N]   */
@@ -112,14 +110,24 @@ typedef struct {
     float     last_surprise;    /**< Previous tick's surprise score                */
     unsigned long long host_rng_state;  /**< Host-side PCG32 for resampling U      */
     int       timestep;         /**< Current tick index                            */
+
+    // ── Online mu learning (kernel 14 + Adam) ──────────────────────────────
+    int       learn_mu;         /**< 0=off, 1=on                                   */
+    int       update_K;         /**< Adam step every K ticks (e.g. 50)             */
+    float     lr;               /**< Learning rate (e.g. 0.003)                    */
+    float     grad_clip;        /**< Gradient clipping norm (e.g. 1.0)             */
+    int       grad_count;       /**< Ticks since last Adam step                    */
+    float     m_alpha;          /**< Adam first moment                             */
+    float     v_alpha;          /**< Adam second moment                            */
+    int       adam_step;        /**< Adam step counter (for bias correction)       */
 } GpuBpfState;
 
 /**
  * @brief Create and initialize a BPF instance.
  *
  * Seeds PCG32 RNG, draws initial particles from stationary distribution
- * N(mu, sigma_z^2 / (1 - rho^2)). Uses whichever proposal kernel is
- * currently selected (bootstrap or optimal).
+ * N(mu, sigma_z^2 / (1 - rho^2)). Online mu learning is OFF by default;
+ * call gpu_bpf_enable_mu_learning() after creation to activate.
  *
  * @param n_particles  Number of particles (recommend power of 2)
  * @param rho          OU persistence (0 < rho < 1)
@@ -139,8 +147,8 @@ void gpu_bpf_destroy(GpuBpfState* state);
 /**
  * @brief Process one observation (synchronous).
  *
- * Propagates particles, computes weights, conditionally resamples,
- * and returns the posterior mean and marginal log-likelihood.
+ * Propagates particles, computes weights, optionally accumulates mu gradient,
+ * conditionally resamples, and returns the posterior mean and marginal log-likelihood.
  *
  * @param state  BPF instance
  * @param y_t    Observation (return) at time t
@@ -161,6 +169,38 @@ void gpu_bpf_step_async(GpuBpfState* state, float y_t);
  * @pre cudaStreamSynchronize(state->stream) must have completed.
  */
 BpfResult gpu_bpf_get_result(GpuBpfState* state);
+
+// ── Online mu learning API ──────────────────────────────────────────────────
+
+/**
+ * @brief Enable online mu learning via kernel 14 gradient + Adam.
+ *
+ * Accumulates ∂loglik/∂alpha over K ticks, then applies one Adam step.
+ * Adds 2 kernel launches per tick (~2-5% overhead), plus one sync every K ticks.
+ *
+ * @param state      BPF instance
+ * @param lr         Learning rate (recommend 0.001-0.01)
+ * @param update_K   Gradient accumulation window (recommend 10-100)
+ * @param grad_clip  Max gradient norm (0 = no clipping, recommend 1.0)
+ */
+void gpu_bpf_enable_mu_learning(GpuBpfState* state, float lr, int update_K, float grad_clip);
+
+/** @brief Disable online mu learning. Mu stays at current value. */
+void gpu_bpf_disable_mu_learning(GpuBpfState* state);
+
+/** @brief Get current mu value (may have been updated by online learning). */
+float gpu_bpf_get_mu(GpuBpfState* state);
+
+/**
+ * @brief Set mu from external source (e.g. SMC² parameter push).
+ *
+ * Resets Adam optimizer state so online learning starts fresh.
+ * Use when SMC²+RBPF pushes corrected parameters.
+ *
+ * @param state  BPF instance
+ * @param mu     New mu value
+ */
+void gpu_bpf_set_mu(GpuBpfState* state, float mu);
 
 // ── Adaptive band API ───────────────────────────────────────────────────────
 
@@ -216,28 +256,6 @@ void gpu_bpf_set_ess_threshold(GpuBpfState* state, float threshold);
 
 /** @brief Return cumulative number of ticks where resampling fired. */
 int gpu_bpf_get_resample_count(GpuBpfState* state);
-
-// ── Optimal proposal toggle ─────────────────────────────────────────────────
-
-/**
- * @brief Select proposal kernel for all subsequent BPF instances.
- *
- * Must be called BEFORE gpu_bpf_create(). Affects all BPF instances
- * created after this call (global setting).
- *
- *   - enable=0: kernel 3 (bootstrap) — blind OU proposal, obs-only weight
- *   - enable=1: kernel 14 (optimal)  — Newton mode-matched Gaussian proposal,
- *               importance-corrected weight
- *
- * If kernel 14 is not in the PTX file, silently falls back to bootstrap
- * and prints a warning to stderr.
- *
- * @param enable  0 = bootstrap, 1 = optimal
- */
-void gpu_bpf_use_optimal_proposal(int enable);
-
-/** @brief Query current proposal selection. @return 0 or 1. */
-int gpu_bpf_get_optimal_proposal(void);
 
 // ── Batch RMSE convenience ──────────────────────────────────────────────────
 

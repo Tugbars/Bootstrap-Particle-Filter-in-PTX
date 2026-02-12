@@ -147,8 +147,8 @@ static int test_single_window(void) {
     printf("  Data: |y|_max = %.3f, y_rms = %.3f\n", y_absmax, y_rms);
 
     /* Allocate learner */
-    int N_theta = 64;
-    int N_inner = 256;
+    int N_theta = 512;
+    int N_inner = 512;
     printf("  N_theta = %d, N_inner = %d, K_rejuv = 5\n", N_theta, N_inner);
 
     SMC2BPFState* s = smc2_bpf_alloc(N_theta, N_inner);
@@ -361,7 +361,7 @@ static int test_cpmmh_acceptance(void) {
     simulate_sv(&truth, y_true, h_true, T);
     for (int t = 0; t < T; t++) y_f[t] = (float)y_true[t];
 
-    SMC2BPFState* s = smc2_bpf_alloc(64, 256);
+    SMC2BPFState* s = smc2_bpf_alloc(512, 512);
     s->nu_obs = (float)truth.nu;
     smc2_bpf_set_seed(s, 77);
 
@@ -434,7 +434,7 @@ static int test_identifiability(void) {
         simulate_sv(&cases[c], y, h, T);
         for (int t = 0; t < T; t++) yf[t] = (float)y[t];
 
-        SMC2BPFState* s = smc2_bpf_alloc(64, 256);
+        SMC2BPFState* s = smc2_bpf_alloc(512, 256);
         s->nu_obs = 5.0f;
         s->prior.mean[0] = 0.90f;  s->prior.std[0] = 0.05f;
         s->prior.mean[1] = 0.15f;  s->prior.std[1] = 0.10f;
@@ -494,7 +494,7 @@ static void test_latency(void) {
     simulate_sv(&truth, y_true, h_true, T);
     for (int t = 0; t < T; t++) y_f[t] = (float)y_true[t];
 
-    int N_theta = 64;
+    int N_theta = 512;
     int n_inner_configs[] = {64, 128, 256, 512};
     int n_configs = 4;
 
@@ -581,7 +581,7 @@ static void test_latency(void) {
     /* Detailed per-tick histogram for default config (N_inner=256) */
     printf("\n  Per-tick latency distribution (N_inner=256, CUDA events per tick):\n");
     {
-        int N_inner = 256;
+        int N_inner = 512;
         int T_bench = 500;
         SMC2BPFState* s = smc2_bpf_alloc(N_theta, N_inner);
         s->nu_obs = (float)truth.nu;
