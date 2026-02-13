@@ -1,20 +1,20 @@
 // =============================================================================
-// STRESS TEST: Standard BPF vs Adaptive BPF
+// STRESS TEST: Standard BPF vs Adaptive BPF vs BPF+NatGrad
 //
 // Reuses the brutal DGP scenarios from test_stress_compare.cu:
-//   A: Spike Gauntlet (20σ→50σ)
+//   A: Spike Gauntlet (20sig→50sig)
 //   B: Regime Teleport (vol 3%→78%)
-//   C: Pure Chaos (random walk + 10% ±2 jumps)
-//   D: Crypto Meltdown (t(3) state+obs, 2x σ_z)
+//   C: Pure Chaos (random walk + 10% +-2 jumps)
+//   D: Crypto Meltdown (t(3) state+obs, 2x sig_z)
 //   E: Periodic Regimes (8 teleports, 1200 ticks)
 //   F: Sawtooth Ramp (4x ramp+crash cycles)
 //
 // Each scenario run with oracle → mild → moderate → severe → extreme misspec.
 //
-// Build: nvcc -O3 test_bpf_adaptive_stress.cu gpu_bpf.cu -o test_bpf_stress -lcurand
+// Build: nvcc -O3 test_bpf_adaptive_stress.cu gpu_bpf_ptx_full.cu -o test_bpf_stress -lcuda -lcurand
 // =============================================================================
 
-#include "gpu_bpf.cuh"
+#include "gpu_bpf_full.cuh"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -55,9 +55,9 @@ static inline float rand_t(unsigned int* seed, float nu) {
 struct SVDGPParams { float mu, rho, sigma; };
 
 static void gen_sv(std::vector<float>& ret, std::vector<float>& th,
-                   int n, float rho, float sigma_z, float mu,
-                   float nu_state, float nu_obs,
-                   float& h, unsigned int* seed) {
+                int n, float rho, float sigma_z, float mu,
+                float nu_state, float nu_obs,
+                float& h, unsigned int* seed) {
     for (int i = 0; i < n; i++) {
         float eps = (nu_state > 0) ? rand_t(seed, nu_state) : randn(seed);
         h = mu + rho * (h - mu) + sigma_z * eps;
@@ -68,12 +68,12 @@ static void gen_sv(std::vector<float>& ret, std::vector<float>& th,
 }
 
 static void gen_calm(std::vector<float>& ret, std::vector<float>& th,
-                     int n, const SVDGPParams& dgp, float& h, unsigned int* seed) {
+                    int n, const SVDGPParams& dgp, float& h, unsigned int* seed) {
     gen_sv(ret, th, n, dgp.rho, dgp.sigma, dgp.mu, 0.0f, 0.0f, h, seed);
 }
 
 static void gen_spike(std::vector<float>& ret, std::vector<float>& th,
-                      float h_jump, float& h, float mu, unsigned int* seed) {
+                    float h_jump, float& h, float mu, unsigned int* seed) {
     float elevated = mu + h_jump;
     if (h < elevated) h = elevated; else h += h_jump * 0.3f;
     th.push_back(h);
@@ -81,7 +81,7 @@ static void gen_spike(std::vector<float>& ret, std::vector<float>& th,
 }
 
 static void gen_recovery(std::vector<float>& ret, std::vector<float>& th,
-                         int n, const SVDGPParams& dgp, float& h, unsigned int* seed) {
+                        int n, const SVDGPParams& dgp, float& h, unsigned int* seed) {
     gen_calm(ret, th, n, dgp, h, seed);
 }
 
@@ -126,7 +126,7 @@ static ScenarioData make_regime_teleport(const SVDGPParams& dgp, unsigned int sv
     for (int r = 0; r < 4; r++) {
         h = mus[r];
         gen_sv(sc.returns, sc.true_h, 100, dgp.rho, dgp.sigma, mus[r],
-               0.0f, 0.0f, h, &seed);
+            0.0f, 0.0f, h, &seed);
     }
     gen_calm(sc.returns, sc.true_h, 200, dgp, h, &seed);
     return sc;
@@ -156,7 +156,7 @@ static ScenarioData make_crypto_meltdown(const SVDGPParams& dgp, unsigned int sv
     gen_calm(sc.returns, sc.true_h, 100, dgp, h, &seed);
     sc.spike_t = (int)sc.returns.size(); sc.spike_window = 200;
     gen_sv(sc.returns, sc.true_h, 150, dgp.rho, dgp.sigma * 2.0f, dgp.mu,
-           3.0f, 3.0f, h, &seed);
+        3.0f, 3.0f, h, &seed);
     gen_calm(sc.returns, sc.true_h, 250, dgp, h, &seed);
     return sc;
 }
@@ -169,7 +169,7 @@ static ScenarioData make_periodic_regimes(const SVDGPParams& dgp, unsigned int s
     for (int r = 0; r < 8; r++) {
         h = mus[r];
         gen_sv(sc.returns, sc.true_h, 150, dgp.rho, dgp.sigma, mus[r],
-               0.0f, 0.0f, h, &seed);
+            0.0f, 0.0f, h, &seed);
     }
     return sc;
 }
@@ -200,24 +200,33 @@ static ScenarioData make_sawtooth(const SVDGPParams& dgp, unsigned int sv) {
 
 struct Metrics {
     double rmse, spike_rmse, bias, max_err;
+    float final_mu, final_rho;
     bool had_nan;
 };
 
 // =============================================================================
-// Run BPF (standard or adaptive depending on setup before call)
+// Run mode
+// =============================================================================
+
+enum RunMode { MODE_STANDARD, MODE_ADAPTIVE, MODE_NATGRAD, MODE_COMBINED };
+
+// =============================================================================
+// Run BPF
 // =============================================================================
 
 static Metrics run_bpf(const ScenarioData& sc,
-                       float f_rho, float f_sigma_z, float f_mu,
-                       float nu_obs, int n_particles, int seed,
-                       bool adaptive) {
+                    float f_rho, float f_sigma_z, float f_mu,
+                    float nu_obs, int n_particles, int seed,
+                    RunMode mode) {
     Metrics m = {};
+    m.final_mu = f_mu;
+    m.final_rho = f_rho;
     int n = (int)sc.returns.size();
 
     GpuBpfState* state = gpu_bpf_create(n_particles, f_rho, f_sigma_z, f_mu,
-                                         0.0f, nu_obs, seed);
+                                        0.0f, nu_obs, seed);
 
-    if (adaptive) {
+    if (mode == MODE_ADAPTIVE || mode == MODE_COMBINED) {
         float cf[] = {0.99f, 0.01f};
         float cs[] = {1.0f,  4.0f};
         float af[] = {0.90f, 0.05f, 0.03f, 0.02f};
@@ -226,6 +235,11 @@ static Metrics run_bpf(const ScenarioData& sc,
         float ps[] = {1.0f,  2.0f,  5.0f,  12.0f};
         gpu_bpf_set_adaptive_bands(n_particles,
             cf, cs, 2, af, as, 4, pf, ps, 4, 2.0f, 4.0f);
+    }
+
+    if (mode == MODE_NATGRAD || mode == MODE_COMBINED) {
+        gpu_bpf_enable_mu_learning(state, 1, 50, 0.1f, 10.0f, 0.667f);
+        gpu_bpf_enable_rho_learning(state, 1);
     }
 
     int skip = 20;
@@ -247,6 +261,12 @@ static Metrics run_bpf(const ScenarioData& sc,
             }
         }
     }
+
+    if (mode == MODE_NATGRAD || mode == MODE_COMBINED) {
+        m.final_mu  = gpu_bpf_get_mu(state);
+        m.final_rho = gpu_bpf_get_rho(state);
+    }
+
     gpu_bpf_destroy(state);
 
     // Reset bands for next run
@@ -290,17 +310,18 @@ int main(int argc, char** argv) {
         {"Moderate",  0.90f, 0.10f, -3.5f},
         {"Severe",    0.80f, 0.05f, -3.0f},
         {"Extreme",   0.70f, 0.03f, -2.0f},
-        {"Wrong μ",   0.98f, 0.15f, -6.5f},
-        {"Wrong ρ",   0.80f, 0.15f, -4.5f},
-        {"Wrong σ_z", 0.98f, 0.02f, -4.5f},
+        {"Wrong mu",  0.98f, 0.15f, -6.5f},
+        {"Wrong rho", 0.80f, 0.15f, -4.5f},
+        {"Wrong sz",  0.98f, 0.02f, -4.5f},
     };
     int n_mc = 8;
 
-    printf("═══════════════════════════════════════════════════════════════════════════════\n");
-    printf("  Standard BPF vs Adaptive BPF — Stress Test\n");
-    printf("  Particles: %dK  ν_obs=%.0f  True DGP: ρ=%.2f σ_z=%.2f μ=%.1f\n",
-           N/1000, bnu, true_rho, true_sz, true_mu);
-    printf("═══════════════════════════════════════════════════════════════════════════════\n");
+    printf("\n");
+    printf("==========================================================================================================\n");
+    printf("  Standard BPF vs Adaptive BPF vs BPF+NatGrad  --  Stress Test\n");
+    printf("  Particles: %dK  nu_obs=%.0f  True DGP: rho=%.2f sigma_z=%.2f mu=%.1f\n",
+        N/1000, bnu, true_rho, true_sz, true_mu);
+    printf("==========================================================================================================\n");
 
     // Generate all scenarios once
     ScenarioData scenarios[] = {
@@ -314,68 +335,98 @@ int main(int argc, char** argv) {
     int n_sc = 6;
 
     // Accumulators
-    double std_rmse_sum = 0, adp_rmse_sum = 0;
-    double std_spike_sum = 0, adp_spike_sum = 0;
-    int std_wins = 0, adp_wins = 0, total = 0;
+    double std_rmse_sum = 0, adp_rmse_sum = 0, ng_rmse_sum = 0, cb_rmse_sum = 0;
+    double std_spike_sum = 0, adp_spike_sum = 0, ng_spike_sum = 0, cb_spike_sum = 0;
+    int std_wins = 0, adp_wins = 0, ng_wins = 0, cb_wins = 0, total = 0;
 
     for (int s = 0; s < n_sc; s++) {
-        printf("\n┌── %s (%d ticks) ", scenarios[s].name.c_str(),
-               (int)scenarios[s].returns.size());
-        for (int p = 0; p < (int)(60 - scenarios[s].name.size()); p++) printf("─");
-        printf("┐\n");
+        printf("\n  === %s (%d ticks) ",
+            scenarios[s].name.c_str(), (int)scenarios[s].returns.size());
+        for (int p = 0; p < (int)(55 - scenarios[s].name.size()); p++) printf("=");
+        printf("\n\n");
 
-        printf("│ %-12s │ %7s %7s │ %7s %7s │ %+7s %+7s │ %6s %6s │ %s\n",
-               "Misspec", "Std", "Adapt", "SpStd", "SpAdp",
-               "bStd", "bAdp", "mxStd", "mxAdp", "Δ RMSE");
-        printf("│ ──────────── │ ─────── ─────── │ ─────── ─────── │ ─────── ─────── │ ────── ────── │ ──────\n");
+        printf("  %-12s | %8s %8s %8s %8s | %8s %8s %8s %8s | Best\n",
+            "Misspec", "Std", "Adapt", "NatGrad", "Combo",
+            "SpStd", "SpAdp", "SpNG", "SpCb");
+        printf("  ------------ | -------- -------- -------- -------- | -------- -------- -------- -------- | -----\n");
 
         for (int m = 0; m < n_mc; m++) {
             Metrics std_m = run_bpf(scenarios[s], mc[m].rho, mc[m].sigma_z, mc[m].mu,
-                                     bnu, N, seed, false);
+                                    bnu, N, seed, MODE_STANDARD);
             Metrics adp_m = run_bpf(scenarios[s], mc[m].rho, mc[m].sigma_z, mc[m].mu,
-                                     bnu, N, seed, true);
+                                    bnu, N, seed, MODE_ADAPTIVE);
+            Metrics ng_m  = run_bpf(scenarios[s], mc[m].rho, mc[m].sigma_z, mc[m].mu,
+                                    bnu, N, seed, MODE_NATGRAD);
+            Metrics cb_m  = run_bpf(scenarios[s], mc[m].rho, mc[m].sigma_z, mc[m].mu,
+                                    bnu, N, seed, MODE_COMBINED);
 
-            const char* winner = "";
-            if (!std_m.had_nan && !adp_m.had_nan) {
-                if (adp_m.rmse < std_m.rmse) { winner = "←"; adp_wins++; }
-                else { winner = "→"; std_wins++; }
+            // Determine winner
+            const char* winner = "???";
+            if (!std_m.had_nan && !adp_m.had_nan && !ng_m.had_nan && !cb_m.had_nan) {
+                double best = std_m.rmse;
+                winner = "Std";
+                if (adp_m.rmse < best) { best = adp_m.rmse; winner = "Adp"; }
+                if (ng_m.rmse  < best) { best = ng_m.rmse;  winner = "NG"; }
+                if (cb_m.rmse  < best) { best = cb_m.rmse;  winner = "Combo"; }
+
+                if (strcmp(winner, "Std") == 0) std_wins++;
+                else if (strcmp(winner, "Adp") == 0) adp_wins++;
+                else if (strcmp(winner, "NG") == 0) ng_wins++;
+                else cb_wins++;
             }
 
-            double pct = (!std_m.had_nan && !adp_m.had_nan && std_m.rmse > 0)
-                ? 100.0 * (adp_m.rmse / std_m.rmse - 1.0) : 0.0;
+            printf("  %-12s | %8.4f %8.4f %8.4f %8.4f | %8.4f %8.4f %8.4f %8.4f | %s",
+                mc[m].label,
+                std_m.had_nan ? 0.0 : std_m.rmse,
+                adp_m.had_nan ? 0.0 : adp_m.rmse,
+                ng_m.had_nan  ? 0.0 : ng_m.rmse,
+                cb_m.had_nan  ? 0.0 : cb_m.rmse,
+                std_m.had_nan ? 0.0 : std_m.spike_rmse,
+                adp_m.had_nan ? 0.0 : adp_m.spike_rmse,
+                ng_m.had_nan  ? 0.0 : ng_m.spike_rmse,
+                cb_m.had_nan  ? 0.0 : cb_m.spike_rmse,
+                winner);
 
-            printf("│ %-12s │ %7.4f %7.4f │ %7.4f %7.4f │ %+7.3f %+7.3f │ %6.2f %6.2f │ %+5.1f%% %s\n",
-                   mc[m].label,
-                   std_m.had_nan ? 0.0 : std_m.rmse,
-                   adp_m.had_nan ? 0.0 : adp_m.rmse,
-                   std_m.had_nan ? 0.0 : std_m.spike_rmse,
-                   adp_m.had_nan ? 0.0 : adp_m.spike_rmse,
-                   std_m.had_nan ? 0.0 : std_m.bias,
-                   adp_m.had_nan ? 0.0 : adp_m.bias,
-                   std_m.had_nan ? 0.0 : std_m.max_err,
-                   adp_m.had_nan ? 0.0 : adp_m.max_err,
-                   pct, winner);
+            // Show combined final params when misspec is non-oracle
+            if (m > 0 && !cb_m.had_nan) {
+                printf("  mu:%.2f rho:%.3f", cb_m.final_mu, cb_m.final_rho);
+            }
+            printf("\n");
 
             if (!std_m.had_nan) { std_rmse_sum += std_m.rmse; std_spike_sum += std_m.spike_rmse; }
             if (!adp_m.had_nan) { adp_rmse_sum += adp_m.rmse; adp_spike_sum += adp_m.spike_rmse; }
+            if (!ng_m.had_nan)  { ng_rmse_sum  += ng_m.rmse;  ng_spike_sum  += ng_m.spike_rmse;  }
+            if (!cb_m.had_nan)  { cb_rmse_sum  += cb_m.rmse;  cb_spike_sum  += cb_m.spike_rmse;  }
             total++;
         }
     }
 
     // Grand summary
-    printf("\n═══════════════════════════════════════════════════════════════════════════════\n");
-    printf("  GRAND SUMMARY (%d scenarios × %d misspec configs = %d runs)\n",
-           n_sc, n_mc, total);
-    printf("  ─────────────────────────────────────────────\n");
-    printf("  %-20s %10s %10s\n",                   "", "Standard", "Adaptive");
-    printf("  %-20s %10.4f %10.4f  (%+.1f%%)\n", "Avg RMSE",
-           std_rmse_sum/total, adp_rmse_sum/total,
-           100.0*(adp_rmse_sum/std_rmse_sum - 1.0));
-    printf("  %-20s %10.4f %10.4f  (%+.1f%%)\n", "Avg Spike RMSE",
-           std_spike_sum/total, adp_spike_sum/total,
-           100.0*(adp_spike_sum/std_spike_sum - 1.0));
-    printf("  %-20s %10d %10d\n", "Wins", std_wins, adp_wins);
-    printf("═══════════════════════════════════════════════════════════════════════════════\n");
+    printf("\n");
+    printf("==========================================================================================================\n");
+    printf("  GRAND SUMMARY (%d scenarios x %d misspec = %d runs)\n", n_sc, n_mc, total);
+    printf("----------------------------------------------------------------------------------------------------------\n");
+    printf("  %-20s %12s %12s %12s %12s\n",     "", "Standard", "Adaptive", "NatGrad", "Combined");
+    printf("  %-20s %12.4f %12.4f %12.4f %12.4f\n", "Avg RMSE",
+        std_rmse_sum/total, adp_rmse_sum/total, ng_rmse_sum/total, cb_rmse_sum/total);
+    printf("  %-20s %12.4f %12.4f %12.4f %12.4f\n", "Avg Spike RMSE",
+        std_spike_sum/total, adp_spike_sum/total, ng_spike_sum/total, cb_spike_sum/total);
+    printf("  %-20s %12d %12d %12d %12d\n", "Wins",
+        std_wins, adp_wins, ng_wins, cb_wins);
+
+    // Pairwise deltas
+    printf("----------------------------------------------------------------------------------------------------------\n");
+    printf("  Combined vs Standard:  %+.1f%% avg RMSE\n",
+        100.0 * (cb_rmse_sum / std_rmse_sum - 1.0));
+    printf("  Combined vs Adaptive:  %+.1f%% avg RMSE\n",
+        100.0 * (cb_rmse_sum / adp_rmse_sum - 1.0));
+    printf("  Combined vs NatGrad:   %+.1f%% avg RMSE\n",
+        100.0 * (cb_rmse_sum / ng_rmse_sum - 1.0));
+    printf("  NatGrad vs Standard:   %+.1f%% avg RMSE\n",
+        100.0 * (ng_rmse_sum / std_rmse_sum - 1.0));
+    printf("  Adaptive vs Standard:  %+.1f%% avg RMSE\n",
+        100.0 * (adp_rmse_sum / std_rmse_sum - 1.0));
+    printf("==========================================================================================================\n\n");
 
     return 0;
 }

@@ -2,10 +2,10 @@
  * @file gpu_bpf_ptx_full.cu
  * @brief GPU BPF — 100% hand-written PTX, zero cuRAND for BPF
  *
- * All 13 BPF kernels from bpf_kernels_full.ptx:
+ * BPF kernels from bpf_kernels_full.ptx:
  *   1.  bpf_init_rng          — PCG32 seeding
  *   2.  bpf_init_particles    — Draw N(mu, sigma_stat^2) via ICDF
- *   3.  bpf_propagate_weight  — OU + Student-t + obs weight (fused)
+ *   3.  bpf_propagate_weight  — OU + Student-t + obs weight (bootstrap)
  *   4.  bpf_set_scalar
  *   5.  bpf_reduce_max
  *   6.  bpf_reduce_sum
@@ -16,14 +16,15 @@
  *  11.  bpf_compute_var
  *  12.  bpf_gen_noise
  *  13.  bpf_silverman_jitter
+ *  14.  bpf_grad_alpha         — [FUSED] Online mu/rho learning: compute + reduce + atomicAdd
  *
  * PCG32 state: 16 bytes/particle (2 x u64) vs curandState ~48 bytes/particle.
  * Normal generation: ICDF (Acklam rational approx) — 1 uniform per normal.
  *
- * APF/IMM still nvcc + cuRAND.
+ * APF still nvcc + cuRAND.
  *
  * Build:
- *   nvcc -O3 test_bpf_matched_dgp.cu gpu_bpf_ptx_full.cu -o test_bpf_full -lcuda -lcurand
+ *   nvcc -O3 gpu_bpf_ptx_full.cu -o test -lcuda -lcurand
  *
  * Runtime: needs bpf_kernels_full.cubin or bpf_kernels_full.ptx in cwd
  */
@@ -81,7 +82,7 @@ __global__ void bpf_accumulate_lw_k(float* __restrict__ log_w,
 }
 
 // =============================================================================
-// PTX Module — 13 kernels
+// PTX Module — 14 kernels
 // =============================================================================
 
 static CUmodule g_ptx_module = NULL;
@@ -100,6 +101,7 @@ typedef struct {
     CUfunction compute_var;
     CUfunction gen_noise;
     CUfunction silverman_jitter;
+    CUfunction grad_alpha;              // [NEW] kernel 14
 } PtxFunctions;
 
 static PtxFunctions g_ptx;
@@ -120,8 +122,8 @@ static void ensure_ptx_loaded() {
     if (g_ptx_loaded) return;
     cudaFree(0);
 
-    const char* cubin_paths[] = { "bpf_kernels_full.cubin", NULL };
-    const char* ptx_paths[]   = { "bpf_kernels_full.ptx", NULL };
+    const char* cubin_paths[] = { "bpf_kernels_full.cubin", "bpf_kernels.cubin", NULL };
+    const char* ptx_paths[]   = { "bpf_kernels_full.ptx", "bpf_kernels.ptx", NULL };
 
     for (int i = 0; cubin_paths[i]; i++) {
         FILE* f = fopen(cubin_paths[i], "rb");
@@ -194,9 +196,10 @@ extract:
     cuModuleGetFunction(&g_ptx.compute_var,       g_ptx_module, "bpf_compute_var");
     cuModuleGetFunction(&g_ptx.gen_noise,         g_ptx_module, "bpf_gen_noise");
     cuModuleGetFunction(&g_ptx.silverman_jitter,  g_ptx_module, "bpf_silverman_jitter");
+    cuModuleGetFunction(&g_ptx.grad_alpha,        g_ptx_module, "bpf_grad_alpha");  // [NEW]
 
     g_ptx_loaded = 1;
-    fprintf(stderr, "[PTX-FULL] All 13 kernels loaded\n");
+    fprintf(stderr, "[PTX-FULL] 14 kernels loaded\n");
 
     // Get constant memory symbol for band config
     cuModuleGetGlobal(&g_d_mix_config, &g_d_mix_config_size,
@@ -356,6 +359,17 @@ GpuBpfState* gpu_bpf_create(int n_particles, float rho, float sigma_z, float mu,
     s->last_h_est = mu;            // initial estimate for surprise score
     s->last_surprise = 0.0f;
 
+    // [NEW] Online mu learning — off by default
+    s->learn_mode = 0;
+    s->learn_rho  = 0;
+    s->update_K   = 50;
+    s->grad_clip  = 5.0f;
+    s->grad_count = 0;
+    s->rm_step    = 0;
+    s->rm_c       = 0.1f;
+    s->rm_t0      = 10.0f;
+    s->rm_gamma   = 0.667f;
+
     cudaStreamCreate(&s->stream);
 
     cudaMalloc(&s->d_h,       n_particles * sizeof(float));
@@ -366,10 +380,13 @@ GpuBpfState* gpu_bpf_create(int n_particles, float rho, float sigma_z, float mu,
     cudaMalloc(&s->d_wh,      n_particles * sizeof(float));
     // PCG32: 2 x u64 per particle = 16 bytes each
     cudaMalloc(&s->d_rng,     n_particles * 2 * sizeof(uint64_t));
-    cudaMalloc(&s->d_scalars, 5 * sizeof(float));  // max_lw, sum_w, h_est, log_lik, sum_w_sq
+    // [CHANGED] 9 scalars: max_lw, sum_w, h_est, log_lik, sum_w_sq,
+    //                      grad_mu, fisher_mu, grad_rho, fisher_rho
+    cudaMalloc(&s->d_scalars, 9 * sizeof(float));
     cudaMalloc(&s->d_noise,   n_particles * sizeof(float));
     cudaMalloc(&s->d_var,     sizeof(float));
     cudaMalloc(&s->d_log_w_prev, n_particles * sizeof(float));
+    cudaMalloc(&s->d_h_prev,  n_particles * sizeof(float));
 
     // Chi2 pre-generation for Student-t state noise
     s->nu_int = (nu_state > 0.0f) ? (int)(nu_state + 0.5f) : 0;
@@ -438,6 +455,7 @@ void gpu_bpf_destroy(GpuBpfState* s) {
     cudaFree(s->d_noise);
     cudaFree(s->d_var);
     cudaFree(s->d_log_w_prev);
+    cudaFree(s->d_h_prev);
     if (s->d_chi2) cudaFree(s->d_chi2);
     if (s->d_chi2_normals) cudaFree(s->d_chi2_normals);
     if (s->curand_gen) curandDestroyGenerator((curandGenerator_t)s->curand_gen);
@@ -445,7 +463,88 @@ void gpu_bpf_destroy(GpuBpfState* s) {
 }
 
 // =============================================================================
-// gpu_bpf_step_async — ALL PTX (13 kernels)
+// [NEW] Online mu/rho learning — natural gradient + Robbins-Monro
+// =============================================================================
+
+static void bpf_grad_and_update(GpuBpfState* s, float y_t,
+                                 CUdeviceptr dh, CUdeviceptr dw,
+                                 CUdeviceptr dscal,
+                                 CUdeviceptr d_h_prev,
+                                 int n, int g, int b, cudaStream_t st)
+{
+    if (!s->learn_mode) return;
+
+    // Fused kernel 14: compute + warp reduce + atomicAdd to scalars[5..8]
+    // Single launch replaces: old kernel14 + 4× reduce_sum
+    {
+        size_t grad_smem = 4 * (b / 32) * sizeof(float);  // 4 values × nwarps
+        void* params[] = { &dscal, &dw, &dh, &d_h_prev,
+                           &y_t, &s->nu_obs, &s->mu, &n };
+        ptx_launch(g_ptx.grad_alpha, st, g, b, grad_smem, params);
+    }
+
+    s->grad_count++;
+
+    // Update every K ticks
+    if (s->grad_count >= s->update_K) {
+        cudaStreamSynchronize(st);
+
+        float sums[4];  // [grad_mu, fisher_mu, grad_rho, fisher_rho]
+        cudaMemcpy(sums, s->d_scalars + 5, 4 * sizeof(float), cudaMemcpyDeviceToHost);
+
+        // Robbins-Monro step size: η = c / (step + t0)^gamma
+        s->rm_step++;
+        float eta = s->rm_c / powf((float)s->rm_step + s->rm_t0, s->rm_gamma);
+
+        float K_f = (float)s->grad_count;
+        float K_inv = 1.0f / K_f;
+
+        // ── μ update (natural gradient: score / Fisher, SNR-gated) ──
+        {
+            float mean_g = sums[0] * K_inv;
+            float mean_f = sums[1] * K_inv;
+            float dir = mean_g / fmaxf(mean_f, 1e-8f);
+
+            if (s->grad_clip > 0.0f && fabsf(dir) > s->grad_clip)
+                dir *= s->grad_clip / fabsf(dir);
+
+            // Soft SNR gate: snr = |mean_g| / sqrt(mean_f / K)
+            // Under correct params: mean_g ~ N(0, F/K) → snr ~ |N(0,1)|
+            // Gate ramps 0→1 over snr 0→snr_ref (2.0 ≈ 95% confidence)
+            float snr_mu = fabsf(mean_g) / fmaxf(sqrtf(mean_f / K_f), 1e-10f);
+            float gate_mu = fminf(snr_mu / 2.0f, 1.0f);
+
+            float alpha = s->mu * (1.0f - s->rho);
+            alpha += eta * gate_mu * dir;
+            float mu_new = alpha / fmaxf(1.0f - s->rho, 1e-6f);
+            s->mu = fmaxf(fminf(mu_new, 2.0f), -5.0f);
+        }
+
+        // ── ρ update (natural gradient: score / Fisher, SNR-gated) ──
+        if (s->learn_rho) {
+            float mean_g = sums[2] * K_inv;
+            float mean_f = sums[3] * K_inv;
+            float dir = mean_g / fmaxf(mean_f, 1e-8f);
+
+            if (s->grad_clip > 0.0f && fabsf(dir) > s->grad_clip)
+                dir *= s->grad_clip / fabsf(dir);
+
+            float snr_rho = fabsf(mean_g) / fmaxf(sqrtf(mean_f / K_f), 1e-10f);
+            float gate_rho = fminf(snr_rho / 2.0f, 1.0f);
+
+            float rho_new = s->rho + eta * gate_rho * dir;
+            s->rho = fmaxf(fminf(rho_new, 0.999f), 0.001f);
+        }
+
+        // Reset all 4 accumulators
+        float zeros[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        cudaMemcpy(s->d_scalars + 5, zeros, 4 * sizeof(float), cudaMemcpyHostToDevice);
+        s->grad_count = 0;
+    }
+}
+
+// =============================================================================
+// gpu_bpf_step_async — ALL PTX (14 kernels)
 // =============================================================================
 
 void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
@@ -466,7 +565,13 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
     CUdeviceptr dnoise= (CUdeviceptr)(uintptr_t)s->d_noise;
     CUdeviceptr dvar  = (CUdeviceptr)(uintptr_t)s->d_var;
 
-    // 1. Generate chi2 variates if Student-t state noise
+    // 1. Save h_{t-1} for ρ gradient (must be before propagation overwrites d_h)
+    if (s->learn_mode && s->timestep > 0) {
+        cudaMemcpyAsync(s->d_h_prev, s->d_h,
+                         n * sizeof(float), cudaMemcpyDeviceToDevice, st);
+    }
+
+    // 1b. Generate chi2 variates if Student-t state noise
     CUdeviceptr dchi2 = (CUdeviceptr)(uintptr_t)s->d_chi2;
     if (s->nu_int > 0 && s->timestep > 0) {
         curandGenerator_t gen = (curandGenerator_t)s->curand_gen;
@@ -482,7 +587,7 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
         mix_maybe_switch_regime(s->last_surprise);
     }
 
-    // 2. Propagate + weight (PTX: fused PCG32 + ICDF + OU + obs weight)
+    // 2. Propagate + weight (kernel 3: OU proposal, obs log-likelihood)
     {
         int do_prop = (s->timestep > 0) ? 1 : 0;
         void* params[] = {
@@ -558,6 +663,14 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
         ptx_launch(g_ptx.set_scalar, st, 1, 1, 0, p1);
         void* p2[] = { &dh2, &ptr, &n };
         ptx_launch(g_ptx.reduce_sum, st, g, b, smem, p2);
+    }
+
+    // ─── [FUSED] Kernel 14: gradient compute + reduce + atomicAdd ───
+    // No scratch buffers needed — fused kernel reduces in-register via warp shuffles
+    {
+        CUdeviceptr d_hp = (CUdeviceptr)(uintptr_t)s->d_h_prev;
+        bpf_grad_and_update(s, y_t, dh, dw, dscal, d_hp,
+                            n, g, b, st);
     }
 
     // ─── Conditional resampling decision ───
@@ -655,6 +768,63 @@ BpfResult gpu_bpf_step(GpuBpfState* s, float y_t) {
     // Surprise uses current tick's h_est → 1-tick regime lag (was 2-tick)
     s->last_surprise = fabsf(y_t) * expf(-s->last_h_est * 0.5f);
     return r;
+}
+
+// =============================================================================
+// [NEW] Online mu/rho learning API — natural gradient + Robbins-Monro
+// =============================================================================
+
+void gpu_bpf_enable_mu_learning(GpuBpfState* s, int mode, int K,
+                                 float c, float t0, float gamma) {
+    s->learn_mode = mode;   // 1=natural gradient
+    s->update_K   = K;
+    s->grad_clip  = 5.0f;
+    s->grad_count = 0;
+    s->rm_step    = 0;
+    s->rm_c       = c;
+    s->rm_t0      = t0;
+    s->rm_gamma   = gamma;
+
+    // Zero all 4 device accumulators
+    float zeros[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    cudaMemcpy(s->d_scalars + 5, zeros, 4 * sizeof(float), cudaMemcpyHostToDevice);
+}
+
+void gpu_bpf_disable_mu_learning(GpuBpfState* s) {
+    s->learn_mode = 0;
+    s->learn_rho  = 0;
+}
+
+void gpu_bpf_enable_rho_learning(GpuBpfState* s, int enable) {
+    s->learn_rho = enable;
+}
+
+float gpu_bpf_get_mu(GpuBpfState* s) {
+    return s->mu;
+}
+
+float gpu_bpf_get_rho(GpuBpfState* s) {
+    return s->rho;
+}
+
+// Called by SMC² when it pushes corrected params.
+// Resets Robbins-Monro counter so step sizes restart fresh.
+void gpu_bpf_set_mu(GpuBpfState* s, float mu) {
+    s->mu = mu;
+    s->rm_step    = 0;
+    s->grad_count = 0;
+
+    float zeros[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    cudaMemcpy(s->d_scalars + 5, zeros, 4 * sizeof(float), cudaMemcpyHostToDevice);
+}
+
+void gpu_bpf_set_rho(GpuBpfState* s, float rho) {
+    s->rho = fmaxf(fminf(rho, 0.999f), 0.001f);
+    s->rm_step    = 0;
+    s->grad_count = 0;
+
+    float zeros[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    cudaMemcpy(s->d_scalars + 5, zeros, 4 * sizeof(float), cudaMemcpyHostToDevice);
 }
 
 // =============================================================================
@@ -1017,111 +1187,4 @@ double gpu_apf_run_rmse(
     }
     gpu_apf_destroy(st);
     return sqrt(sse / (double)count);
-}
-
-// =============================================================================
-// IMM (uses gpu_bpf_* which is now full PTX for BPF)
-// =============================================================================
-
-static double log_sum_exp(const double* x, int n) {
-    double mx = -1e30;
-    for (int i = 0; i < n; i++) if (x[i] > mx) mx = x[i];
-    double s = 0.0;
-    for (int i = 0; i < n; i++) s += exp(x[i] - mx);
-    return mx + log(s);
-}
-
-GpuImmState* gpu_imm_create(
-    const ImmModelParams* models, int n_models, int n_particles_per_model,
-    const float* transition_matrix, int seed
-) {
-    if (n_models > IMM_MAX_MODELS) {
-        fprintf(stderr, "IMM: n_models=%d > max=%d\n", n_models, IMM_MAX_MODELS);
-        return NULL;
-    }
-    GpuImmState* s = (GpuImmState*)calloc(1, sizeof(GpuImmState));
-    s->n_models = n_models;
-    s->n_particles_per_model = n_particles_per_model;
-    s->timestep = 0;
-    s->filters = (GpuBpfState**)malloc(n_models * sizeof(GpuBpfState*));
-    for (int k = 0; k < n_models; k++)
-        s->filters[k] = gpu_bpf_create(n_particles_per_model,
-            models[k].rho, models[k].sigma_z, models[k].mu,
-            models[k].nu_state, models[k].nu_obs, seed + k * 7919);
-    s->log_pi = (double*)malloc(n_models * sizeof(double));
-    s->log_pi_pred = (double*)malloc(n_models * sizeof(double));
-    double log_u = -log((double)n_models);
-    for (int k = 0; k < n_models; k++) s->log_pi[k] = log_u;
-    s->log_T = (double*)malloc(n_models * n_models * sizeof(double));
-    if (transition_matrix) {
-        for (int i = 0; i < n_models * n_models; i++)
-            s->log_T[i] = log(fmax((double)transition_matrix[i], 1e-30));
-    } else {
-        double p_stay = 0.95, p_sw = (n_models > 1) ? (1.0 - p_stay) / (n_models - 1) : 0.0;
-        for (int i = 0; i < n_models; i++)
-            for (int j = 0; j < n_models; j++)
-                s->log_T[i * n_models + j] = log(fmax((i == j) ? p_stay : p_sw, 1e-30));
-    }
-    return s;
-}
-
-void gpu_imm_destroy(GpuImmState* s) {
-    if (!s) return;
-    for (int k = 0; k < s->n_models; k++) gpu_bpf_destroy(s->filters[k]);
-    free(s->filters); free(s->log_pi); free(s->log_pi_pred); free(s->log_T); free(s);
-}
-
-ImmResult gpu_imm_step(GpuImmState* s, float y_t) {
-    int K = s->n_models;
-    for (int k = 0; k < K; k++) {
-        double terms[IMM_MAX_MODELS];
-        for (int j = 0; j < K; j++) terms[j] = s->log_T[j * K + k] + s->log_pi[j];
-        s->log_pi_pred[k] = log_sum_exp(terms, K);
-    }
-    for (int k = 0; k < K; k++) gpu_bpf_step_async(s->filters[k], y_t);
-    cudaDeviceSynchronize();
-    double log_liks[IMM_MAX_MODELS]; float h_ests[IMM_MAX_MODELS];
-    for (int k = 0; k < K; k++) {
-        BpfResult r = gpu_bpf_get_result(s->filters[k]);
-        h_ests[k] = r.h_mean; log_liks[k] = (double)r.log_lik;
-    }
-    double log_joint[IMM_MAX_MODELS];
-    for (int k = 0; k < K; k++) log_joint[k] = s->log_pi_pred[k] + log_liks[k];
-    double log_Z = log_sum_exp(log_joint, K);
-    for (int k = 0; k < K; k++) s->log_pi[k] = log_joint[k] - log_Z;
-    double h_mixed = 0.0; int best_k = 0; double best_lp = -1e30;
-    for (int k = 0; k < K; k++) {
-        h_mixed += exp(s->log_pi[k]) * (double)h_ests[k];
-        if (s->log_pi[k] > best_lp) { best_lp = s->log_pi[k]; best_k = k; }
-    }
-    s->timestep++;
-    ImmResult r;
-    r.h_mean = (float)h_mixed; r.vol = expf((float)h_mixed * 0.5f);
-    r.log_lik = (float)log_Z; r.best_model = best_k; r.best_prob = (float)exp(best_lp);
-    return r;
-}
-
-float gpu_imm_get_prob(const GpuImmState* s, int k) {
-    return (k >= 0 && k < s->n_models) ? (float)exp(s->log_pi[k]) : 0.0f;
-}
-void gpu_imm_get_probs(const GpuImmState* s, float* out) {
-    for (int k = 0; k < s->n_models; k++) out[k] = (float)exp(s->log_pi[k]);
-}
-
-ImmModelParams* gpu_imm_build_grid(
-    const float* rhos, int n_rho, const float* sigma_zs, int n_sigma,
-    const float* mus, int n_mu, float nu_state, float nu_obs, int* out_n
-) {
-    int total = n_rho * n_sigma * n_mu;
-    ImmModelParams* g = (ImmModelParams*)malloc(total * sizeof(ImmModelParams));
-    int idx = 0;
-    for (int r = 0; r < n_rho; r++)
-        for (int s = 0; s < n_sigma; s++)
-            for (int m = 0; m < n_mu; m++) {
-                g[idx].rho = rhos[r]; g[idx].sigma_z = sigma_zs[s];
-                g[idx].mu = mus[m]; g[idx].nu_state = nu_state;
-                g[idx].nu_obs = nu_obs; idx++;
-            }
-    *out_n = total;
-    return g;
 }

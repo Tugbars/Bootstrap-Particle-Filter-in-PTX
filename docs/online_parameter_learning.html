@@ -1,0 +1,1312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Online Parameter Learning — Natural Gradient in the Particle Filter</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500&family=Outfit:wght@300;400;500;600;700;800&display=swap');
+
+  :root {
+    --bg: #0a0e17;
+    --bg-card: #0f1520;
+    --bg-card-alt: #111927;
+    --bg-code: #0c1018;
+    --border: #1a2235;
+    --border-glow: #1e3a5f;
+    --text: #c8d6e5;
+    --text-dim: #6b7d95;
+    --text-bright: #e8f0f8;
+    --cyan: #4ecdc4;
+    --cyan-dim: #2a7a74;
+    --cyan-glow: rgba(78, 205, 196, 0.15);
+    --blue: #5b8def;
+    --orange: #f0a35e;
+    --red: #e74c6f;
+    --green: #5ee6a0;
+    --purple: #a78bfa;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Outfit', sans-serif;
+    font-weight: 300;
+    line-height: 1.7;
+    overflow-x: hidden;
+  }
+
+  .page {
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 60px 32px 120px;
+  }
+
+  /* ── Typography ── */
+  h1 {
+    font-size: 2.6rem;
+    font-weight: 800;
+    color: var(--text-bright);
+    letter-spacing: -0.03em;
+    line-height: 1.15;
+    margin-bottom: 24px;
+  }
+  h1 .accent { color: var(--cyan); }
+
+  h2 {
+    font-size: 1.6rem;
+    font-weight: 700;
+    color: var(--text-bright);
+    margin-top: 72px;
+    margin-bottom: 20px;
+    letter-spacing: -0.02em;
+  }
+
+  h3 {
+    font-size: 1.15rem;
+    font-weight: 600;
+    color: var(--cyan);
+    margin-top: 40px;
+    margin-bottom: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 0.85rem;
+  }
+
+  p { margin-bottom: 18px; font-size: 1.05rem; }
+  strong { color: var(--text-bright); font-weight: 500; }
+
+  .lead {
+    font-size: 1.15rem;
+    color: var(--text-dim);
+    line-height: 1.8;
+    margin-bottom: 40px;
+    max-width: 720px;
+  }
+
+  /* ── Cards ── */
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 32px;
+    margin: 24px 0;
+  }
+  .card.glow {
+    border-color: var(--border-glow);
+    box-shadow: 0 0 40px var(--cyan-glow), inset 0 1px 0 rgba(78,205,196,0.05);
+  }
+
+  .math-block {
+    background: var(--bg-code);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 24px 28px;
+    margin: 20px 0;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.92rem;
+    font-weight: 400;
+    line-height: 2;
+    overflow-x: auto;
+    color: var(--text);
+  }
+  .math-block .comment {
+    color: var(--text-dim);
+    font-style: italic;
+  }
+  .math-block .var { color: var(--cyan); }
+  .math-block .op { color: var(--orange); }
+  .math-block .func { color: var(--blue); }
+  .math-block .note { color: var(--purple); }
+
+  /* ── Pipeline ── */
+  .pipeline {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin: 28px 0;
+    justify-content: center;
+  }
+  .pipe-box {
+    padding: 10px 18px;
+    border-radius: 8px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.82rem;
+    font-weight: 500;
+    white-space: nowrap;
+    border: 1px solid var(--border);
+    background: var(--bg-card);
+    color: var(--text);
+    transition: all 0.3s;
+  }
+  .pipe-box.active {
+    border-color: var(--cyan-dim);
+    background: rgba(78, 205, 196, 0.08);
+    color: var(--cyan);
+  }
+  .pipe-box.new {
+    border-color: var(--orange);
+    background: rgba(240, 163, 94, 0.08);
+    color: var(--orange);
+    animation: pulse-orange 3s ease-in-out infinite;
+  }
+  @keyframes pulse-orange {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(240,163,94,0); }
+    50% { box-shadow: 0 0 16px 2px rgba(240,163,94,0.15); }
+  }
+  .pipe-arrow {
+    color: var(--text-dim);
+    font-size: 0.9rem;
+    user-select: none;
+  }
+
+  /* ── Animated Visualizations ── */
+  .viz-container {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    margin: 28px 0;
+  }
+  .viz-container canvas {
+    display: block;
+    width: 100%;
+  }
+  .viz-caption {
+    padding: 16px 24px;
+    font-size: 0.88rem;
+    color: var(--text-dim);
+    text-align: center;
+    border-top: 1px solid var(--border);
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  /* ── Comparison table ── */
+  .comp-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin: 24px 0;
+  }
+  .comp-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 24px;
+  }
+  .comp-card.winner {
+    border-color: var(--cyan-dim);
+    box-shadow: 0 0 20px var(--cyan-glow);
+  }
+  .comp-card h4 {
+    font-size: 0.95rem;
+    font-weight: 600;
+    margin-bottom: 12px;
+    color: var(--text-bright);
+  }
+  .comp-card.winner h4 { color: var(--cyan); }
+  .comp-card ul {
+    list-style: none;
+    padding: 0;
+  }
+  .comp-card li {
+    font-size: 0.9rem;
+    padding: 4px 0;
+    color: var(--text-dim);
+  }
+  .comp-card li::before {
+    content: '›';
+    color: var(--text-dim);
+    margin-right: 8px;
+  }
+  .comp-card.winner li::before {
+    color: var(--cyan);
+    content: '✓';
+  }
+
+  /* ── Results bar chart ── */
+  .bar-chart {
+    margin: 24px 0;
+  }
+  .bar-row {
+    display: flex;
+    align-items: center;
+    margin: 8px 0;
+    gap: 12px;
+  }
+  .bar-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    width: 100px;
+    text-align: right;
+    flex-shrink: 0;
+  }
+  .bar-track {
+    flex: 1;
+    height: 28px;
+    background: var(--bg-code);
+    border-radius: 6px;
+    overflow: hidden;
+    position: relative;
+  }
+  .bar-fill {
+    height: 100%;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    padding-left: 12px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.75rem;
+    font-weight: 500;
+    color: var(--bg);
+    transition: width 1.5s cubic-bezier(0.22, 1, 0.36, 1);
+    width: 0;
+  }
+  .bar-fill.vanilla { background: linear-gradient(90deg, #3a4a6b, #5b6d8e); color: var(--text); }
+  .bar-fill.natgrad { background: linear-gradient(90deg, var(--cyan-dim), var(--cyan)); }
+  .bar-fill.both { background: linear-gradient(90deg, #2a7a54, var(--green)); }
+
+  /* ── Separator ── */
+  .sep {
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--border-glow), transparent);
+    margin: 56px 0;
+  }
+
+  /* ── Scroll animations ── */
+  .reveal {
+    opacity: 0;
+    transform: translateY(24px);
+    transition: opacity 0.7s ease, transform 0.7s ease;
+  }
+  .reveal.visible {
+    opacity: 1;
+    transform: translateY(0);
+  }
+
+  /* ── Inline highlights ── */
+  .hl { color: var(--cyan); font-weight: 400; }
+  .hl-o { color: var(--orange); font-weight: 400; }
+  .hl-b { color: var(--blue); font-weight: 400; }
+  .hl-g { color: var(--green); font-weight: 400; }
+  .hl-r { color: var(--red); font-weight: 400; }
+
+  code {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.88em;
+    background: var(--bg-code);
+    padding: 2px 7px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    color: var(--cyan);
+  }
+
+  /* ── Responsive ── */
+  @media (max-width: 640px) {
+    .page { padding: 32px 18px 80px; }
+    h1 { font-size: 1.8rem; }
+    h2 { font-size: 1.3rem; }
+    .comp-grid { grid-template-columns: 1fr; }
+    .pipeline { gap: 6px; }
+    .pipe-box { padding: 8px 12px; font-size: 0.75rem; }
+  }
+</style>
+</head>
+<body>
+
+<div class="page">
+
+  <!-- ═══════════════ HEADER ═══════════════ -->
+  <div class="reveal">
+    <h1>Online Parameter Learning<br>via <span class="accent">Natural Gradient</span></h1>
+    <p class="lead">
+      The particle filter tracks the hidden state h<sub>t</sub> — but it treats model parameters
+      (μ, ρ) as fixed constants. When the market shifts and those parameters become stale, the filter
+      degrades. We fix this by computing the <strong>Fisher-normalized score</strong> directly from
+      the particle cloud, every tick, at zero meaningful cost.
+    </p>
+  </div>
+
+  <!-- ═══════════════ THE PROBLEM ═══════════════ -->
+  <div class="reveal">
+    <h2>The Problem</h2>
+    <p>
+      In the stochastic volatility model, the OU process has a <strong>long-run mean</strong>
+      <span class="hl">μ</span> and a <strong>persistence</strong> <span class="hl">ρ</span>
+      that govern how log-volatility evolves:
+    </p>
+
+    <div class="math-block">
+      <span class="comment">// State evolution — OU process</span><br>
+      <span class="var">h_t</span> = <span class="var">μ</span> + <span class="var">ρ</span>(<span class="var">h</span><sub>t-1</sub> - <span class="var">μ</span>) + <span class="var">σ_z</span> · <span class="var">ε_t</span><br><br>
+      <span class="comment">// Equivalently, with α = μ(1-ρ):</span><br>
+      <span class="var">h_t</span> = <span class="var">α</span> + <span class="var">ρ</span> · <span class="var">h</span><sub>t-1</sub> + <span class="var">σ_z</span> · <span class="var">ε_t</span>
+    </div>
+
+    <p>
+      A batch estimator (SMC²) learns these parameters, but it operates on a sliding window and
+      needs hundreds of ticks to reconverge after a regime change. During that gap —
+      the <span class="hl-r">R-hat blackout</span> — the BPF runs on stale parameters.
+    </p>
+    <p>
+      The question: can we adjust <span class="hl">μ</span> and <span class="hl">ρ</span> <em>inside</em>
+      the particle filter, every tick, using information already available in the particle cloud?
+    </p>
+  </div>
+
+  <!-- ═══════════════ THE SCORE ═══════════════ -->
+  <div class="sep"></div>
+
+  <div class="reveal">
+    <h2>The Score Is Already There</h2>
+    <p>
+      Each particle <em>i</em> carries a weight based on how well it explains the observation y<sub>t</sub>.
+      The <strong>score</strong> — the gradient of the log-likelihood with respect to a parameter —
+      tells us which direction to move that parameter to increase the likelihood.
+    </p>
+    <p>
+      For the observation model y<sub>t</sub> = exp(h<sub>t</sub>/2) · η<sub>t</sub>, the log-weight
+      depends on h<sub>t</sub>. The derivative of the log-weight with respect to h is:
+    </p>
+
+    <div class="math-block">
+      <span class="comment">// Score function: how log-weight changes with h</span><br><br>
+      <span class="func">Gaussian obs:</span>  <span class="var">∂log w</span> / <span class="var">∂h</span> = -½ + ½ · <span class="var">η²</span><br>
+      <span class="func">Student-t obs:</span> <span class="var">∂log w</span> / <span class="var">∂h</span> = -½ + <span class="op">(ν+1)/2</span> · <span class="var">η²</span> / (<span class="var">ν</span> + <span class="var">η²</span>)<br><br>
+      <span class="note">where η² = y_t² · exp(-h_t)</span>
+    </div>
+
+    <p>
+      Now apply the chain rule. Since h<sub>t</sub> = α + ρ · h<sub>t-1</sub> + σ<sub>z</sub> · ε:
+    </p>
+
+    <div class="math-block">
+      <span class="comment">// Chain rule gives us gradients for both parameters</span><br><br>
+      <span class="var">∂h</span> / <span class="var">∂α</span> = <span class="op">1</span>              <span class="note">→ score for μ: just the score itself</span><br>
+      <span class="var">∂h</span> / <span class="var">∂ρ</span> = <span class="var">h</span><sub>t-1</sub> - <span class="var">μ</span>   <span class="note">→ score for ρ: score × displacement from mean</span>
+    </div>
+
+    <p>
+      The <strong>weighted score</strong> across the particle cloud is a Monte Carlo estimate of the
+      true score of the marginal likelihood. No approximation beyond finite N.
+    </p>
+  </div>
+
+  <!-- ═══════════════ FISHER VIZ ═══════════════ -->
+  <div class="sep"></div>
+
+  <div class="reveal">
+    <h2>Fisher Information: The Curvature Map</h2>
+    <p>
+      The score tells you the <em>direction</em>. The <strong>Fisher information</strong> tells you
+      the <em>curvature</em> — how much information the data carries about each parameter at the
+      current operating point.
+    </p>
+
+    <div class="viz-container">
+      <canvas id="fisherViz" height="320"></canvas>
+      <div class="viz-caption">
+        Fisher information controls step size. Near the optimum (high curvature), steps shrink automatically.
+        Away from optimum (low curvature), steps are larger. No learning rate needed.
+      </div>
+    </div>
+
+    <div class="math-block">
+      <span class="comment">// Fisher information — estimated from the same particles</span><br><br>
+      <span class="var">F_μ</span>  = <span class="op">Σ</span> <span class="var">w̃_i</span> · (<span class="var">∂log w</span> / <span class="var">∂h</span>)<sub>i</sub>²<br>
+      <span class="var">F_ρ</span>  = <span class="op">Σ</span> <span class="var">w̃_i</span> · (<span class="var">∂log w</span> / <span class="var">∂h</span>)<sub>i</sub>² · (<span class="var">h</span><sub>t-1</sub><sup>i</sup> - <span class="var">μ</span>)²
+    </div>
+
+    <p>
+      The <strong>natural gradient</strong> is the score divided by the Fisher information.
+      This is the <em>steepest ascent direction in the space of probability distributions</em>,
+      not in Euclidean parameter space. It accounts for the geometry of the statistical manifold.
+    </p>
+
+    <div class="math-block">
+      <span class="comment">// Natural gradient step for each parameter</span><br><br>
+      <span class="var">Δμ</span> = <span class="var">η_k</span> · <span class="var">g_μ</span> / <span class="var">F_μ</span>     <span class="note">← Fisher-normalized: self-regulating</span><br>
+      <span class="var">Δρ</span> = <span class="var">η_k</span> · <span class="var">g_ρ</span> / <span class="var">F_ρ</span>
+    </div>
+  </div>
+
+  <!-- ═══════════════ ROBBINS-MONRO ═══════════════ -->
+  <div class="sep"></div>
+
+  <div class="reveal">
+    <h2>Robbins-Monro: Guaranteed Convergence</h2>
+    <p>
+      The step size <span class="hl-o">η<sub>k</sub></span> follows the
+      <strong>Robbins-Monro</strong> stochastic approximation schedule — a 1951 result that
+      guarantees convergence to the optimum under mild conditions:
+    </p>
+
+    <div class="math-block">
+      <span class="var">η_k</span> = <span class="var">c</span> / (<span class="var">k</span> + <span class="var">t₀</span>)<sup class="op">γ</sup><br><br>
+      <span class="comment">// Requirements for convergence:</span><br>
+      <span class="op">Σ η_k = ∞</span>    <span class="note">← can reach any point</span><br>
+      <span class="op">Σ η_k² < ∞</span>   <span class="note">← noise averages out</span><br><br>
+      <span class="comment">// Optimal rate for natural gradient: γ = 2/3</span><br>
+      <span class="comment">// Reset k → 0 when SMC² pushes new parameters</span>
+    </div>
+
+    <p>
+      Combined with the Fisher normalization, this gives a <strong>doubly self-regulating</strong>
+      system. Near the optimum, the score <span class="hl">g</span> averages to zero (particles
+      are balanced), and the step size <span class="hl-o">η</span> is shrinking. Away from the
+      optimum, the score is large and consistent, and the Fisher normalizes the scale. When SMC²
+      pushes a correction, the counter resets, allowing fast initial adaptation.
+    </p>
+  </div>
+
+  <!-- ═══════════════ PIPELINE DIAGRAM ═══════════════ -->
+  <div class="sep"></div>
+
+  <div class="reveal">
+    <h2>The Per-Tick Pipeline</h2>
+    <p>
+      The gradient computation slots into the existing filter pipeline between the ESS check
+      and resampling — exactly where the normalized weights are available and the scratch
+      buffers are free.
+    </p>
+
+    <h3>Standard BPF Pipeline</h3>
+    <div class="pipeline">
+      <div class="pipe-box active">Propagate</div>
+      <span class="pipe-arrow">→</span>
+      <div class="pipe-box active">Weight</div>
+      <span class="pipe-arrow">→</span>
+      <div class="pipe-box active">Normalize</div>
+      <span class="pipe-arrow">→</span>
+      <div class="pipe-box active">h_est</div>
+      <span class="pipe-arrow">→</span>
+      <div class="pipe-box active">ESS check</div>
+      <span class="pipe-arrow">→</span>
+      <div class="pipe-box active">Resample?</div>
+    </div>
+
+    <h3>With Online Learning</h3>
+    <div class="pipeline">
+      <div class="pipe-box">Save h<sub>prev</sub></div>
+      <span class="pipe-arrow">→</span>
+      <div class="pipe-box active">Propagate</div>
+      <span class="pipe-arrow">→</span>
+      <div class="pipe-box active">Weight</div>
+      <span class="pipe-arrow">→</span>
+      <div class="pipe-box active">Normalize</div>
+      <span class="pipe-arrow">→</span>
+      <div class="pipe-box active">h_est</div>
+      <span class="pipe-arrow">→</span>
+      <div class="pipe-box active">ESS</div>
+      <span class="pipe-arrow">→</span>
+      <div class="pipe-box new">Score + Fisher</div>
+      <span class="pipe-arrow">→</span>
+      <div class="pipe-box active">Resample?</div>
+    </div>
+
+    <p style="margin-top: 16px;">
+      Every <strong>K</strong> ticks (e.g. 50), the accumulated score and Fisher are read back and
+      the natural gradient step is applied. Between updates, only the per-particle multiply-and-store
+      runs — one lightweight pass over the particle array.
+    </p>
+  </div>
+
+  <!-- ═══════════════ SCORE + FISHER ANIMATION ═══════════════ -->
+  <div class="sep"></div>
+
+  <div class="reveal">
+    <h2>Four Quantities, One Pass</h2>
+    <p>
+      For each particle, the gradient kernel reads the weight <span class="hl">w<sub>i</sub></span>,
+      the current state <span class="hl">h<sub>t</sub><sup>i</sup></span>, and the previous state
+      <span class="hl">h<sub>t-1</sub><sup>i</sup></span>, then writes four values:
+    </p>
+
+    <div class="viz-container">
+      <canvas id="fourQuantViz" height="340"></canvas>
+      <div class="viz-caption">
+        Each particle contributes to all four gradient accumulators. Reduction sums them into scalar estimates.
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px;">
+        <div>
+          <div style="color:var(--cyan); font-weight:600; font-size:0.85rem; margin-bottom:8px;">μ GRADIENT</div>
+          <div style="font-family:'JetBrains Mono',monospace; font-size:0.85rem; color:var(--text-dim);">
+            g<sub>μ</sub> = Σ w̃<sub>i</sub> · ∂logw/∂h
+          </div>
+          <div style="font-size:0.85rem; color:var(--text-dim); margin-top:6px;">
+            Direction to move μ
+          </div>
+        </div>
+        <div>
+          <div style="color:var(--orange); font-weight:600; font-size:0.85rem; margin-bottom:8px;">μ FISHER</div>
+          <div style="font-family:'JetBrains Mono',monospace; font-size:0.85rem; color:var(--text-dim);">
+            F<sub>μ</sub> = Σ w̃<sub>i</sub> · (∂logw/∂h)²
+          </div>
+          <div style="font-size:0.85rem; color:var(--text-dim); margin-top:6px;">
+            Curvature — how much to step
+          </div>
+        </div>
+        <div>
+          <div style="color:var(--blue); font-weight:600; font-size:0.85rem; margin-bottom:8px;">ρ GRADIENT</div>
+          <div style="font-family:'JetBrains Mono',monospace; font-size:0.85rem; color:var(--text-dim);">
+            g<sub>ρ</sub> = Σ w̃<sub>i</sub> · ∂logw/∂h · (h<sub>t-1</sub> − μ)
+          </div>
+          <div style="font-size:0.85rem; color:var(--text-dim); margin-top:6px;">
+            Direction to move ρ
+          </div>
+        </div>
+        <div>
+          <div style="color:var(--purple); font-weight:600; font-size:0.85rem; margin-bottom:8px;">ρ FISHER</div>
+          <div style="font-family:'JetBrains Mono',monospace; font-size:0.85rem; color:var(--text-dim);">
+            F<sub>ρ</sub> = Σ w̃<sub>i</sub> · (∂logw/∂h)² · (h<sub>t-1</sub> − μ)²
+          </div>
+          <div style="font-size:0.85rem; color:var(--text-dim); margin-top:6px;">
+            Curvature — disentangles from μ
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════ TRACKING ANIMATION ═══════════════ -->
+  <div class="sep"></div>
+
+  <div class="reveal">
+    <h2>Tracking a Regime Change</h2>
+    <p>
+      When the true μ shifts from <span class="hl">-1.0</span> to <span class="hl">-2.5</span>,
+      the vanilla BPF (fixed parameters) accumulates tracking error. The natural gradient learner
+      detects the mismatch from the particle weights and corrects μ within a few hundred ticks.
+    </p>
+
+    <div class="viz-container">
+      <canvas id="trackingViz" height="360"></canvas>
+      <div class="viz-caption">
+        μ regime change at t=2500. Vanilla BPF (grey) stays at -1.0. Natural gradient (cyan) tracks to -2.5.
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════ WHY IT WORKS ═══════════════ -->
+  <div class="sep"></div>
+
+  <div class="reveal">
+    <h2>Why It Self-Regulates</h2>
+
+    <div class="card glow">
+      <h3 style="margin-top:0;">When parameters are correct</h3>
+      <p style="margin-bottom:0;">
+        The particles are well-calibrated. Half see η² &gt; 1 (positive score), half see η² &lt; 1
+        (negative score). The weighted sum <span class="hl">g<sub>μ</sub> ≈ 0</span>. But the Fisher
+        <span class="hl-o">F<sub>μ</sub></span> stays positive — it's the <em>variance</em> of the
+        score, not the mean. So g/F ≈ 0/positive ≈ 0. Meanwhile, the Robbins-Monro step
+        <span class="hl-o">η<sub>k</sub></span> is shrinking. Result: <strong>the system barely moves</strong>.
+        In testing, RMSE degrades by less than 1%.
+      </p>
+    </div>
+
+    <div class="card glow">
+      <h3 style="margin-top:0;">When parameters are stale</h3>
+      <p style="margin-bottom:0;">
+        If μ is too high, all particles produce h values that are systematically too high.
+        Observations look surprisingly large relative to exp(h/2). The score
+        <span class="hl">g<sub>μ</sub></span> becomes consistently negative — "decrease μ".
+        The Fisher normalizes the scale so the step is proportional to the parameter-space geometry,
+        not an arbitrary learning rate. The Robbins-Monro counter was reset by the last SMC² push,
+        so early steps are large. Result: <strong>fast, principled correction</strong>.
+      </p>
+    </div>
+  </div>
+
+  <!-- ═══════════════ RESULTS ═══════════════ -->
+  <div class="sep"></div>
+
+  <div class="reveal">
+    <h2>Empirical Results</h2>
+
+    <h3>μ regime change — Phase 2 RMSE (10 seeds)</h3>
+    <p>DGP: μ = -1.0 → -2.5 at midpoint.  Both start at μ = -1.0.</p>
+
+    <div class="bar-chart">
+      <div class="bar-row">
+        <div class="bar-label">Vanilla</div>
+        <div class="bar-track">
+          <div class="bar-fill vanilla" data-width="78" style="width:0%">0.587</div>
+        </div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-label">Nat. Grad</div>
+        <div class="bar-track">
+          <div class="bar-fill natgrad" data-width="63" style="width:0%">0.470</div>
+        </div>
+      </div>
+    </div>
+    <p style="font-size:0.9rem; color:var(--text-dim);">
+      Natural gradient wins <strong style="color:var(--cyan);">10 out of 10</strong> seeds.
+      Mean improvement: <strong style="color:var(--cyan);">20%</strong>.
+    </p>
+
+    <h3>ρ regime change — Phase 2 RMSE (10 seeds)</h3>
+    <p>DGP: ρ = 0.98 → 0.90 at midpoint. μ = -1.0 constant.</p>
+
+    <div class="bar-chart">
+      <div class="bar-row">
+        <div class="bar-label">Vanilla</div>
+        <div class="bar-track">
+          <div class="bar-fill vanilla" data-width="76" style="width:0%">0.382</div>
+        </div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-label">μ only</div>
+        <div class="bar-track">
+          <div class="bar-fill vanilla" data-width="77" style="width:0%">0.387</div>
+        </div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-label">μ + ρ</div>
+        <div class="bar-track">
+          <div class="bar-fill both" data-width="69" style="width:0%">0.347</div>
+        </div>
+      </div>
+    </div>
+    <p style="font-size:0.9rem; color:var(--text-dim);">
+      Joint μ+ρ wins <strong style="color:var(--green);">10 out of 10</strong>.
+      Learning μ alone on a ρ shift makes things <em>worse</em> — it absorbs the misspecification.
+      The Fisher matrix disentangles them.
+    </p>
+
+    <h3>No regime change — do no harm</h3>
+    <p>
+      DGP: μ = -1.0 constant. Both start with correct parameters. Mean RMSE increase with learning
+      enabled: <strong style="color:var(--text-dim);">+0.005</strong> (~1%). The Robbins-Monro decay
+      and Fisher normalization prevent drift when the filter is already well-calibrated.
+    </p>
+  </div>
+
+  <!-- ═══════════════ VS SVGD ═══════════════ -->
+  <div class="sep"></div>
+
+  <div class="reveal">
+    <h2>Relationship to Stein Variational Methods</h2>
+    <p>
+      Stein Variational Gradient Descent (SVGD) transports particles toward a target distribution
+      by combining the score with a repulsive kernel. It solves the full nonparametric transport
+      problem — but at the cost of an RKHS projection that introduces irreducible bias.
+    </p>
+
+    <div class="comp-grid">
+      <div class="comp-card">
+        <h4>SVGD</h4>
+        <ul>
+          <li>O(N²) kernel evaluations</li>
+          <li>Bandwidth selection required</li>
+          <li>RKHS projection → bias</li>
+          <li>Score + transport in one mechanism</li>
+          <li>Variance underestimation</li>
+        </ul>
+      </div>
+      <div class="comp-card winner">
+        <h4>Natural Gradient in PF</h4>
+        <ul>
+          <li>O(N) weighted sum</li>
+          <li>No kernel, no bandwidth</li>
+          <li>Unbiased Monte Carlo score</li>
+          <li>PF handles states, gradient handles params</li>
+          <li>Exact Fisher from particle weights</li>
+        </ul>
+      </div>
+    </div>
+
+    <p>
+      The particle filter cleanly separates the problem: particles handle the
+      <strong>infinite-dimensional</strong> object (posterior over h<sub>t</sub>), while the natural
+      gradient handles the <strong>finite-dimensional</strong> object (θ = {μ, ρ}). Each tool does
+      what it's best at. SVGD tries to do both with one mechanism and gets bias on both.
+    </p>
+    <p>
+      The particle cloud gives unbiased score estimates for free. Moving θ along the Fisher-normalized
+      direction is the theoretically optimal parametric transport on the statistical manifold —
+      the same thing Stein transport approximates through an RKHS kernel, but computed exactly
+      at O(N) cost.
+    </p>
+  </div>
+
+  <!-- ═══════════════ ARCHITECTURE ═══════════════ -->
+  <div class="sep"></div>
+
+  <div class="reveal">
+    <h2>Role in the Full Architecture</h2>
+    <p>
+      Online learning doesn't replace batch estimation. It <strong>bridges the gap</strong>
+      between SMC² updates — especially during regime changes when the batch estimator's
+      R-hat diagnostic signals non-convergence and blocks parameter pushes.
+    </p>
+
+    <div class="viz-container">
+      <canvas id="archViz" height="260"></canvas>
+      <div class="viz-caption">
+        During R-hat blackout (red), online learning is the only thing adapting the BPF.
+        When SMC² reconverges, it pushes corrected params and resets the RM counter.
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="font-family:'JetBrains Mono',monospace; font-size:0.85rem; line-height:2.2; color:var(--text-dim);">
+        <span class="hl">SMC² converged</span>&nbsp; → push (μ, ρ) to BPF, reset RM counter<br>
+        <span class="hl-r">R-hat blackout</span>&nbsp; → online gradient is the only adaptation<br>
+        <span class="hl-o">Regime change</span>&nbsp;&nbsp; → online gradient responds in ~100 ticks<br>
+        <span class="hl">SMC² reconverges</span> → corrects any online drift, resets again
+      </div>
+    </div>
+
+    <p>
+      The two systems cover each other's blind spots. SMC² can't react instantly (it needs
+      reconvergence). Online gradient can't learn σ<sub>z</sub> (flat likelihood surface). Together,
+      there is no gap.
+    </p>
+  </div>
+
+</div>
+
+<!-- ═══════════════ CANVAS ANIMATIONS ═══════════════ -->
+<script>
+// ── Utility ──
+function getColors() {
+  return {
+    bg: '#0a0e17', card: '#0f1520', border: '#1a2235',
+    cyan: '#4ecdc4', cyanDim: '#2a7a74',
+    orange: '#f0a35e', blue: '#5b8def',
+    red: '#e74c6f', green: '#5ee6a0', purple: '#a78bfa',
+    text: '#c8d6e5', dim: '#6b7d95', bright: '#e8f0f8'
+  };
+}
+
+function setupCanvas(id) {
+  const c = document.getElementById(id);
+  const dpr = window.devicePixelRatio || 1;
+  const rect = c.getBoundingClientRect();
+  c.width = rect.width * dpr;
+  c.height = rect.height * dpr;
+  const ctx = c.getContext('2d');
+  ctx.scale(dpr, dpr);
+  return { ctx, w: rect.width, h: rect.height };
+}
+
+// ── Fisher Information Visualization ──
+(function() {
+  const { ctx, w, h } = setupCanvas('fisherViz');
+  const C = getColors();
+  let t = 0;
+
+  function draw() {
+    ctx.clearRect(0, 0, w, h);
+
+    const cx = w / 2, cy = h / 2;
+    const pad = 60;
+
+    // Draw likelihood surface (inverted parabola)
+    ctx.beginPath();
+    for (let x = pad; x < w - pad; x++) {
+      const xn = (x - cx) / (w/2 - pad);
+      const y = cy - 80 * (1 - xn*xn) + 20 * Math.sin(xn * 3);
+      x === pad ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = C.dim + '60';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // Label
+    ctx.fillStyle = C.dim;
+    ctx.font = '12px "JetBrains Mono"';
+    ctx.textAlign = 'center';
+    ctx.fillText('log p(y | θ)', cx, 30);
+    ctx.fillText('θ', w - pad + 15, cy + 5);
+
+    // Axes
+    ctx.strokeStyle = C.border;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(pad, cy + 40);
+    ctx.lineTo(w - pad, cy + 40);
+    ctx.stroke();
+
+    // Animate two points: one near optimum, one far
+    const phase = (Math.sin(t * 0.015) + 1) / 2;
+
+    // Point A: near optimum (high Fisher → small step)
+    const axN = -0.05 + 0.03 * Math.sin(t * 0.02);
+    const ax = cx + axN * (w/2 - pad);
+    const ay = cy - 80 * (1 - axN*axN) + 20 * Math.sin(axN * 3);
+
+    // Point B: far from optimum (low Fisher → big step)
+    const bxN = 0.65 - phase * 0.4;
+    const bx = cx + bxN * (w/2 - pad);
+    const by = cy - 80 * (1 - bxN*bxN) + 20 * Math.sin(bxN * 3);
+
+    // Draw Fisher curvature arcs
+    // Near optimum: tight curve
+    ctx.beginPath();
+    ctx.arc(ax, ay, 20, Math.PI * 0.8, Math.PI * 0.2, true);
+    ctx.strokeStyle = C.orange + 'aa';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.fillStyle = C.orange;
+    ctx.font = '11px "JetBrains Mono"';
+    ctx.textAlign = 'center';
+    ctx.fillText('high F → small step', ax, ay + 42);
+
+    // Far: shallow curve
+    ctx.beginPath();
+    ctx.arc(bx, by, 50, Math.PI * 0.85, Math.PI * 0.15, true);
+    ctx.strokeStyle = C.cyan + '80';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.fillStyle = C.cyan;
+    ctx.fillText('low F → large step', bx, by + 60);
+
+    // Draw dots
+    ctx.beginPath();
+    ctx.arc(ax, ay, 6, 0, Math.PI * 2);
+    ctx.fillStyle = C.orange;
+    ctx.fill();
+
+    ctx.beginPath();
+    ctx.arc(bx, by, 6, 0, Math.PI * 2);
+    ctx.fillStyle = C.cyan;
+    ctx.fill();
+
+    // Step arrows
+    const arrowLen1 = 8;
+    const arrowLen2 = 35 * (1 - phase * 0.3);
+
+    ctx.beginPath();
+    ctx.moveTo(ax + arrowLen1, ay);
+    ctx.lineTo(ax - arrowLen1, ay);
+    ctx.strokeStyle = C.orange;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.moveTo(bx, by);
+    ctx.lineTo(bx - arrowLen2, by - arrowLen2 * 0.3);
+    ctx.strokeStyle = C.cyan;
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+
+    // Arrowhead
+    ctx.beginPath();
+    ctx.moveTo(bx - arrowLen2, by - arrowLen2 * 0.3);
+    ctx.lineTo(bx - arrowLen2 + 8, by - arrowLen2 * 0.3 - 5);
+    ctx.lineTo(bx - arrowLen2 + 6, by - arrowLen2 * 0.3 + 7);
+    ctx.fillStyle = C.cyan;
+    ctx.fill();
+
+    t++;
+    requestAnimationFrame(draw);
+  }
+  draw();
+})();
+
+// ── Four Quantities Visualization ──
+(function() {
+  const { ctx, w, h } = setupCanvas('fourQuantViz');
+  const C = getColors();
+  let t = 0;
+
+  const N = 12;
+  const particles = [];
+  for (let i = 0; i < N; i++) {
+    particles.push({
+      x: 0.1 + 0.8 * i / (N-1),
+      w: 0.3 + Math.random() * 0.7,
+      score: (Math.random() - 0.4) * 2,
+      hprev: -1.0 + (Math.random() - 0.5) * 1.5,
+      phase: Math.random() * Math.PI * 2
+    });
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, w, h);
+
+    const topY = 55, botY = h - 60;
+    const leftX = 60, rightX = w - 40;
+    const midY = (topY + botY) / 2;
+
+    // Labels
+    ctx.fillStyle = C.dim;
+    ctx.font = '11px "JetBrains Mono"';
+    ctx.textAlign = 'center';
+    ctx.fillText('Particle index i', (leftX + rightX)/2, h - 18);
+
+    // Draw particles
+    for (let i = 0; i < N; i++) {
+      const p = particles[i];
+      const x = leftX + p.x * (rightX - leftX);
+      const pulse = 1 + 0.15 * Math.sin(t * 0.04 + p.phase);
+
+      // Particle dot
+      const r = 4 + p.w * 8 * pulse;
+      const alpha = 0.3 + p.w * 0.7;
+
+      ctx.beginPath();
+      ctx.arc(x, topY + 15, r, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(78,205,196,${alpha})`;
+      ctx.fill();
+
+      // Weight label
+      ctx.fillStyle = C.dim;
+      ctx.font = '9px "JetBrains Mono"';
+      ctx.textAlign = 'center';
+      ctx.fillText('w=' + p.w.toFixed(2), x, topY + 35);
+
+      // Flow lines to 4 outputs
+      const outputColors = [C.cyan, C.orange, C.blue, C.purple];
+      const outputY = [midY - 30, midY + 5, midY + 40, midY + 75];
+
+      for (let j = 0; j < 4; j++) {
+        const progress = ((t * 0.03 + i * 0.2 + j * 0.5) % 1);
+        if (progress < 0.7) {
+          const py = topY + 40 + (outputY[j] - topY - 40) * (progress / 0.7);
+          ctx.beginPath();
+          ctx.arc(x, py, 2, 0, Math.PI * 2);
+          ctx.fillStyle = outputColors[j] + '60';
+          ctx.fill();
+        }
+      }
+
+      // Output bars
+      const barW = (rightX - leftX) / N * 0.7;
+
+      const vals = [
+        p.w * p.score,
+        p.w * p.score * p.score,
+        p.w * p.score * (p.hprev + 1),
+        p.w * p.score * p.score * (p.hprev + 1) * (p.hprev + 1)
+      ];
+
+      for (let j = 0; j < 4; j++) {
+        const bh = Math.abs(vals[j]) * 12 * pulse;
+        ctx.fillStyle = outputColors[j] + '50';
+        ctx.fillRect(x - barW/2, outputY[j] - bh/2, barW, bh);
+      }
+    }
+
+    // Output labels
+    ctx.textAlign = 'left';
+    const labels = ['g_μ', 'F_μ', 'g_ρ', 'F_ρ'];
+    const outputColors2 = [C.cyan, C.orange, C.blue, C.purple];
+    const outputY2 = [midY - 30, midY + 5, midY + 40, midY + 75];
+
+    for (let j = 0; j < 4; j++) {
+      ctx.fillStyle = outputColors2[j];
+      ctx.font = '11px "JetBrains Mono"';
+      ctx.fillText(labels[j], 10, outputY2[j] + 4);
+    }
+
+    // "Particles" label
+    ctx.fillStyle = C.bright;
+    ctx.font = '12px "Outfit"';
+    ctx.textAlign = 'center';
+    ctx.fillText('Weighted particles', (leftX + rightX)/2, topY - 5);
+
+    // Reduction arrows on right
+    ctx.textAlign = 'right';
+    ctx.fillStyle = C.dim;
+    ctx.font = '10px "JetBrains Mono"';
+    for (let j = 0; j < 4; j++) {
+      ctx.fillText('→ Σ', w - 8, outputY2[j] + 4);
+    }
+
+    t++;
+    requestAnimationFrame(draw);
+  }
+  draw();
+})();
+
+// ── Tracking Visualization ──
+(function() {
+  const { ctx, w, h } = setupCanvas('trackingViz');
+  const C = getColors();
+  let frame = 0;
+  const totalFrames = 600;
+
+  function draw() {
+    ctx.clearRect(0, 0, w, h);
+    const pad = { l: 60, r: 30, t: 40, b: 50 };
+    const plotW = w - pad.l - pad.r;
+    const plotH = h - pad.t - pad.b;
+
+    const progress = Math.min(frame / totalFrames, 1);
+    const tMax = Math.floor(progress * 5000);
+
+    // Axes
+    ctx.strokeStyle = C.border;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(pad.l, pad.t);
+    ctx.lineTo(pad.l, pad.t + plotH);
+    ctx.lineTo(pad.l + plotW, pad.t + plotH);
+    ctx.stroke();
+
+    // Y-axis labels
+    ctx.fillStyle = C.dim;
+    ctx.font = '10px "JetBrains Mono"';
+    ctx.textAlign = 'right';
+    for (let v = 0; v >= -3; v -= 0.5) {
+      const y = pad.t + plotH * (-v / 3);
+      ctx.fillText(v.toFixed(1), pad.l - 8, y + 4);
+      ctx.strokeStyle = C.border + '40';
+      ctx.beginPath();
+      ctx.moveTo(pad.l, y);
+      ctx.lineTo(pad.l + plotW, y);
+      ctx.stroke();
+    }
+
+    // X-axis
+    ctx.textAlign = 'center';
+    for (let t = 0; t <= 5000; t += 1000) {
+      const x = pad.l + (t / 5000) * plotW;
+      ctx.fillText(t.toString(), x, pad.t + plotH + 20);
+    }
+    ctx.fillText('tick', pad.l + plotW / 2, pad.t + plotH + 38);
+
+    // True mu line
+    ctx.beginPath();
+    ctx.strokeStyle = C.dim + '60';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([5, 5]);
+    // Phase 1
+    let x1 = pad.l;
+    let x2 = pad.l + (Math.min(2500, tMax) / 5000) * plotW;
+    let y1 = pad.t + plotH * (1.0 / 3);
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y1);
+    // Phase 2
+    if (tMax > 2500) {
+      let x3 = pad.l + (tMax / 5000) * plotW;
+      let y2 = pad.t + plotH * (2.5 / 3);
+      ctx.moveTo(pad.l + (2500/5000)*plotW, y1);
+      ctx.lineTo(pad.l + (2500/5000)*plotW, y2);
+      ctx.lineTo(x3, y2);
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Regime change line
+    if (tMax > 2500) {
+      const xSwitch = pad.l + (2500/5000) * plotW;
+      ctx.strokeStyle = C.red + '40';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      ctx.moveTo(xSwitch, pad.t);
+      ctx.lineTo(xSwitch, pad.t + plotH);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      ctx.fillStyle = C.red + 'aa';
+      ctx.font = '10px "JetBrains Mono"';
+      ctx.textAlign = 'center';
+      ctx.fillText('μ shift', xSwitch, pad.t - 8);
+    }
+
+    // Vanilla mu (flat at -1.0)
+    if (tMax > 0) {
+      ctx.beginPath();
+      ctx.moveTo(pad.l, pad.t + plotH * (1.0/3));
+      ctx.lineTo(pad.l + (tMax/5000)*plotW, pad.t + plotH * (1.0/3));
+      ctx.strokeStyle = C.dim + '80';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
+    // Natural gradient mu trajectory (simulated smooth tracking)
+    ctx.beginPath();
+    ctx.strokeStyle = C.cyan;
+    ctx.lineWidth = 2.5;
+    let started = false;
+    for (let tick = 0; tick < tMax; tick += 20) {
+      const x = pad.l + (tick / 5000) * plotW;
+      let mu;
+      if (tick < 2500) {
+        mu = -1.0 + 0.15 * Math.sin(tick * 0.003) * Math.exp(-tick * 0.0003);
+      } else {
+        const dt = tick - 2500;
+        const target = -2.5;
+        mu = -1.0 + (target - (-1.0)) * (1 - Math.exp(-dt * 0.003));
+        mu += 0.1 * Math.sin(dt * 0.004) * Math.exp(-dt * 0.0005);
+      }
+      const y = pad.t + plotH * (-mu / 3);
+      if (!started) { ctx.moveTo(x, y); started = true; }
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Glow
+    ctx.strokeStyle = C.cyan + '20';
+    ctx.lineWidth = 8;
+    ctx.stroke();
+
+    // Legend
+    const legX = pad.l + 15;
+    const legY = pad.t + 12;
+    ctx.font = '11px "Outfit"';
+
+    ctx.fillStyle = C.dim + '80';
+    ctx.fillRect(legX, legY, 12, 3);
+    ctx.fillStyle = C.dim;
+    ctx.textAlign = 'left';
+    ctx.fillText('Vanilla (fixed μ)', legX + 18, legY + 5);
+
+    ctx.fillStyle = C.cyan;
+    ctx.fillRect(legX, legY + 18, 12, 3);
+    ctx.fillStyle = C.cyan;
+    ctx.fillText('Natural gradient', legX + 18, legY + 23);
+
+    ctx.fillStyle = C.dim + '60';
+    ctx.setLineDash([4, 4]);
+    ctx.strokeStyle = C.dim + '60';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(legX, legY + 37);
+    ctx.lineTo(legX + 12, legY + 37);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = C.dim;
+    ctx.fillText('True μ', legX + 18, legY + 41);
+
+    frame++;
+    if (frame > totalFrames + 120) frame = 0;
+    requestAnimationFrame(draw);
+  }
+  draw();
+})();
+
+// ── Architecture Timeline ──
+(function() {
+  const { ctx, w, h } = setupCanvas('archViz');
+  const C = getColors();
+  let t = 0;
+
+  function draw() {
+    ctx.clearRect(0, 0, w, h);
+    const pad = { l: 30, r: 30, t: 50, b: 40 };
+    const trackW = w - pad.l - pad.r;
+
+    // Timeline bar
+    const barY = h / 2;
+    const barH = 24;
+
+    // Segments
+    const segments = [
+      { start: 0, end: 0.3, label: 'SMC² converged', color: C.cyan + '30', border: C.cyan },
+      { start: 0.3, end: 0.32, label: '', color: C.orange + '40', border: C.orange },
+      { start: 0.32, end: 0.58, label: 'R-hat blackout', color: C.red + '20', border: C.red },
+      { start: 0.58, end: 0.62, label: '', color: C.orange + '40', border: C.orange },
+      { start: 0.62, end: 1.0, label: 'SMC² reconverged', color: C.cyan + '30', border: C.cyan }
+    ];
+
+    for (const seg of segments) {
+      const x = pad.l + seg.start * trackW;
+      const sw = (seg.end - seg.start) * trackW;
+      ctx.fillStyle = seg.color;
+      ctx.fillRect(x, barY - barH/2, sw, barH);
+      ctx.strokeStyle = seg.border + '60';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x, barY - barH/2, sw, barH);
+    }
+
+    // Labels
+    ctx.font = '10px "JetBrains Mono"';
+    ctx.textAlign = 'center';
+
+    ctx.fillStyle = C.cyan;
+    ctx.fillText('SMC² pushes params', pad.l + 0.15 * trackW, barY - barH/2 - 12);
+
+    ctx.fillStyle = C.red;
+    ctx.fillText('R-hat blackout', pad.l + 0.45 * trackW, barY - barH/2 - 12);
+
+    ctx.fillStyle = C.cyan;
+    ctx.fillText('SMC² pushes + resets RM', pad.l + 0.81 * trackW, barY - barH/2 - 12);
+
+    // Online learning bar (underneath)
+    const olY = barY + barH/2 + 20;
+
+    // Always active gradient
+    const pulse = 0.6 + 0.4 * Math.abs(Math.sin(t * 0.03));
+
+    ctx.fillStyle = `rgba(240,163,94,${0.1 + 0.1 * pulse})`;
+    ctx.fillRect(pad.l, olY, trackW, 18);
+    ctx.strokeStyle = C.orange + '50';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(pad.l, olY, trackW, 18);
+
+    ctx.fillStyle = C.orange;
+    ctx.font = '10px "JetBrains Mono"';
+    ctx.textAlign = 'center';
+    ctx.fillText('Online natural gradient (always running)', pad.l + trackW/2, olY + 13);
+
+    // Highlight blackout zone
+    const bx = pad.l + 0.32 * trackW;
+    const bw = 0.26 * trackW;
+    ctx.fillStyle = `rgba(240,163,94,${0.15 + 0.15 * pulse})`;
+    ctx.fillRect(bx, olY, bw, 18);
+
+    // Regime event
+    const evX = pad.l + 0.31 * trackW;
+    ctx.strokeStyle = C.orange;
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(evX, barY - barH/2 - 25);
+    ctx.lineTo(evX, olY + 22);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    ctx.fillStyle = C.orange;
+    ctx.font = '9px "JetBrains Mono"';
+    ctx.textAlign = 'center';
+    ctx.fillText('regime change', evX, barY - barH/2 - 28);
+
+    // Title
+    ctx.fillStyle = C.bright;
+    ctx.font = '13px "Outfit"';
+    ctx.textAlign = 'center';
+    ctx.fillText('Parameter Learning Timeline', w/2, 24);
+
+    t++;
+    requestAnimationFrame(draw);
+  }
+  draw();
+})();
+
+// ── Scroll reveal ──
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(e => {
+    if (e.isIntersecting) e.target.classList.add('visible');
+  });
+}, { threshold: 0.15 });
+document.querySelectorAll('.reveal').forEach(el => observer.observe(el));
+
+// ── Bar chart animation on scroll ──
+const barObserver = new IntersectionObserver((entries) => {
+  entries.forEach(e => {
+    if (e.isIntersecting) {
+      e.target.querySelectorAll('.bar-fill').forEach(bar => {
+        bar.style.width = bar.dataset.width + '%';
+      });
+    }
+  });
+}, { threshold: 0.3 });
+document.querySelectorAll('.bar-chart').forEach(el => barObserver.observe(el));
+</script>
+
+</body>
+</html>

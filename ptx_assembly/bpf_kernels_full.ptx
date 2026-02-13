@@ -28,7 +28,8 @@
 //   - Kernels 5, 6, 11: shfl.sync.bfly for final 5 reduction levels
 //     Saves 5 bar.sync + 15 shared memory ops per invocation
 //   - Kernel 5: CAS atomicMax kept (atom.global.max.f32 not in SM_120 ptxas 13.1)
-//   - Net: 20 fewer block stalls per tick (4 reduction invocations)//
+//   - Net: 20 fewer block stalls per tick (4 reduction invocations)
+//
 // Compile:  ptxas -arch=sm_120 -o bpf_kernels.cubin bpf_kernels.ptx
 // =============================================================================
 
@@ -223,8 +224,8 @@ INIT_P_EXIT:
 //   chi2 variates pre-generated on host (param_chi2 array)
 //   Student-t obs constant precomputed on host (param_C_obs)
 //   Adaptive bands: sigma_z scaled by k_b from d_mix_config constant memory
-//   Band lookup: contiguous ranges → zero warp divergence
-//   No importance weight correction — observation likelihood does natural selection
+//   Band lookup: contiguous ranges -> zero warp divergence
+//   No importance weight correction -- observation likelihood does natural selection
 // =============================================================================
 
 .visible .entry bpf_propagate_weight(
@@ -478,7 +479,7 @@ PW_EXIT:
 // Kernel 5: bpf_reduce_max   (v2: warp shuffle)
 //
 //   Inter-warp: shared memory tree reduction (s >= 32) with bar.sync
-//   Intra-warp: shfl.sync.bfly (s = 16..1) — 5 rounds, no bar.sync
+//   Intra-warp: shfl.sync.bfly (s = 16..1) -- 5 rounds, no bar.sync
 //   Final:      CAS loop for float atomicMax (native f32 max not in SM_120 ptxas)
 //
 //   Saves 5 bar.sync + 15 shared memory ops per invocation
@@ -542,7 +543,7 @@ RM_SK:
     bra RM_LP;
 
 RM_WARP:
-    // === Intra-warp reduction: shfl.sync.bfly — no bar.sync needed ===
+    // === Intra-warp reduction: shfl.sync.bfly -- no bar.sync needed ===
     // After inter-warp phase, smem[0..31] holds 32 partial maxima.
     // Each warp loads its own slot; only warp 0's result matters.
     ld.shared.f32 %f_val, [%rd_smem];
@@ -1079,5 +1080,305 @@ GN_EX:
     min.f32 %f_h, %f_h, %f_hi;
     st.global.f32 [%rd_ha], %f_h;
 SJ_EX:
+    ret;
+}
+
+// =============================================================================
+// Kernel 14: bpf_grad_alpha  (FUSED: compute + reduce + atomicAdd)
+//
+// Replaces: old kernel 14 (scatter to 4 scratch buffers) + 4× reduce_sum
+// Result:   1 kernel launch instead of 5
+//
+// Per-particle gradient + Fisher for BOTH α (mu) and ρ:
+//
+//   v0 = w[i] * dlw                    → Σ → scalars[5]  (g_α)
+//   v1 = w[i] * dlw²                   → Σ → scalars[6]  (F_α)
+//   v2 = w[i] * dlw * (h_prev - mu)    → Σ → scalars[7]  (g_ρ)
+//   v3 = w[i] * dlw² * (h_prev - mu)²  → Σ → scalars[8]  (F_ρ)
+//
+// where dlw = ∂log_w/∂h:
+//   Gaussian:  -0.5 + 0.5·η²         (η² = y²·exp(-h))
+//   Student-t: -0.5 + (ν+1)/2·η²/(ν+η²)
+//
+// Reduction strategy:
+//   Phase 1: Per-particle compute → v0,v1,v2,v3 in registers
+//   Phase 2: Warp-level butterfly (shfl.sync.bfly, 5 rounds × 4 values)
+//   Phase 3: Lane 0 of each warp → shared memory
+//   Phase 4: bar.sync
+//   Phase 5: Thread 0 sums across warps (sequential, ≤8 iterations)
+//   Phase 6: Thread 0 atomicAdd to d_scalars[5..8]
+//
+// Shared memory: 4 × nwarps × 4 bytes = 128 bytes (block=256)
+// Registers: ~45 (no spill risk on SM_120)
+// Eliminates: 4 scratch buffers, 4N global stores, 4N global loads, 4 launches
+// =============================================================================
+
+.visible .entry bpf_grad_alpha(
+    .param .u64 param_scalars,          // d_scalars base [9 floats]
+    .param .u64 param_w,                // normalized weights [N]
+    .param .u64 param_h,                // current h_t [N]
+    .param .u64 param_h_prev,           // previous h_{t-1} [N]
+    .param .f32 param_y_t,
+    .param .f32 param_nu_obs,
+    .param .f32 param_mu,
+    .param .s32 param_n
+)
+{
+    .reg .u32   %idx, %r_tid, %r_ctaid, %r_ntid, %r_n;
+    .reg .u32   %r_lane, %r_warp, %r_nwarps;
+    .reg .u64   %rd_scalars, %rd_w, %rd_h, %rd_hp, %rd_off;
+    .reg .u64   %rd_smem_base, %rd_smem;
+    .reg .f32   %f_yt, %f_nu, %f_mu, %f_h, %f_w, %f_hp;
+    .reg .f32   %f_yt2, %f_neg_h, %f_exp_neg_h, %f_eta_sq;
+    .reg .f32   %f_nup1h, %f_denom, %f_ratio, %f_dlw;
+    .reg .f32   %f_dlw2, %f_dhdr, %f_dhdr2;
+    .reg .f32   %f_v0, %f_v1, %f_v2, %f_v3;
+    .reg .f32   %f_shfl, %f_tmp;
+    .reg .pred  %p_bound, %p_t_obs, %p_lane0, %p_tid0;
+
+    ld.param.u64    %rd_scalars, [param_scalars];
+    ld.param.u64    %rd_w,   [param_w];
+    ld.param.u64    %rd_h,   [param_h];
+    ld.param.u64    %rd_hp,  [param_h_prev];
+    ld.param.f32    %f_yt,   [param_y_t];
+    ld.param.f32    %f_nu,   [param_nu_obs];
+    ld.param.f32    %f_mu,   [param_mu];
+    ld.param.s32    %r_n,    [param_n];
+
+    mov.u32         %r_tid,   %tid.x;
+    mov.u32         %r_ctaid, %ctaid.x;
+    mov.u32         %r_ntid,  %ntid.x;
+    mad.lo.u32      %idx,     %r_ctaid, %r_ntid, %r_tid;
+
+    // Lane and warp IDs
+    and.b32         %r_lane, %r_tid, 31;
+    shr.u32         %r_warp, %r_tid, 5;
+    shr.u32         %r_nwarps, %r_ntid, 5;
+
+    mov.u64         %rd_smem_base, smem_raw;
+
+    // ═══ Phase 1: Per-particle compute ═══
+    // Out-of-bounds threads contribute zeros to reduction
+    mov.f32         %f_v0, 0f00000000;
+    mov.f32         %f_v1, 0f00000000;
+    mov.f32         %f_v2, 0f00000000;
+    mov.f32         %f_v3, 0f00000000;
+
+    setp.ge.u32     %p_bound, %idx, %r_n;
+    @%p_bound bra   GF_REDUCE;
+
+    // Load w[i], h[i], h_prev[i]
+    mul.wide.u32    %rd_off, %idx, 4;
+    .reg .u64 %a0, %a1, %a2;
+    add.u64         %a0, %rd_h,  %rd_off;
+    add.u64         %a1, %rd_w,  %rd_off;
+    add.u64         %a2, %rd_hp, %rd_off;
+    ld.global.f32   %f_h,  [%a0];
+    ld.global.f32   %f_w,  [%a1];
+    ld.global.f32   %f_hp, [%a2];
+
+    // eta_sq = y_t² * exp(-h)
+    mul.f32         %f_yt2, %f_yt, %f_yt;
+    neg.f32         %f_neg_h, %f_h;
+    mul.f32         %f_neg_h, %f_neg_h, 0f3FB8AA3B;      // * log2(e)
+    ex2.approx.f32  %f_exp_neg_h, %f_neg_h;               // exp(-h)
+    mul.f32         %f_eta_sq, %f_yt2, %f_exp_neg_h;
+
+    // Branch: Student-t vs Gaussian
+    setp.gt.f32     %p_t_obs, %f_nu, 0f00000000;
+    @%p_t_obs bra   GF_T_OBS;
+
+    // Gaussian: dlw = -0.5 + 0.5 * eta_sq
+    fma.rn.f32      %f_dlw, %f_eta_sq, 0f3F000000, 0fBF000000;
+    bra             GF_COMPUTE;
+
+GF_T_OBS:
+    // Student-t: dlw = -0.5 + (nu+1)/2 * eta_sq / (nu + eta_sq)
+    add.f32         %f_nup1h, %f_nu, 0f3F800000;          // nu + 1
+    mul.f32         %f_nup1h, %f_nup1h, 0f3F000000;       // (nu+1)/2
+    add.f32         %f_denom, %f_nu, %f_eta_sq;            // nu + eta_sq
+    div.approx.f32  %f_ratio, %f_eta_sq, %f_denom;
+    fma.rn.f32      %f_dlw, %f_nup1h, %f_ratio, 0fBF000000;
+
+GF_COMPUTE:
+    // dhdr = h_prev - mu  (∂h/∂ρ)
+    sub.f32         %f_dhdr, %f_hp, %f_mu;
+
+    // dlw² and dhdr²
+    mul.f32         %f_dlw2,  %f_dlw,  %f_dlw;
+    mul.f32         %f_dhdr2, %f_dhdr, %f_dhdr;
+
+    // v0 = w * dlw              (grad_mu)
+    mul.f32         %f_v0, %f_w, %f_dlw;
+    // v1 = w * dlw²             (fisher_mu)
+    mul.f32         %f_v1, %f_w, %f_dlw2;
+    // v2 = w * dlw * dhdr       (grad_rho)
+    mul.f32         %f_v2, %f_v0, %f_dhdr;
+    // v3 = w * dlw² * dhdr²     (fisher_rho)
+    mul.f32         %f_v3, %f_v1, %f_dhdr2;
+
+    // ═══ Phase 2: Warp-level butterfly reduction (4 values × 5 rounds) ═══
+
+GF_REDUCE:
+    // v0
+    shfl.sync.bfly.b32 %f_shfl, %f_v0, 16, 31, 0xFFFFFFFF;
+    add.f32 %f_v0, %f_v0, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v0, 8, 31, 0xFFFFFFFF;
+    add.f32 %f_v0, %f_v0, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v0, 4, 31, 0xFFFFFFFF;
+    add.f32 %f_v0, %f_v0, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v0, 2, 31, 0xFFFFFFFF;
+    add.f32 %f_v0, %f_v0, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v0, 1, 31, 0xFFFFFFFF;
+    add.f32 %f_v0, %f_v0, %f_shfl;
+
+    // v1
+    shfl.sync.bfly.b32 %f_shfl, %f_v1, 16, 31, 0xFFFFFFFF;
+    add.f32 %f_v1, %f_v1, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v1, 8, 31, 0xFFFFFFFF;
+    add.f32 %f_v1, %f_v1, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v1, 4, 31, 0xFFFFFFFF;
+    add.f32 %f_v1, %f_v1, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v1, 2, 31, 0xFFFFFFFF;
+    add.f32 %f_v1, %f_v1, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v1, 1, 31, 0xFFFFFFFF;
+    add.f32 %f_v1, %f_v1, %f_shfl;
+
+    // v2
+    shfl.sync.bfly.b32 %f_shfl, %f_v2, 16, 31, 0xFFFFFFFF;
+    add.f32 %f_v2, %f_v2, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v2, 8, 31, 0xFFFFFFFF;
+    add.f32 %f_v2, %f_v2, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v2, 4, 31, 0xFFFFFFFF;
+    add.f32 %f_v2, %f_v2, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v2, 2, 31, 0xFFFFFFFF;
+    add.f32 %f_v2, %f_v2, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v2, 1, 31, 0xFFFFFFFF;
+    add.f32 %f_v2, %f_v2, %f_shfl;
+
+    // v3
+    shfl.sync.bfly.b32 %f_shfl, %f_v3, 16, 31, 0xFFFFFFFF;
+    add.f32 %f_v3, %f_v3, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v3, 8, 31, 0xFFFFFFFF;
+    add.f32 %f_v3, %f_v3, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v3, 4, 31, 0xFFFFFFFF;
+    add.f32 %f_v3, %f_v3, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v3, 2, 31, 0xFFFFFFFF;
+    add.f32 %f_v3, %f_v3, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v3, 1, 31, 0xFFFFFFFF;
+    add.f32 %f_v3, %f_v3, %f_shfl;
+
+    // ═══ Phase 3: Lane 0 of each warp → shared memory ═══
+    // Layout: smem[warp + 0*nwarps]=v0, [warp+1*nw]=v1, [warp+2*nw]=v2, [warp+3*nw]=v3
+
+    setp.eq.u32     %p_lane0, %r_lane, 0;
+    @!%p_lane0 bra  GF_SYNC;
+
+    .reg .u32 %r_smoff;
+
+    // v0 → smem[warp_id]
+    mul.wide.u32    %rd_off, %r_warp, 4;
+    add.u64         %rd_smem, %rd_smem_base, %rd_off;
+    st.shared.f32   [%rd_smem], %f_v0;
+
+    // v1 → smem[nwarps + warp_id]
+    add.u32         %r_smoff, %r_nwarps, %r_warp;
+    mul.wide.u32    %rd_off, %r_smoff, 4;
+    add.u64         %rd_smem, %rd_smem_base, %rd_off;
+    st.shared.f32   [%rd_smem], %f_v1;
+
+    // v2 → smem[2*nwarps + warp_id]
+    .reg .u32 %r_nw2;
+    shl.b32         %r_nw2, %r_nwarps, 1;
+    add.u32         %r_smoff, %r_nw2, %r_warp;
+    mul.wide.u32    %rd_off, %r_smoff, 4;
+    add.u64         %rd_smem, %rd_smem_base, %rd_off;
+    st.shared.f32   [%rd_smem], %f_v2;
+
+    // v3 → smem[3*nwarps + warp_id]
+    add.u32         %r_smoff, %r_nw2, %r_nwarps;
+    add.u32         %r_smoff, %r_smoff, %r_warp;
+    mul.wide.u32    %rd_off, %r_smoff, 4;
+    add.u64         %rd_smem, %rd_smem_base, %rd_off;
+    st.shared.f32   [%rd_smem], %f_v3;
+
+GF_SYNC:
+    bar.sync 0;
+
+    // ═══ Phase 4: Thread 0 sums warp partials + atomicAdd ═══
+    setp.eq.u32     %p_tid0, %r_tid, 0;
+    @!%p_tid0 bra   GF_EXIT;
+
+    .reg .u32 %r_i;
+    .reg .pred %p_wdone;
+
+    // Sum v0 (grad_mu) across warps
+    mov.f32         %f_v0, 0f00000000;
+    mov.u32         %r_i, 0;
+GF_SUM0:
+    setp.ge.u32     %p_wdone, %r_i, %r_nwarps;
+    @%p_wdone bra   GF_SUM0_DONE;
+    mul.wide.u32    %rd_off, %r_i, 4;
+    add.u64         %rd_smem, %rd_smem_base, %rd_off;
+    ld.shared.f32   %f_tmp, [%rd_smem];
+    add.f32         %f_v0, %f_v0, %f_tmp;
+    add.u32         %r_i, %r_i, 1;
+    bra             GF_SUM0;
+GF_SUM0_DONE:
+
+    // Sum v1 (fisher_mu) across warps
+    mov.f32         %f_v1, 0f00000000;
+    mov.u32         %r_i, 0;
+GF_SUM1:
+    setp.ge.u32     %p_wdone, %r_i, %r_nwarps;
+    @%p_wdone bra   GF_SUM1_DONE;
+    add.u32         %r_smoff, %r_nwarps, %r_i;
+    mul.wide.u32    %rd_off, %r_smoff, 4;
+    add.u64         %rd_smem, %rd_smem_base, %rd_off;
+    ld.shared.f32   %f_tmp, [%rd_smem];
+    add.f32         %f_v1, %f_v1, %f_tmp;
+    add.u32         %r_i, %r_i, 1;
+    bra             GF_SUM1;
+GF_SUM1_DONE:
+
+    // Sum v2 (grad_rho) across warps
+    mov.f32         %f_v2, 0f00000000;
+    mov.u32         %r_i, 0;
+GF_SUM2:
+    setp.ge.u32     %p_wdone, %r_i, %r_nwarps;
+    @%p_wdone bra   GF_SUM2_DONE;
+    add.u32         %r_smoff, %r_nw2, %r_i;
+    mul.wide.u32    %rd_off, %r_smoff, 4;
+    add.u64         %rd_smem, %rd_smem_base, %rd_off;
+    ld.shared.f32   %f_tmp, [%rd_smem];
+    add.f32         %f_v2, %f_v2, %f_tmp;
+    add.u32         %r_i, %r_i, 1;
+    bra             GF_SUM2;
+GF_SUM2_DONE:
+
+    // Sum v3 (fisher_rho) across warps
+    mov.f32         %f_v3, 0f00000000;
+    .reg .u32 %r_base3;
+    add.u32         %r_base3, %r_nw2, %r_nwarps;
+    mov.u32         %r_i, 0;
+GF_SUM3:
+    setp.ge.u32     %p_wdone, %r_i, %r_nwarps;
+    @%p_wdone bra   GF_SUM3_DONE;
+    add.u32         %r_smoff, %r_base3, %r_i;
+    mul.wide.u32    %rd_off, %r_smoff, 4;
+    add.u64         %rd_smem, %rd_smem_base, %rd_off;
+    ld.shared.f32   %f_tmp, [%rd_smem];
+    add.f32         %f_v3, %f_v3, %f_tmp;
+    add.u32         %r_i, %r_i, 1;
+    bra             GF_SUM3;
+GF_SUM3_DONE:
+
+    // atomicAdd block partial sums to d_scalars[5..8]
+    atom.global.add.f32 %f_tmp, [%rd_scalars + 20], %f_v0;   // [5] grad_mu
+    atom.global.add.f32 %f_tmp, [%rd_scalars + 24], %f_v1;   // [6] fisher_mu
+    atom.global.add.f32 %f_tmp, [%rd_scalars + 28], %f_v2;   // [7] grad_rho
+    atom.global.add.f32 %f_tmp, [%rd_scalars + 32], %f_v3;   // [8] fisher_rho
+
+GF_EXIT:
     ret;
 }
