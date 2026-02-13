@@ -496,9 +496,10 @@ static void bpf_grad_and_update(GpuBpfState* s, float y_t,
         s->rm_step++;
         float eta = s->rm_c / powf((float)s->rm_step + s->rm_t0, s->rm_gamma);
 
-        float K_inv = 1.0f / (float)s->grad_count;
+        float K_f = (float)s->grad_count;
+        float K_inv = 1.0f / K_f;
 
-        // ── μ update (natural gradient: score / Fisher) ──
+        // ── μ update (natural gradient: score / Fisher, SNR-gated) ──
         {
             float mean_g = sums[0] * K_inv;
             float mean_f = sums[1] * K_inv;
@@ -507,13 +508,19 @@ static void bpf_grad_and_update(GpuBpfState* s, float y_t,
             if (s->grad_clip > 0.0f && fabsf(dir) > s->grad_clip)
                 dir *= s->grad_clip / fabsf(dir);
 
+            // Soft SNR gate: snr = |mean_g| / sqrt(mean_f / K)
+            // Under correct params: mean_g ~ N(0, F/K) → snr ~ |N(0,1)|
+            // Gate ramps 0→1 over snr 0→snr_ref (2.0 ≈ 95% confidence)
+            float snr_mu = fabsf(mean_g) / fmaxf(sqrtf(mean_f / K_f), 1e-10f);
+            float gate_mu = fminf(snr_mu / 2.0f, 1.0f);
+
             float alpha = s->mu * (1.0f - s->rho);
-            alpha += eta * dir;
+            alpha += eta * gate_mu * dir;
             float mu_new = alpha / fmaxf(1.0f - s->rho, 1e-6f);
             s->mu = fmaxf(fminf(mu_new, 2.0f), -5.0f);
         }
 
-        // ── ρ update (natural gradient: score / Fisher) ──
+        // ── ρ update (natural gradient: score / Fisher, SNR-gated) ──
         if (s->learn_rho) {
             float mean_g = sums[2] * K_inv;
             float mean_f = sums[3] * K_inv;
@@ -522,7 +529,10 @@ static void bpf_grad_and_update(GpuBpfState* s, float y_t,
             if (s->grad_clip > 0.0f && fabsf(dir) > s->grad_clip)
                 dir *= s->grad_clip / fabsf(dir);
 
-            float rho_new = s->rho + eta * dir;
+            float snr_rho = fabsf(mean_g) / fmaxf(sqrtf(mean_f / K_f), 1e-10f);
+            float gate_rho = fminf(snr_rho / 2.0f, 1.0f);
+
+            float rho_new = s->rho + eta * gate_rho * dir;
             s->rho = fmaxf(fminf(rho_new, 0.999f), 0.001f);
         }
 
