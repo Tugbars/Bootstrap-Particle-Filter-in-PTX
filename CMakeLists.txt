@@ -313,7 +313,9 @@ endif()
 add_executable(test_bpf_adaptive_stress tests/test_bpf_adaptive_stress.cu)
 
 target_link_libraries(test_bpf_adaptive_stress PRIVATE
-    gpu_bpf
+    gpu_bpf_ptx_full
+    smc2_bpf
+    CUDA::cuda_driver
     CUDA::cudart
     CUDA::curand
 )
