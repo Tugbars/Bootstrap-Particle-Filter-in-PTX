@@ -4,7 +4,7 @@
 # Directory layout:
 #   gpu_bpf/          — Host-side BPF/APF implementations + PTX driver
 #   ptx_assembly/     — Hand-written PTX kernels and pre-compiled cubins
-#   smc2/             — SMC² batch parameter learner (BPF inner filter)
+#   smc2/             — SMC² RBPF parameter learner (4-param, regime-switching)
 #   tests/            — Test harnesses and diagnostics
 #   csv_bank/         — Data files
 #
@@ -210,26 +210,27 @@ set_target_properties(gpu_bpf_ptx_full PROPERTIES
 )
 
 # ==============================================================================
-# Library: smc2_bpf (SMC² batch parameter learner with BPF inner filter)
+# Library: smc2_rbpf (SMC² + RBPF parameter learner, 4-param)
 #
-# Learns θ = (ρ, σ_z, μ) for stochastic volatility model using SMC² with
-# CPMMH rejuvenation. Student-t observation model matches production BPF.
-# Uses CUB BlockRadixSort for CPMMH particle coupling.
+# Learns θ = (ρ, σ_z, μ_base, σ_base) for regime-switching stochastic
+# volatility model. RBPF inner filter with OCSN Kalman updates.
+# CPMMH rejuvenation with bucket sort coupling.
+# Fixed curve shapes (μ_scale, μ_rate, σ_scale, σ_rate) in constant memory.
 # ==============================================================================
 
-add_library(smc2_bpf STATIC smc2/smc2_bpf_batch.cu)
+add_library(smc2_rbpf STATIC smc2/smc2_rbpf_batch.cu)
 
-target_link_libraries(smc2_bpf PRIVATE
+target_link_libraries(smc2_rbpf PRIVATE
     CUDA::cudart
     CUDA::curand
 )
 
-target_include_directories(smc2_bpf PUBLIC
+target_include_directories(smc2_rbpf PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/smc2
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 
-set_target_properties(smc2_bpf PROPERTIES
+set_target_properties(smc2_rbpf PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF
 )
 
@@ -249,8 +250,6 @@ set_target_properties(test_mix_bands PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
 )
-
-
 
 # ==============================================================================
 # Target: test_bpf_ptx_full (matched-DGP BPF accuracy and throughput)
@@ -314,7 +313,7 @@ add_executable(test_bpf_adaptive_stress tests/test_bpf_adaptive_stress.cu)
 
 target_link_libraries(test_bpf_adaptive_stress PRIVATE
     gpu_bpf_ptx_full
-    smc2_bpf
+    smc2_rbpf
     CUDA::cuda_driver
     CUDA::cudart
     CUDA::curand
@@ -362,50 +361,45 @@ target_include_directories(test_cond_resample PRIVATE gpu_bpf)
 target_link_libraries(test_cond_resample curand)
 
 # ==============================================================================
-# Target: test_smc2_bpf (SMC² + BPF convergence tests)
+# Target: test_smc2_rbpf (SMC² + RBPF convergence tests, 4-param)
 #
-# Simulates from known SV model, checks parameter recovery.
+# Simulates from regime-switching SV model with known params, checks recovery.
 # Tests: single window, multi-window, high-vol stress, CPMMH acceptance,
-#        ρ vs σ_z identifiability.
+#        ρ vs σ_z identifiability, latency benchmark.
 # ==============================================================================
 
-add_executable(test_smc2_bpf smc2/test_smc2_bpf.cu)
+add_executable(test_smc2_rbpf smc2/test_smc2_rbpf.cu)
 
-target_link_libraries(test_smc2_bpf PRIVATE
-    smc2_bpf
+target_link_libraries(test_smc2_rbpf PRIVATE
+    smc2_rbpf
     CUDA::cudart
     CUDA::curand
 )
 
-target_include_directories(test_smc2_bpf PRIVATE
+target_include_directories(test_smc2_rbpf PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/smc2
 )
 
-set_target_properties(test_smc2_bpf PROPERTIES
+set_target_properties(test_smc2_rbpf PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
 )
 
 # ==============================================================================
-# Target: test_smc2_bpf (SMC² + BPF convergence tests)
-#
-# Simulates from known SV model, checks parameter recovery.
-# Tests: single window, multi-window, high-vol stress, CPMMH acceptance,
-#        ρ vs σ_z identifiability.
+# Target: test_mu_learning (μ learning diagnostic)
 # ==============================================================================
 
 add_executable(test_mu_learning smc2/test_mu_learning.cu)
 
 target_link_libraries(test_mu_learning PRIVATE
     gpu_bpf_ptx_full
-    smc2_bpf
+    smc2_rbpf
     CUDA::cuda_driver
     CUDA::cudart
     CUDA::curand
 )
 
 target_include_directories(test_mu_learning PRIVATE ${CMAKE_SOURCE_DIR}/gpu_bpf)
-
 
 set_target_properties(test_mu_learning PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF
@@ -425,12 +419,11 @@ target_include_directories(bench_grad_overhead PRIVATE
 
 target_link_libraries(bench_grad_overhead PRIVATE
     gpu_bpf_ptx_full
-    smc2_bpf
+    smc2_rbpf
     CUDA::cuda_driver
     CUDA::cudart
     CUDA::curand
 )
-
 
 # ==============================================================================
 # Print summary
