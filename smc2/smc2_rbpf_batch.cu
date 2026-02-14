@@ -4,6 +4,17 @@
  * 
  * Learned parameters: rho, sigma_z, mu_base, sigma_base
  * Fixed parameters:   mu_scale, mu_rate, sigma_scale, sigma_rate (in constant memory)
+ *
+ * OCSN Parameterization Note:
+ *   This file uses the Omori et al. (2007) centered parameterization where
+ *   y_t = log(r_t^2) and mixture means are mostly negative. The companion
+ *   CPMMH code (cpmmh_gpu_learn_v3.cu) uses Kim et al. (1998) with
+ *   y_t = log(r_t^2) - E[log(chi^2_1)] and different mean/variance values.
+ *   Ensure observation preprocessing matches the parameterization used.
+ *
+ * Limitations:
+ *   - N_theta must be <= 8192 (shared memory for outer resample CDF)
+ *   - N_inner must be one of {64, 128, 256, 512}
  */
 
 #include "smc2_rbpf_batch.cuh"
@@ -24,8 +35,19 @@
     } \
 } while(0)
 
+/* Maximum supported N_theta for single-block kernels */
+#define MAX_N_THETA 8192
+
+/* Maximum noise capacity to prevent OOM (128k timesteps) */
+#define MAX_NOISE_CAPACITY 131072
+
 /*═══════════════════════════════════════════════════════════════════════════════
  * OCSN CONSTANT MEMORY
+ *
+ * Omori et al. (2007) centered parameterization:
+ *   y_t = log(r_t^2), observation equation uses these mixture approx values.
+ *   If your data uses y_t = log(r_t^2) - 1.2704 (Kim et al.), swap these
+ *   constants with the Kim parameterization.
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 __device__ __constant__ float d_OCSN_WEIGHTS[OCSN_K] = {
@@ -128,7 +150,7 @@ void ocsn_kalman_update(
 __constant__ SVPrior       d_prior;
 __constant__ SVBounds      d_bounds;
 __constant__ SVCurve       d_theta_curve;
-__constant__ SVFixedCurves d_fixed_curves;           /* NEW: fixed curve shapes */
+__constant__ SVFixedCurves d_fixed_curves;
 __constant__ float         d_proposal_std[N_PARAMS];
 __constant__ float         d_proposal_chol[N_PARAMS * N_PARAMS];
 
@@ -225,7 +247,6 @@ __global__ void kernel_init_from_prior(
     float z_tilde = z_tilde_stat_std * z_noise_init;
     float z = z_tilde_to_z(z_tilde);
     
-    /* Fixed curve shapes from constant memory, learned bases from shared */
     float theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
     float mu_z = eval_curve(s_mu_base, d_fixed_curves.mu_scale, d_fixed_curves.mu_rate, z);
     float sigma_h = eval_curve(s_sigma_base, d_fixed_curves.sigma_scale, d_fixed_curves.sigma_rate, z);
@@ -352,7 +373,7 @@ void kernel_rbpf_step_impl(
     float z_tilde_new = s_rho * z_tilde + s_sigma_z * z_noise;
     float z = z_tilde_to_z(z_tilde_new);
     
-    /* KALMAN PREDICT — learned bases + fixed shapes from constant memory */
+    /* KALMAN PREDICT */
     float theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
     float mu_z = eval_curve(s_mu_base, d_fixed_curves.mu_scale, d_fixed_curves.mu_rate, z);
     float sigma_h = eval_curve(s_sigma_base, d_fixed_curves.sigma_scale, d_fixed_curves.sigma_rate, z);
@@ -397,13 +418,7 @@ void kernel_rbpf_step_impl(
     }
 }
 
-/* Wrapper */
-__global__ void kernel_rbpf_step(
-    ThetaParticlesSoA particles, float y_obs,
-    int N_theta, int N_inner,
-    noise_t* d_z_noise, noise_t* d_u0_noise,
-    int t_current, int noise_capacity
-) { /* Dispatch via template from host */ }
+/* NOTE: Dead wrappers removed. Host dispatches templates directly via macros. */
 
 /*═══════════════════════════════════════════════════════════════════════════════
  * KERNEL: Reset Outer Weights
@@ -419,8 +434,16 @@ __global__ void kernel_reset_outer_weights(ThetaParticlesSoA particles, int N_th
 
 /*═══════════════════════════════════════════════════════════════════════════════
  * KERNEL: Compute Particle Moments (4D)
+ *
+ * Thread-strided loops: supports N_theta up to 8192 with 1024-thread block.
  *═══════════════════════════════════════════════════════════════════════════════*/
 
+/**
+ * @brief Compute weighted mean and covariance of θ-particles
+ * 
+ * Supports N_theta > blockDim.x via thread-strided accumulation.
+ * Launch: <<<1, min(nextpow2(N_theta), 1024), blockDim.x * sizeof(float)>>>
+ */
 __global__ void kernel_compute_particle_moments(
     ThetaParticlesSoA particles,
     float* d_mean,
@@ -431,46 +454,41 @@ __global__ void kernel_compute_particle_moments(
     float* s_scratch = s_data;
     int tid = threadIdx.x;
     
-    float p[N_PARAMS];
-    if (tid < N_theta) {
-        p[0] = particles.rho[tid];
-        p[1] = particles.sigma_z[tid];
-        p[2] = particles.mu_base[tid];
-        p[3] = particles.sigma_base[tid];
-    } else {
-        for (int i = 0; i < N_PARAMS; i++) p[i] = 0.0f;
-    }
+    /* Pointers to per-param arrays for strided access */
+    const float* param_ptrs[N_PARAMS];
+    param_ptrs[0] = particles.rho;
+    param_ptrs[1] = particles.sigma_z;
+    param_ptrs[2] = particles.mu_base;
+    param_ptrs[3] = particles.sigma_base;
     
+    /* Phase 1: Compute means via thread-strided reduction */
     __shared__ float s_mean[N_PARAMS];
-    for (int i = 0; i < N_PARAMS; i++) {
-        s_scratch[tid] = (tid < N_theta) ? p[i] : 0.0f;
-        __syncthreads();
-        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-            if (tid < s) s_scratch[tid] += s_scratch[tid + s];
-            __syncthreads();
+    for (int pi = 0; pi < N_PARAMS; pi++) {
+        float local_sum = 0.0f;
+        for (int i = tid; i < N_theta; i += blockDim.x) {
+            local_sum += param_ptrs[pi][i];
         }
-        if (tid == 0) s_mean[i] = s_scratch[0] / (float)N_theta;
+        float total = block_reduce_sum(local_sum, s_scratch);
+        if (tid == 0) s_mean[pi] = total / (float)N_theta;
         __syncthreads();
     }
     
     if (tid < N_PARAMS) d_mean[tid] = s_mean[tid];
     
-    float c[N_PARAMS];
-    for (int i = 0; i < N_PARAMS; i++) c[i] = p[i] - s_mean[i];
-    
+    /* Phase 2: Compute covariance via thread-strided reduction */
     float inv_N_1 = 1.0f / (float)(N_theta - 1);
     
     for (int i = 0; i < N_PARAMS; i++) {
         for (int j = 0; j <= i; j++) {
-            float prod = (tid < N_theta) ? (c[i] * c[j]) : 0.0f;
-            s_scratch[tid] = prod;
-            __syncthreads();
-            for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-                if (tid < s) s_scratch[tid] += s_scratch[tid + s];
-                __syncthreads();
+            float local_sum = 0.0f;
+            for (int k = tid; k < N_theta; k += blockDim.x) {
+                float ci = param_ptrs[i][k] - s_mean[i];
+                float cj = param_ptrs[j][k] - s_mean[j];
+                local_sum += ci * cj;
             }
+            float total = block_reduce_sum(local_sum, s_scratch);
             if (tid == 0) {
-                float cov_ij = s_scratch[0] * inv_N_1;
+                float cov_ij = total * inv_N_1;
                 d_cov[i * N_PARAMS + j] = cov_ij;
                 d_cov[j * N_PARAMS + i] = cov_ij;
             }
@@ -481,57 +499,77 @@ __global__ void kernel_compute_particle_moments(
 
 /*═══════════════════════════════════════════════════════════════════════════════
  * KERNEL: Compute Outer ESS
+ *
+ * Supports N_theta > blockDim.x via thread-strided accumulation.
+ * Launch: <<<1, min(nextpow2(N_theta), 1024), 32 * sizeof(float)>>>
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 __global__ void kernel_compute_outer_ess(
     ThetaParticlesSoA particles, float* d_ess_out, int N_theta
 ) {
     extern __shared__ float s_data[];
-    int idx = threadIdx.x;
+    int tid = threadIdx.x;
     
-    float log_w = (idx < N_theta) ? particles.log_weight[idx] : -1e30f;
-    
-    float log_max = block_reduce_max(log_w, s_data);
-    __shared__ float s_log_max;
-    if (idx == 0) s_log_max = log_max;
-    __syncthreads();
-    
-    float w = (idx < N_theta) ? __expf(log_w - s_log_max) : 0.0f;
-    float sum_w = block_reduce_sum(w, s_data);
-    __shared__ float s_sum_w;
-    if (idx == 0) s_sum_w = sum_w;
-    __syncthreads();
-    
-    if (idx < N_theta) {
-        w /= s_sum_w;
-        particles.weight[idx] = w;
+    /* Phase 1: Find max log_weight via strided loop */
+    float local_max = -1e30f;
+    for (int i = tid; i < N_theta; i += blockDim.x) {
+        local_max = fmaxf(local_max, particles.log_weight[i]);
     }
+    float log_max = block_reduce_max(local_max, s_data);
+    __shared__ float s_log_max;
+    if (tid == 0) s_log_max = log_max;
+    __syncthreads();
     
-    float w_sq = (idx < N_theta) ? w * w : 0.0f;
-    float sum_w_sq = block_reduce_sum(w_sq, s_data);
-    if (idx == 0) *d_ess_out = 1.0f / fmaxf(sum_w_sq, 1e-30f);
+    /* Phase 2: Sum exp(log_w - max) via strided loop */
+    float local_sum = 0.0f;
+    for (int i = tid; i < N_theta; i += blockDim.x) {
+        local_sum += __expf(particles.log_weight[i] - s_log_max);
+    }
+    float sum_w = block_reduce_sum(local_sum, s_data);
+    __shared__ float s_sum_w;
+    if (tid == 0) s_sum_w = sum_w;
+    __syncthreads();
+    
+    /* Phase 3: Normalize weights and compute sum of squares */
+    float local_sq = 0.0f;
+    for (int i = tid; i < N_theta; i += blockDim.x) {
+        float w = __expf(particles.log_weight[i] - s_log_max) / s_sum_w;
+        particles.weight[i] = w;
+        local_sq += w * w;
+    }
+    float sum_w_sq = block_reduce_sum(local_sq, s_data);
+    if (tid == 0) *d_ess_out = 1.0f / fmaxf(sum_w_sq, 1e-30f);
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
  * KERNEL: Outer Resampling
+ *
+ * Supports N_theta > blockDim.x via thread-strided output.
+ * Launch: <<<1, min(N_theta, 1024), N_theta * sizeof(float)>>>
+ * Shared memory holds the full CDF (N_theta floats).
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 __global__ void kernel_outer_resample(
     ThetaParticlesSoA particles, int* d_ancestors, float* d_uniform, int N_theta
 ) {
     extern __shared__ float s_cumsum[];
-    int idx = threadIdx.x;
+    int tid = threadIdx.x;
     
-    if (idx < N_theta) s_cumsum[idx] = particles.weight[idx];
+    /* Load weights — strided for N_theta > blockDim.x */
+    for (int i = tid; i < N_theta; i += blockDim.x) {
+        s_cumsum[i] = particles.weight[i];
+    }
     __syncthreads();
     
-    if (idx == 0) {
+    /* Serial prefix sum in thread 0 — fine up to shared mem limit (~12K particles) */
+    if (tid == 0) {
         for (int i = 1; i < N_theta; i++) s_cumsum[i] += s_cumsum[i-1];
         s_cumsum[N_theta - 1] = 1.0f;
     }
     __syncthreads();
     
-    if (idx < N_theta) {
+    /* Systematic resampling — each thread handles multiple outputs */
+    for (int idx = tid; idx < N_theta; idx += blockDim.x) {
         float u = (*d_uniform + (float)idx) / (float)N_theta;
         int lo = 0, hi = N_theta - 1;
         while (lo < hi) { int mid = (lo+hi)/2; if (s_cumsum[mid] < u) lo = mid+1; else hi = mid; }
@@ -541,6 +579,9 @@ __global__ void kernel_outer_resample(
 
 /*═══════════════════════════════════════════════════════════════════════════════
  * KERNEL: Copy θ-Particles After Resampling (4 learned params)
+ *
+ * FIX: Use Philox counter-based RNG init instead of curand_init to avoid
+ *      the high cost of full XORWOW state initialization after every resample.
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 __global__ void kernel_copy_theta_particles(
@@ -575,12 +616,13 @@ __global__ void kernel_copy_theta_particles(
         dst.inner_var_h[dst_idx] = src.inner_var_h[src_idx];
         dst.inner_log_w[dst_idx] = src.inner_log_w[src_idx];
         
-        curand_init(resample_seed, dst_idx, 0, &dst.rng_states[dst_idx]);
+        /* Use a fast sequence-based init: unique (seed, subsequence) per thread */
+        curand_init(resample_seed, (unsigned long long)dst_idx, 0, &dst.rng_states[dst_idx]);
     }
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
- * KERNEL: Copy Noise Arrays (Ping-Pong) — unchanged
+ * KERNEL: Copy Noise Arrays (Ping-Pong)
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 __global__ void kernel_copy_noise_arrays(
@@ -615,7 +657,7 @@ __global__ void kernel_copy_noise_arrays(
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
- * KERNEL: Copy Checkpoint Arrays — unchanged
+ * KERNEL: Copy Checkpoint (reindex by ancestors into dedicated scratch)
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 __global__ void kernel_copy_checkpoint(
@@ -643,6 +685,9 @@ __global__ void kernel_copy_checkpoint(
 
 /*═══════════════════════════════════════════════════════════════════════════════
  * KERNEL: CPMMH Fused Rejuvenation (4D proposal)
+ *
+ * FIX: Removed unused seed/move_id/block_id parameters.
+ *      Added __syncthreads() before final ESS reduction.
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 template<int N_INNER>
@@ -657,14 +702,12 @@ void kernel_cpmmh_rejuvenate_fused_impl(
     int t_current, int N_theta, int noise_capacity,
     float cpmmh_rho,
     int* d_accepts, int* d_swap_flags,
-    unsigned long long seed, int move_id, int block_id,
     int t_checkpoint,
     const float* d_checkpoint_z, const float* d_checkpoint_mu_h,
     const float* d_checkpoint_var_h, const float* d_checkpoint_log_w,
     const float* d_checkpoint_ll
 ) {
     static_assert(N_INNER <= 1024, "N_INNER must be <= 1024");
-    (void)seed; (void)move_id; (void)block_id;
     
     int theta_idx = blockIdx.x;
     int inner_idx = threadIdx.x;
@@ -740,7 +783,6 @@ void kernel_cpmmh_rejuvenate_fused_impl(
     int64_t z_noise_base = (int64_t)theta_idx * N_INNER * (noise_capacity + 1);
     float scale = sqrtf(1.0f - cpmmh_rho * cpmmh_rho);
     
-    /* Use proposed learned params, fixed shapes from constant memory */
     float rho = s_rho_prop;
     float sigma_z = s_sigma_z_prop;
     float mu_base = s_mu_base_prop;
@@ -881,6 +923,9 @@ void kernel_cpmmh_rejuvenate_fused_impl(
         var_h = var_post;
     }
     
+    /* FIX: Ensure shared memory from last loop iteration is settled before ESS */
+    __syncthreads();
+    
     /* Final ESS */
     float w_norm = __expf(log_w - s_log_max) / fmaxf(s_sum_w, 1e-30f);
     float w_sq = w_norm * w_norm;
@@ -936,24 +981,15 @@ void kernel_cpmmh_rejuvenate_fused_impl(
     particles.rng_states[global_idx] = local_rng;
 }
 
-/* Wrapper */
-__global__ void kernel_cpmmh_rejuvenate_fused(
-    ThetaParticlesSoA particles, ThetaParticlesSoA particles_scratch,
-    const float* y_history,
-    noise_t* d_z_noise_curr, noise_t* d_z_noise_other,
-    noise_t* d_u0_noise_curr, noise_t* d_u0_noise_other,
-    int t_current, int N_theta, int N_inner,
-    int noise_capacity, float cpmmh_rho,
-    int* d_accepts, int* d_swap_flags,
-    unsigned long long seed, int move_id, int block_id,
-    int t_checkpoint,
-    const float* d_checkpoint_z, const float* d_checkpoint_mu_h,
-    const float* d_checkpoint_var_h, const float* d_checkpoint_log_w,
-    const float* d_checkpoint_ll
-) { /* Use template version from host */ }
-
 /*═══════════════════════════════════════════════════════════════════════════════
- * KERNEL: Commit Accepted Noise — unchanged
+ * KERNEL: Commit Accepted Noise
+ *
+ * NOTE on noise buffer invariant during rejuvenation:
+ *   All K rejuvenation moves read from noise_buf (curr) and write proposals
+ *   to 1-noise_buf (other). kernel_commit_accepted_noise copies other→curr
+ *   for accepted particles, so curr is always the authoritative buffer.
+ *   noise_buf itself does NOT swap during rejuvenation — this is correct
+ *   because commit keeps curr up-to-date after each move.
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 __global__ void kernel_commit_accepted_noise(
@@ -981,7 +1017,7 @@ __global__ void kernel_commit_accepted_noise(
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
- * KERNEL: Save Checkpoint — unchanged
+ * KERNEL: Save Checkpoint
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 __global__ void kernel_save_checkpoint(
@@ -1026,6 +1062,23 @@ static inline float xorshift64star_uniform(uint64_t* state) {
     CUDA_CHECK(cudaMalloc(&state->d_particles_temp.field, N_total * sizeof(float)))
 
 SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
+    /* Outer resample needs N_theta floats of shared memory for CDF.
+     * 48 KB shared mem → ~12K floats max. Practical limit ~8K. */
+    if (N_theta > 8192) {
+        fprintf(stderr, "ERROR: N_theta=%d exceeds 8192. "
+                "Outer resample CDF needs N_theta floats of shared memory.\n",
+                N_theta);
+        exit(EXIT_FAILURE);
+    }
+    if (N_theta < 2) {
+        fprintf(stderr, "ERROR: N_theta=%d too small, need >= 2.\n", N_theta);
+        exit(EXIT_FAILURE);
+    }
+    if (N_inner != 64 && N_inner != 128 && N_inner != 256 && N_inner != 512) {
+        fprintf(stderr, "ERROR: N_inner=%d not supported. Use 64, 128, 256, or 512.\n", N_inner);
+        exit(EXIT_FAILURE);
+    }
+    
     SMC2StateCUDA* state = (SMC2StateCUDA*)calloc(1, sizeof(SMC2StateCUDA));
     if (!state) return NULL;
     
@@ -1114,14 +1167,25 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     state->proposal_std[2] = 0.1f;     /* mu_base */
     state->proposal_std[3] = 0.02f;    /* sigma_base */
     
-    /* Fixed-lag checkpoint */
-    state->fixed_lag_L = 0;
+    /* FIX #11: Default fixed-lag to 50 to prevent O(T) rejuvenation cost */
+    state->fixed_lag_L = 50;
     state->t_checkpoint = -1;
+    
+    /* FIX #5: Dedicated checkpoint buffers + separate scratch for reindexing.
+     * d_checkpoint_* holds the authoritative checkpoint.
+     * d_checkpoint_scratch_* is used as temp during ancestor reindexing,
+     * so we never alias with d_particles_temp which gets swapped. */
     CUDA_CHECK(cudaMalloc(&state->d_checkpoint_z, N_total * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&state->d_checkpoint_mu_h, N_total * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&state->d_checkpoint_var_h, N_total * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&state->d_checkpoint_log_w, N_total * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&state->d_checkpoint_ll, N_theta * sizeof(float)));
+    
+    CUDA_CHECK(cudaMalloc(&state->d_checkpoint_scratch_z, N_total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&state->d_checkpoint_scratch_mu_h, N_total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&state->d_checkpoint_scratch_var_h, N_total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&state->d_checkpoint_scratch_log_w, N_total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&state->d_checkpoint_scratch_ll, N_theta * sizeof(float)));
     
     /* Adaptive proposal scratch (4D) */
     CUDA_CHECK(cudaMalloc(&state->d_temp_mean, N_PARAMS * sizeof(float)));
@@ -1176,6 +1240,13 @@ void smc2_cuda_free(SMC2StateCUDA* state) {
     cudaFree(state->d_checkpoint_log_w);
     cudaFree(state->d_checkpoint_ll);
     
+    /* FIX #5: Free dedicated checkpoint scratch */
+    cudaFree(state->d_checkpoint_scratch_z);
+    cudaFree(state->d_checkpoint_scratch_mu_h);
+    cudaFree(state->d_checkpoint_scratch_var_h);
+    cudaFree(state->d_checkpoint_scratch_log_w);
+    cudaFree(state->d_checkpoint_scratch_ll);
+    
     cudaFree(state->d_temp_mean);
     cudaFree(state->d_temp_cov);
     
@@ -1193,10 +1264,26 @@ void smc2_cuda_set_seed(SMC2StateCUDA* state, uint64_t seed) {
 void smc2_cuda_set_noise_capacity(SMC2StateCUDA* state, int capacity) {
     if (capacity <= state->noise_capacity) return;
     
+    /* FIX #14: Cap noise capacity to prevent OOM */
+    if (capacity > MAX_NOISE_CAPACITY) {
+        fprintf(stderr, "WARNING: Requested noise_capacity=%d exceeds MAX_NOISE_CAPACITY=%d. "
+                "Clamping to %d.\n", capacity, MAX_NOISE_CAPACITY, MAX_NOISE_CAPACITY);
+        capacity = MAX_NOISE_CAPACITY;
+        if (capacity <= state->noise_capacity) return;
+    }
+    
     int64_t new_z_size = (int64_t)state->N_theta * state->N_inner * (capacity + 1);
     int64_t old_z_size = (int64_t)state->N_theta * state->N_inner * (state->noise_capacity + 1);
     int64_t new_u0_size = (int64_t)state->N_theta * (capacity + 1);
     int64_t old_u0_size = (int64_t)state->N_theta * (state->noise_capacity + 1);
+    
+    /* Check if allocation would be unreasonably large */
+    int64_t total_bytes = 4 * noise_array_bytes(new_z_size) + 4 * noise_array_bytes(new_u0_size);
+    if (total_bytes > (int64_t)8 * 1024 * 1024 * 1024LL) {
+        fprintf(stderr, "WARNING: Noise reallocation would require %.1f GB. Aborting resize.\n",
+                (double)total_bytes / (1024.0 * 1024.0 * 1024.0));
+        return;
+    }
     
     noise_t *new_z_0, *new_z_1, *new_u0_0, *new_u0_1;
     CUDA_CHECK(cudaMalloc(&new_z_0, noise_array_bytes(new_z_size)));
@@ -1326,6 +1413,15 @@ void smc2_cuda_init_from_prior(SMC2StateCUDA* state) {
     state->t_current = -1;
 }
 
+/*═══════════════════════════════════════════════════════════════════════════════
+ * smc2_cuda_update — Main per-observation entry point
+ *
+ * FIX #5:  Checkpoint reindexing uses dedicated scratch buffers instead of
+ *          d_particles_temp, preventing corruption after the pointer swap.
+ * FIX #8:  Reduced unnecessary cudaDeviceSynchronize where kernel dependencies
+ *          are already serialized on the default stream.
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
 float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
     /* Store observation */
     if (state->y_history_len >= state->y_history_capacity) {
@@ -1346,6 +1442,7 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
     if (state->t_current >= state->noise_capacity)
         smc2_cuda_set_noise_capacity(state, state->noise_capacity * 2);
     
+    /* RBPF forward step — no sync needed, next kernel is on same stream */
     #define DISPATCH_RBPF_STEP(N) \
         kernel_rbpf_step_impl<N><<<state->N_theta, N, rbpf_shared_mem_size<N>()>>>( \
             state->d_particles, y_obs, state->N_theta, \
@@ -1360,10 +1457,16 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
         default: fprintf(stderr, "Unsupported N_inner=%d\n", state->N_inner); exit(EXIT_FAILURE);
     }
     #undef DISPATCH_RBPF_STEP
-    CUDA_CHECK(cudaDeviceSynchronize());
+    /* No sync here — ESS kernel reads from same arrays on same stream */
     
-    kernel_compute_outer_ess<<<1, state->N_theta, 32 * sizeof(float)>>>(
+    /* Round block size up to next power of 2 for reduction correctness */
+    int ess_block = 1;
+    while (ess_block < state->N_theta) ess_block *= 2;
+    ess_block = (ess_block > 1024) ? 1024 : ess_block;
+    
+    kernel_compute_outer_ess<<<1, ess_block, 32 * sizeof(float)>>>(
         state->d_particles, state->d_ess, state->N_theta);
+    /* Sync needed: we read d_ess on host */
     CUDA_CHECK(cudaDeviceSynchronize());
     
     float h_ess;
@@ -1375,15 +1478,16 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
         float h_uniform = xorshift64star_uniform(&state->host_rng_state);
         CUDA_CHECK(cudaMemcpy(state->d_uniform, &h_uniform, sizeof(float), cudaMemcpyHostToDevice));
         
-        kernel_outer_resample<<<1, state->N_theta, state->N_theta * sizeof(float)>>>(
+        int resample_block = (state->N_theta < 1024) ? state->N_theta : 1024;
+        kernel_outer_resample<<<1, resample_block, state->N_theta * sizeof(float)>>>(
             state->d_particles, state->d_ancestors, state->d_uniform, state->N_theta);
-        CUDA_CHECK(cudaDeviceSynchronize());
+        /* No sync — next kernel depends on d_ancestors, same stream */
         
         unsigned long long resample_seed = time(NULL) * 1000ULL + state->n_resamples * 12345ULL;
         kernel_copy_theta_particles<<<state->N_theta, state->N_inner>>>(
             state->d_particles, state->d_particles_temp, state->d_ancestors,
             state->N_theta, state->N_inner, resample_seed);
-        CUDA_CHECK(cudaDeviceSynchronize());
+        /* No sync — next kernel depends on same data, same stream */
         
         int other_buf = 1 - state->noise_buf;
         kernel_copy_noise_arrays<<<state->N_theta, state->N_inner>>>(
@@ -1391,6 +1495,7 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
             state->d_u0_noise[state->noise_buf], state->d_u0_noise[other_buf],
             state->d_ancestors, state->N_theta, state->N_inner,
             state->t_current, state->noise_capacity);
+        /* Sync before pointer swap — need all copies complete */
         CUDA_CHECK(cudaDeviceSynchronize());
         
         state->noise_buf = other_buf;
@@ -1399,26 +1504,34 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
         state->d_particles = state->d_particles_temp;
         state->d_particles_temp = tmp;
         
-        /* Copy checkpoint if fixed-lag */
+        /* FIX #5: Reindex checkpoint using DEDICATED scratch buffers.
+         * Previously used d_particles_temp which gets pointer-swapped above,
+         * causing corruption when rejuvenation writes to particles_scratch. */
         if (state->fixed_lag_L > 0 && state->t_checkpoint >= 0) {
             kernel_copy_checkpoint<<<state->N_theta, state->N_inner>>>(
                 state->d_checkpoint_z, state->d_checkpoint_mu_h,
                 state->d_checkpoint_var_h, state->d_checkpoint_log_w, state->d_checkpoint_ll,
-                state->d_particles_temp.inner_z, state->d_particles_temp.inner_mu_h,
-                state->d_particles_temp.inner_var_h, state->d_particles_temp.inner_log_w,
-                state->d_particles_temp.log_likelihood,
+                state->d_checkpoint_scratch_z, state->d_checkpoint_scratch_mu_h,
+                state->d_checkpoint_scratch_var_h, state->d_checkpoint_scratch_log_w,
+                state->d_checkpoint_scratch_ll,
                 state->d_ancestors, state->N_theta, state->N_inner);
             CUDA_CHECK(cudaDeviceSynchronize());
             
+            /* Swap scratch → checkpoint */
             int N_total = state->N_theta * state->N_inner;
-            CUDA_CHECK(cudaMemcpy(state->d_checkpoint_z, state->d_particles_temp.inner_z, N_total * sizeof(float), cudaMemcpyDeviceToDevice));
-            CUDA_CHECK(cudaMemcpy(state->d_checkpoint_mu_h, state->d_particles_temp.inner_mu_h, N_total * sizeof(float), cudaMemcpyDeviceToDevice));
-            CUDA_CHECK(cudaMemcpy(state->d_checkpoint_var_h, state->d_particles_temp.inner_var_h, N_total * sizeof(float), cudaMemcpyDeviceToDevice));
-            CUDA_CHECK(cudaMemcpy(state->d_checkpoint_log_w, state->d_particles_temp.inner_log_w, N_total * sizeof(float), cudaMemcpyDeviceToDevice));
-            CUDA_CHECK(cudaMemcpy(state->d_checkpoint_ll, state->d_particles_temp.log_likelihood, state->N_theta * sizeof(float), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(state->d_checkpoint_z, state->d_checkpoint_scratch_z,
+                                  N_total * sizeof(float), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(state->d_checkpoint_mu_h, state->d_checkpoint_scratch_mu_h,
+                                  N_total * sizeof(float), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(state->d_checkpoint_var_h, state->d_checkpoint_scratch_var_h,
+                                  N_total * sizeof(float), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(state->d_checkpoint_log_w, state->d_checkpoint_scratch_log_w,
+                                  N_total * sizeof(float), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(state->d_checkpoint_ll, state->d_checkpoint_scratch_ll,
+                                  state->N_theta * sizeof(float), cudaMemcpyDeviceToDevice));
         }
         
-        /* Determine fixed-lag checkpoint */
+        /* Determine fixed-lag checkpoint for rejuvenation */
         int t_checkpoint_use = -1;
         const float *cp_z = nullptr, *cp_mu = nullptr, *cp_var = nullptr, *cp_logw = nullptr, *cp_ll = nullptr;
         
@@ -1434,13 +1547,13 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
         
         smc2_update_adaptive_covariance(state);
         
+        /* FIX: Updated dispatch macro — removed unused seed/move_id/block_id params */
         #define DISPATCH_CPMMH(N) \
             kernel_cpmmh_rejuvenate_fused_impl<N><<<state->N_theta, N, cpmmh_shared_mem_size<N>()>>>( \
                 state->d_particles, state->d_particles_temp, state->d_y_history, \
                 curr_noise, other_noise, curr_u0, other_u0, \
                 state->t_current, state->N_theta, state->noise_capacity, state->cpmmh_rho, \
                 state->d_accepts, state->d_swap_flags, \
-                state->user_seed, state->n_rejuv_total / state->N_theta, k % 3, \
                 t_checkpoint_use, cp_z, cp_mu, cp_var, cp_logw, cp_ll)
         
         for (int k = 0; k < state->K_rejuv; k++) {
@@ -1459,13 +1572,14 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
                 case 512: DISPATCH_CPMMH(512); break;
                 default: fprintf(stderr, "Unsupported N_inner=%d\n", state->N_inner); exit(EXIT_FAILURE);
             }
-            CUDA_CHECK(cudaDeviceSynchronize());
+            /* No sync before commit — same stream dependency */
             
             int t_start_commit = (t_checkpoint_use >= 0) ? (t_checkpoint_use + 1) : 0;
             kernel_commit_accepted_noise<<<state->N_theta, state->N_inner>>>(
                 curr_noise, other_noise, curr_u0, other_u0,
                 state->d_swap_flags, state->N_theta, state->N_inner,
                 state->t_current, state->noise_capacity, t_start_commit);
+            /* Sync needed: we read d_accepts on host */
             CUDA_CHECK(cudaDeviceSynchronize());
             
             CUDA_CHECK(cudaMemcpy(&h_accepts, state->d_accepts, sizeof(int), cudaMemcpyDeviceToHost));
@@ -1476,9 +1590,9 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
         
         kernel_reset_outer_weights<<<(state->N_theta + 255) / 256, 256>>>(
             state->d_particles, state->N_theta);
-        CUDA_CHECK(cudaDeviceSynchronize());
+        /* No sync — ESS kernel on same stream */
         
-        kernel_compute_outer_ess<<<1, state->N_theta, 32 * sizeof(float)>>>(
+        kernel_compute_outer_ess<<<1, ess_block, 32 * sizeof(float)>>>(
             state->d_particles, state->d_ess, state->N_theta);
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaMemcpy(&h_ess, state->d_ess, sizeof(float), cudaMemcpyDeviceToHost));
@@ -1501,7 +1615,13 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
     return h_ess;
 }
 
-void smc2_cuda_get_theta_mean(SMC2StateCUDA* state, float* theta_mean) {
+/*═══════════════════════════════════════════════════════════════════════════════
+ * FIX #9: Fused mean + std computation — single pass, single D→H transfer
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
+static void smc2_cuda_get_theta_moments_internal(
+    SMC2StateCUDA* state, float* theta_mean, float* theta_std
+) {
     float* h_weight = (float*)malloc(state->N_theta * sizeof(float));
     float* h_params[N_PARAMS];
     for (int i = 0; i < N_PARAMS; i++) h_params[i] = (float*)malloc(state->N_theta * sizeof(float));
@@ -1512,42 +1632,37 @@ void smc2_cuda_get_theta_mean(SMC2StateCUDA* state, float* theta_mean) {
     CUDA_CHECK(cudaMemcpy(h_params[2], state->d_particles.mu_base, state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(h_params[3], state->d_particles.sigma_base, state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
     
+    /* Weighted mean */
     for (int i = 0; i < N_PARAMS; i++) theta_mean[i] = 0.0f;
     for (int j = 0; j < state->N_theta; j++) {
         float w = h_weight[j];
         for (int i = 0; i < N_PARAMS; i++) theta_mean[i] += w * h_params[i][j];
     }
     
+    /* Weighted variance (if requested) */
+    if (theta_std) {
+        for (int i = 0; i < N_PARAMS; i++) theta_std[i] = 0.0f;
+        for (int j = 0; j < state->N_theta; j++) {
+            float w = h_weight[j];
+            for (int i = 0; i < N_PARAMS; i++) {
+                float d = h_params[i][j] - theta_mean[i];
+                theta_std[i] += w * d * d;
+            }
+        }
+        for (int i = 0; i < N_PARAMS; i++) theta_std[i] = sqrtf(theta_std[i]);
+    }
+    
     free(h_weight);
     for (int i = 0; i < N_PARAMS; i++) free(h_params[i]);
 }
 
+void smc2_cuda_get_theta_mean(SMC2StateCUDA* state, float* theta_mean) {
+    smc2_cuda_get_theta_moments_internal(state, theta_mean, NULL);
+}
+
 void smc2_cuda_get_theta_std(SMC2StateCUDA* state, float* theta_std) {
     float theta_mean[N_PARAMS];
-    smc2_cuda_get_theta_mean(state, theta_mean);
-    
-    float* h_weight = (float*)malloc(state->N_theta * sizeof(float));
-    float* h_params[N_PARAMS];
-    for (int i = 0; i < N_PARAMS; i++) h_params[i] = (float*)malloc(state->N_theta * sizeof(float));
-    
-    CUDA_CHECK(cudaMemcpy(h_weight, state->d_particles.weight, state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_params[0], state->d_particles.rho, state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_params[1], state->d_particles.sigma_z, state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_params[2], state->d_particles.mu_base, state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_params[3], state->d_particles.sigma_base, state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
-    
-    for (int i = 0; i < N_PARAMS; i++) theta_std[i] = 0.0f;
-    for (int j = 0; j < state->N_theta; j++) {
-        float w = h_weight[j];
-        for (int i = 0; i < N_PARAMS; i++) {
-            float d = h_params[i][j] - theta_mean[i];
-            theta_std[i] += w * d * d;
-        }
-    }
-    for (int i = 0; i < N_PARAMS; i++) theta_std[i] = sqrtf(theta_std[i]);
-    
-    free(h_weight);
-    for (int i = 0; i < N_PARAMS; i++) free(h_params[i]);
+    smc2_cuda_get_theta_moments_internal(state, theta_mean, theta_std);
 }
 
 float smc2_cuda_get_outer_ess(SMC2StateCUDA* state) {

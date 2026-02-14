@@ -92,6 +92,13 @@
  *     z = 1.5·(1 + tanh(z̃)) ∈ (0, 3)   (bounded, for curves)
  * 
  * 
+ * Limitations
+ * ===========
+ * 
+ *   - N_theta must be <= MAX_N_THETA (8192) due to shared memory CDF in outer resample
+ *   - N_inner must be one of {64, 128, 256, 512} (template dispatch)
+ * 
+ * 
  * References
  * ==========
  * 
@@ -128,6 +135,12 @@
 
 #define Z_CENTER 1.5f
 #define Z_SCALE  1.5f
+
+/** Maximum N_theta — limited by shared memory for outer resample CDF */
+#define MAX_N_THETA 8192
+
+/** Maximum noise capacity to prevent OOM */
+#define MAX_NOISE_CAPACITY 131072
 
 /*═══════════════════════════════════════════════════════════════════════════════
  * SECTION 2: DATA STRUCTURES
@@ -262,6 +275,17 @@ struct SMC2StateCUDA {
     float* d_checkpoint_log_w;
     float* d_checkpoint_ll;
     
+    /** Dedicated scratch for checkpoint reindexing after outer resample.
+     *  Separate from d_particles_temp to prevent corruption after the
+     *  particle pointer swap — rejuvenation writes to particles_scratch
+     *  (which IS d_particles_temp), so using those arrays for checkpoint
+     *  reindexing would corrupt the checkpoint data. */
+    float* d_checkpoint_scratch_z;
+    float* d_checkpoint_scratch_mu_h;
+    float* d_checkpoint_scratch_var_h;
+    float* d_checkpoint_scratch_log_w;
+    float* d_checkpoint_scratch_ll;
+    
     /* ═══ Diagnostics ═══ */
     int n_resamples;
     int n_rejuv_accepts;
@@ -345,7 +369,9 @@ void block_inclusive_scan(volatile float* data, int n) {
         __syncthreads();
         
         if (tid >= offset && tid < n) {
-            data[tid] += temp;
+            float val = data[tid];
+            val += temp;
+            data[tid] = val;
         }
         __syncthreads();
     }
@@ -395,6 +421,10 @@ __device__ void ocsn_kalman_update(
 
 /*═══════════════════════════════════════════════════════════════════════════════
  * SECTION 6: KERNEL DECLARATIONS
+ *
+ * NOTE: The RBPF step and CPMMH rejuvenation kernels are template-dispatched
+ * from the host via macros in the .cu file. The non-template wrappers have
+ * been removed — only the template implementations exist.
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 __global__ void kernel_init_rng(curandState* states, unsigned long long seed, int N);
@@ -406,13 +436,7 @@ __global__ void kernel_init_from_prior(
     int noise_capacity
 );
 
-__global__ void kernel_rbpf_step(
-    ThetaParticlesSoA particles,
-    float y_obs,
-    int N_theta, int N_inner,
-    noise_t* d_z_noise, noise_t* d_u0_noise,
-    int t_current, int noise_capacity
-);
+/* RBPF step: template-dispatched, declared in .cu via kernel_rbpf_step_impl<N_INNER> */
 
 __global__ void kernel_compute_outer_ess(
     ThetaParticlesSoA particles, float* d_ess_out, int N_theta
@@ -434,16 +458,25 @@ __global__ void kernel_copy_noise_arrays(
     int t_current, int noise_capacity
 );
 
-__global__ void kernel_cpmmh_rejuvenate_fused(
-    ThetaParticlesSoA particles, ThetaParticlesSoA particles_scratch,
-    const float* y_history,
-    noise_t* d_z_noise_curr, noise_t* d_z_noise_other,
-    noise_t* d_u0_noise_curr, noise_t* d_u0_noise_other,
-    int t_current, int N_theta, int N_inner,
-    int noise_capacity, float cpmmh_rho,
-    int* d_accepts, int* d_swap_flags,
-    unsigned long long seed, int move_id, int block_id
-);
+/* CPMMH rejuvenation: template-dispatched, declared in .cu via
+ * kernel_cpmmh_rejuvenate_fused_impl<N_INNER>.
+ * Signature (no seed/move_id/block_id — those were unused vestigial params):
+ *
+ *   template<int N_INNER>
+ *   __global__ void kernel_cpmmh_rejuvenate_fused_impl(
+ *       ThetaParticlesSoA particles,
+ *       ThetaParticlesSoA particles_scratch,
+ *       const float* y_history,
+ *       noise_t* d_z_noise_curr, noise_t* d_z_noise_other,
+ *       noise_t* d_u0_noise_curr, noise_t* d_u0_noise_other,
+ *       int t_current, int N_theta, int noise_capacity,
+ *       float cpmmh_rho,
+ *       int* d_accepts, int* d_swap_flags,
+ *       int t_checkpoint,
+ *       const float* d_checkpoint_z, const float* d_checkpoint_mu_h,
+ *       const float* d_checkpoint_var_h, const float* d_checkpoint_log_w,
+ *       const float* d_checkpoint_ll);
+ */
 
 __global__ void kernel_commit_accepted_noise(
     noise_t* d_z_noise_0, noise_t* d_z_noise_1,
@@ -451,6 +484,33 @@ __global__ void kernel_commit_accepted_noise(
     const int* d_swap_flags, int N_theta, int N_inner,
     int t_current, int noise_capacity, int t_start
 );
+
+__global__ void kernel_reset_outer_weights(
+    ThetaParticlesSoA particles, int N_theta
+);
+
+__global__ void kernel_compute_particle_moments(
+    ThetaParticlesSoA particles,
+    float* d_mean, float* d_cov, int N_theta
+);
+
+__global__ void kernel_copy_checkpoint(
+    const float* src_z, const float* src_mu_h, const float* src_var_h,
+    const float* src_log_w, const float* src_ll,
+    float* dst_z, float* dst_mu_h, float* dst_var_h,
+    float* dst_log_w, float* dst_ll,
+    const int* d_ancestors, int N_theta, int N_inner
+);
+
+__global__ void kernel_save_checkpoint(
+    const ThetaParticlesSoA particles,
+    float* d_checkpoint_z, float* d_checkpoint_mu_h,
+    float* d_checkpoint_var_h, float* d_checkpoint_log_w, float* d_checkpoint_ll,
+    int N_theta, int N_inner
+);
+
+/* Shared memory size helpers (rbpf_shared_mem_size, cpmmh_shared_mem_size)
+ * are defined in smc2_sorting.cuh, included above. */
 
 /*═══════════════════════════════════════════════════════════════════════════════
  * SECTION 7: HOST API
@@ -484,6 +544,9 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs);
 void smc2_cuda_get_theta_mean(SMC2StateCUDA* state, float* theta_mean);
 void smc2_cuda_get_theta_std(SMC2StateCUDA* state, float* theta_std);
 float smc2_cuda_get_outer_ess(SMC2StateCUDA* state);
+
+/** @brief Internal: update adaptive proposal covariance from particle cloud */
+void smc2_update_adaptive_covariance(SMC2StateCUDA* state);
 
 #ifdef __cplusplus
 }
