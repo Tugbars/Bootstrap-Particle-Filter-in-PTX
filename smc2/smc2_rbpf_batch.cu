@@ -173,6 +173,27 @@ __device__ float log_prior_theta(float rho, float sigma_z, float mu_base, float 
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
+ * NOISE INDEXING HELPERS — Circular Buffer
+ *
+ * Noise buffers use modular time indexing so that only a fixed window of
+ * ~(fixed_lag_L + margin) timesteps needs to be stored, not the full history.
+ * Layout:  z_noise[theta_idx][t_slot][inner_idx]   (t_slot = t % capacity)
+ *          u0_noise[theta_idx][t_slot]
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
+__device__ __forceinline__
+int64_t z_noise_slot(int theta_idx, int t, int inner_idx, int N_inner, int cap) {
+    int t_slot = t % cap;
+    return (int64_t)theta_idx * N_inner * cap + (int64_t)t_slot * N_inner + inner_idx;
+}
+
+__device__ __forceinline__
+int64_t u0_noise_slot(int theta_idx, int t, int cap) {
+    int t_slot = t % cap;
+    return (int64_t)theta_idx * cap + t_slot;
+}
+
+/*═══════════════════════════════════════════════════════════════════════════════
  * KERNEL: RNG Initialization
  *═══════════════════════════════════════════════════════════════════════════════*/
 
@@ -235,13 +256,13 @@ __global__ void kernel_init_from_prior(
     float z_tilde_stat_std = sigma_z / sqrtf(one_minus_rho_sq);
     
     float z_noise_raw = curand_normal(rng);
-    int64_t z_noise_idx = (int64_t)theta_idx * N_inner * (noise_capacity + 1) + inner_idx;
+    int64_t z_noise_idx = z_noise_slot(theta_idx, 0, inner_idx, N_inner, noise_capacity);
     float z_noise_init = noise_store_roundtrip(d_z_noise, z_noise_idx, z_noise_raw);
     
     if (inner_idx == 0) {
         float u0_noise_raw = curand_normal(rng);
-        int64_t u0_noise_idx = (int64_t)theta_idx * (noise_capacity + 1);
-        noise_store(d_u0_noise, u0_noise_idx, u0_noise_raw);
+        int64_t u0_idx = u0_noise_slot(theta_idx, 0, noise_capacity);
+        noise_store(d_u0_noise, u0_idx, u0_noise_raw);
     }
     
     float z_tilde = z_tilde_stat_std * z_noise_init;
@@ -310,9 +331,8 @@ void kernel_rbpf_step_impl(
     float var_h = particles.inner_var_h[global_idx];
     float log_w = particles.inner_log_w[global_idx];
     
-    int64_t z_noise_base = (int64_t)theta_idx * N_INNER * (noise_capacity + 1);
-    int64_t z_noise_idx = z_noise_base + (int64_t)(t_current + 1) * N_INNER + inner_idx;
-    int64_t u0_noise_idx = (int64_t)theta_idx * (noise_capacity + 1) + (t_current + 1);
+    int64_t z_noise_idx = z_noise_slot(theta_idx, t_current + 1, inner_idx, N_INNER, noise_capacity);
+    int64_t u0_noise_idx = u0_noise_slot(theta_idx, t_current + 1, noise_capacity);
     
     float z_noise_raw = curand_normal(&local_rng);
     float z_noise = noise_store_roundtrip(d_z_noise, z_noise_idx, z_noise_raw);
@@ -622,14 +642,19 @@ __global__ void kernel_copy_theta_particles(
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
- * KERNEL: Copy Noise Arrays (Ping-Pong)
+ * KERNEL: Copy Noise Arrays (Ping-Pong) — Circular Buffer Aware
+ *
+ * Only copies the active window [t_start..t_current+1] using modular indexing.
+ * When fixed_lag_L > 0, t_start = t_checkpoint+1 (or 0 if no checkpoint).
+ * When fixed_lag_L == 0, t_start = 0 (full history).
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 __global__ void kernel_copy_noise_arrays(
     const noise_t* src_z_noise, noise_t* dst_z_noise,
     const noise_t* src_u0_noise, noise_t* dst_u0_noise,
     const int* d_ancestors,
-    int N_theta, int N_inner, int t_current, int noise_capacity
+    int N_theta, int N_inner, int t_current, int noise_capacity,
+    int t_start
 ) {
     int theta_idx = blockIdx.x;
     int inner_idx = threadIdx.x;
@@ -638,20 +663,17 @@ __global__ void kernel_copy_noise_arrays(
     
     int ancestor = d_ancestors[theta_idx];
     
-    int64_t dst_z_base = (int64_t)theta_idx * N_inner * (noise_capacity + 1);
-    int64_t src_z_base = (int64_t)ancestor * N_inner * (noise_capacity + 1);
-    
-    for (int t = 0; t <= t_current + 1; t++) {
-        int64_t src_idx = src_z_base + t * N_inner + inner_idx;
-        int64_t dst_idx = dst_z_base + t * N_inner + inner_idx;
+    for (int t = t_start; t <= t_current + 1; t++) {
+        int64_t src_idx = z_noise_slot(ancestor, t, inner_idx, N_inner, noise_capacity);
+        int64_t dst_idx = z_noise_slot(theta_idx, t, inner_idx, N_inner, noise_capacity);
         dst_z_noise[dst_idx] = src_z_noise[src_idx];
     }
     
     if (inner_idx == 0) {
-        int64_t dst_u0_base = (int64_t)theta_idx * (noise_capacity + 1);
-        int64_t src_u0_base = (int64_t)ancestor * (noise_capacity + 1);
-        for (int t = 0; t <= t_current + 1; t++) {
-            dst_u0_noise[dst_u0_base + t] = src_u0_noise[src_u0_base + t];
+        for (int t = t_start; t <= t_current + 1; t++) {
+            int64_t src_idx = u0_noise_slot(ancestor, t, noise_capacity);
+            int64_t dst_idx = u0_noise_slot(theta_idx, t, noise_capacity);
+            dst_u0_noise[dst_idx] = src_u0_noise[src_idx];
         }
     }
 }
@@ -780,7 +802,6 @@ void kernel_cpmmh_rejuvenate_fused_impl(
         return;
     }
     
-    int64_t z_noise_base = (int64_t)theta_idx * N_INNER * (noise_capacity + 1);
     float scale = sqrtf(1.0f - cpmmh_rho * cpmmh_rho);
     
     float rho = s_rho_prop;
@@ -802,10 +823,10 @@ void kernel_cpmmh_rejuvenate_fused_impl(
         float one_minus_rho_sq = fmaxf(1.0f - rho * rho, 1e-6f);
         float z_tilde_stat_std = sigma_z / sqrtf(one_minus_rho_sq);
         
-        float z_noise_curr_0 = noise_load(d_z_noise_curr, z_noise_base + inner_idx);
+        float z_noise_curr_0 = noise_load(d_z_noise_curr, z_noise_slot(theta_idx, 0, inner_idx, N_INNER, noise_capacity));
         float z_noise_fresh_0 = curand_normal(&local_rng);
         float z_noise_prop_0 = cpmmh_rho * z_noise_curr_0 + scale * z_noise_fresh_0;
-        noise_store(d_z_noise_other, z_noise_base + inner_idx, z_noise_prop_0);
+        noise_store(d_z_noise_other, z_noise_slot(theta_idx, 0, inner_idx, N_INNER, noise_capacity), z_noise_prop_0);
         
         z_tilde = z_tilde_stat_std * z_noise_prop_0;
         float z_init = z_tilde_to_z(z_tilde);
@@ -849,14 +870,14 @@ void kernel_cpmmh_rejuvenate_fused_impl(
         if (inner_idx == N_INNER - 1) s_cdf[N_INNER - 1] = 1.0f;
         __syncthreads();
         
-        int64_t z_idx_t1 = z_noise_base + (int64_t)(t + 1) * N_INNER + inner_idx;
+        int64_t z_idx_t1 = z_noise_slot(theta_idx, t + 1, inner_idx, N_INNER, noise_capacity);
         float z_noise_curr_t1 = noise_load(d_z_noise_curr, z_idx_t1);
         float z_noise_fresh_t1 = curand_normal(&local_rng);
         float z_noise_prop_t1_raw = cpmmh_rho * z_noise_curr_t1 + scale * z_noise_fresh_t1;
         float z_noise_prop_t1 = noise_store_roundtrip(d_z_noise_other, z_idx_t1, z_noise_prop_t1_raw);
         
         if (inner_idx == 0) {
-            int64_t u0_idx_t1 = (int64_t)theta_idx * (noise_capacity + 1) + (t + 1);
+            int64_t u0_idx_t1 = u0_noise_slot(theta_idx, t + 1, noise_capacity);
             float u0_noise_curr = noise_load(d_u0_noise_curr, u0_idx_t1);
             float u0_noise_fresh = curand_normal(&local_rng);
             float u0_noise_prop_raw = cpmmh_rho * u0_noise_curr + scale * u0_noise_fresh;
@@ -1004,15 +1025,15 @@ __global__ void kernel_commit_accepted_noise(
     if (theta_idx >= N_theta || inner_idx >= N_inner) return;
     if (d_swap_flags[theta_idx] == 0) return;
     
-    int64_t z_base = (int64_t)theta_idx * N_inner * (noise_capacity + 1);
     for (int t = t_start; t <= t_current + 1; t++) {
-        int64_t idx = z_base + t * N_inner + inner_idx;
+        int64_t idx = z_noise_slot(theta_idx, t, inner_idx, N_inner, noise_capacity);
         d_z_noise_0[idx] = d_z_noise_1[idx];
     }
     if (inner_idx == 0) {
-        int64_t u0_base = (int64_t)theta_idx * (noise_capacity + 1);
-        for (int t = t_start; t <= t_current + 1; t++)
-            d_u0_noise_0[u0_base + t] = d_u0_noise_1[u0_base + t];
+        for (int t = t_start; t <= t_current + 1; t++) {
+            int64_t idx = u0_noise_slot(theta_idx, t, noise_capacity);
+            d_u0_noise_0[idx] = d_u0_noise_1[idx];
+        }
     }
 }
 
@@ -1124,15 +1145,23 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     CUDA_CHECK(cudaMalloc(&state->d_accepts, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&state->d_swap_flags, N_theta * sizeof(int)));
     
-    /* CPMMH noise */
-    state->noise_capacity = 2048;
+    /* CPMMH noise — dynamic default capacity based on particle count.
+     * Target ~512 MB for initial allocation (4 buffers × capacity). 
+     * This gets right-sized when set_fixed_lag is called. */
+    {
+        int64_t per_slot_bytes = (int64_t)N_theta * N_inner * NOISE_SIZEOF;
+        int default_cap = (int)(512LL * 1024 * 1024 / (per_slot_bytes > 0 ? per_slot_bytes : 1));
+        if (default_cap < 64) default_cap = 64;
+        if (default_cap > 2048) default_cap = 2048;
+        state->noise_capacity = default_cap;
+    }
     state->cpmmh_rho = 0.99f;
     state->noise_buf = 0;
     state->user_seed = 0;
     state->host_rng_state = 0x853C49E6748FEA9BULL ^ (uint64_t)time(NULL);
     
-    int64_t z_noise_size = (int64_t)N_theta * N_inner * (state->noise_capacity + 1);
-    int64_t u0_noise_size = (int64_t)N_theta * (state->noise_capacity + 1);
+    int64_t z_noise_size = (int64_t)N_theta * N_inner * state->noise_capacity;
+    int64_t u0_noise_size = (int64_t)N_theta * state->noise_capacity;
     CUDA_CHECK(cudaMalloc(&state->d_z_noise[0], noise_array_bytes(z_noise_size)));
     CUDA_CHECK(cudaMalloc(&state->d_z_noise[1], noise_array_bytes(z_noise_size)));
     CUDA_CHECK(cudaMalloc(&state->d_u0_noise[0], noise_array_bytes(u0_noise_size)));
@@ -1262,9 +1291,19 @@ void smc2_cuda_set_seed(SMC2StateCUDA* state, uint64_t seed) {
 }
 
 void smc2_cuda_set_noise_capacity(SMC2StateCUDA* state, int capacity) {
+    /* When fixed-lag is active, cap capacity to L + 256:
+     * only the replay window needs to fit in the circular buffer.
+     * If set_noise_capacity is called BEFORE set_fixed_lag, the user
+     * may need to call it again after setting L. */
+    if (state->fixed_lag_L > 0) {
+        int min_cap = state->fixed_lag_L + 256;
+        if (capacity > min_cap) {
+            capacity = min_cap;
+        }
+    }
+    
     if (capacity <= state->noise_capacity) return;
     
-    /* FIX #14: Cap noise capacity to prevent OOM */
     if (capacity > MAX_NOISE_CAPACITY) {
         fprintf(stderr, "WARNING: Requested noise_capacity=%d exceeds MAX_NOISE_CAPACITY=%d. "
                 "Clamping to %d.\n", capacity, MAX_NOISE_CAPACITY, MAX_NOISE_CAPACITY);
@@ -1272,16 +1311,24 @@ void smc2_cuda_set_noise_capacity(SMC2StateCUDA* state, int capacity) {
         if (capacity <= state->noise_capacity) return;
     }
     
-    int64_t new_z_size = (int64_t)state->N_theta * state->N_inner * (capacity + 1);
-    int64_t old_z_size = (int64_t)state->N_theta * state->N_inner * (state->noise_capacity + 1);
-    int64_t new_u0_size = (int64_t)state->N_theta * (capacity + 1);
-    int64_t old_u0_size = (int64_t)state->N_theta * (state->noise_capacity + 1);
+    int64_t new_z_size = (int64_t)state->N_theta * state->N_inner * capacity;
+    int64_t old_z_size = (int64_t)state->N_theta * state->N_inner * state->noise_capacity;
+    int64_t new_u0_size = (int64_t)state->N_theta * capacity;
+    int64_t old_u0_size = (int64_t)state->N_theta * state->noise_capacity;
     
     /* Check if allocation would be unreasonably large */
     int64_t total_bytes = 4 * noise_array_bytes(new_z_size) + 4 * noise_array_bytes(new_u0_size);
     if (total_bytes > (int64_t)8 * 1024 * 1024 * 1024LL) {
-        fprintf(stderr, "WARNING: Noise reallocation would require %.1f GB. Aborting resize.\n",
-                (double)total_bytes / (1024.0 * 1024.0 * 1024.0));
+        static bool warned = false;
+        if (!warned) {
+            fprintf(stderr, "WARNING: Noise buffer for %d slots would need %.1f GB "
+                    "(N_theta=%d, N_inner=%d). Using L=0 at this particle count "
+                    "requires more VRAM — use set_fixed_lag(L>0) to bound memory.\n",
+                    capacity,
+                    (double)total_bytes / (1024.0 * 1024.0 * 1024.0),
+                    state->N_theta, state->N_inner);
+            warned = true;
+        }
         return;
     }
     
@@ -1291,10 +1338,17 @@ void smc2_cuda_set_noise_capacity(SMC2StateCUDA* state, int capacity) {
     CUDA_CHECK(cudaMalloc(&new_u0_0, noise_array_bytes(new_u0_size)));
     CUDA_CHECK(cudaMalloc(&new_u0_1, noise_array_bytes(new_u0_size)));
     
-    if (state->d_z_noise[0] && old_z_size > 0)
-        CUDA_CHECK(cudaMemcpy(new_z_0, state->d_z_noise[0], noise_array_bytes(old_z_size), cudaMemcpyDeviceToDevice));
-    if (state->d_u0_noise[0] && old_u0_size > 0)
-        CUDA_CHECK(cudaMemcpy(new_u0_0, state->d_u0_noise[0], noise_array_bytes(old_u0_size), cudaMemcpyDeviceToDevice));
+    /* NOTE: With circular buffer, old data positions don't map 1:1 to new buffer
+     * positions when capacity changes. But this is only called before init_from_prior
+     * (which zeroes everything), so a raw copy of the smaller of old/new is safe. */
+    if (state->d_z_noise[0] && old_z_size > 0) {
+        int64_t copy_z = (old_z_size < new_z_size) ? old_z_size : new_z_size;
+        CUDA_CHECK(cudaMemcpy(new_z_0, state->d_z_noise[0], noise_array_bytes(copy_z), cudaMemcpyDeviceToDevice));
+    }
+    if (state->d_u0_noise[0] && old_u0_size > 0) {
+        int64_t copy_u0 = (old_u0_size < new_u0_size) ? old_u0_size : new_u0_size;
+        CUDA_CHECK(cudaMemcpy(new_u0_0, state->d_u0_noise[0], noise_array_bytes(copy_u0), cudaMemcpyDeviceToDevice));
+    }
     
     cudaFree(state->d_z_noise[0]); cudaFree(state->d_z_noise[1]);
     cudaFree(state->d_u0_noise[0]); cudaFree(state->d_u0_noise[1]);
@@ -1308,6 +1362,39 @@ void smc2_cuda_set_noise_capacity(SMC2StateCUDA* state, int capacity) {
 void smc2_cuda_set_fixed_lag(SMC2StateCUDA* state, int L) {
     state->fixed_lag_L = L;
     state->t_checkpoint = -1;
+    
+    /* Right-size noise buffers to L + 256 (the circular replay window).
+     * This handles both orderings of set_noise_capacity / set_fixed_lag. */
+    if (L > 0) {
+        int target_cap = L + 256;
+        if (state->noise_capacity != target_cap) {
+            int64_t new_z_size = (int64_t)state->N_theta * state->N_inner * target_cap;
+            int64_t new_u0_size = (int64_t)state->N_theta * target_cap;
+            
+            /* Sanity check: shouldn't exceed 8 GB */
+            int64_t total_bytes = 4 * noise_array_bytes(new_z_size) + 4 * noise_array_bytes(new_u0_size);
+            if (total_bytes > (int64_t)8 * 1024 * 1024 * 1024LL) {
+                fprintf(stderr, "WARNING: Fixed-lag noise allocation would require %.1f GB. "
+                        "Consider reducing N_theta or N_inner.\n",
+                        (double)total_bytes / (1024.0 * 1024.0 * 1024.0));
+                return;
+            }
+            
+            noise_t *new_z_0, *new_z_1, *new_u0_0, *new_u0_1;
+            CUDA_CHECK(cudaMalloc(&new_z_0, noise_array_bytes(new_z_size)));
+            CUDA_CHECK(cudaMalloc(&new_z_1, noise_array_bytes(new_z_size)));
+            CUDA_CHECK(cudaMalloc(&new_u0_0, noise_array_bytes(new_u0_size)));
+            CUDA_CHECK(cudaMalloc(&new_u0_1, noise_array_bytes(new_u0_size)));
+            
+            cudaFree(state->d_z_noise[0]); cudaFree(state->d_z_noise[1]);
+            cudaFree(state->d_u0_noise[0]); cudaFree(state->d_u0_noise[1]);
+            
+            state->d_z_noise[0] = new_z_0; state->d_z_noise[1] = new_z_1;
+            state->d_u0_noise[0] = new_u0_0; state->d_u0_noise[1] = new_u0_1;
+            state->noise_buf = 0;
+            state->noise_capacity = target_cap;
+        }
+    }
 }
 
 void smc2_cuda_set_proposal_std(SMC2StateCUDA* state, const float* std) {
@@ -1439,8 +1526,22 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
     state->y_history_len++;
     state->t_current++;
     
-    if (state->t_current >= state->noise_capacity)
-        smc2_cuda_set_noise_capacity(state, state->noise_capacity * 2);
+    if (state->fixed_lag_L == 0 && state->t_current >= state->noise_capacity) {
+        /* L=0 (full-history CPMMH) needs the entire noise timeline.
+         * Try to grow once; if it fails (OOM guard), stop trying. */
+        static bool growth_failed = false;
+        if (!growth_failed) {
+            int old_cap = state->noise_capacity;
+            smc2_cuda_set_noise_capacity(state, state->noise_capacity * 2);
+            if (state->noise_capacity == old_cap) {
+                growth_failed = true;
+                fprintf(stderr, "NOTE: L=0 CPMMH will use wrapped noise from t=%d onward. "
+                        "Rejuvenation results may be inaccurate beyond this point.\n",
+                        state->t_current);
+            }
+        }
+    }
+    /* With fixed_lag_L > 0, circular buffer naturally wraps — no growth needed. */
     
     /* RBPF forward step — no sync needed, next kernel is on same stream */
     #define DISPATCH_RBPF_STEP(N) \
@@ -1490,11 +1591,15 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
         /* No sync — next kernel depends on same data, same stream */
         
         int other_buf = 1 - state->noise_buf;
+        /* Only copy the active noise window — with fixed-lag, this is
+         * just L+2 slots instead of all T+1 slots. */
+        int t_noise_start = (state->fixed_lag_L > 0 && state->t_checkpoint >= 0)
+                            ? state->t_checkpoint : 0;
         kernel_copy_noise_arrays<<<state->N_theta, state->N_inner>>>(
             state->d_z_noise[state->noise_buf], state->d_z_noise[other_buf],
             state->d_u0_noise[state->noise_buf], state->d_u0_noise[other_buf],
             state->d_ancestors, state->N_theta, state->N_inner,
-            state->t_current, state->noise_capacity);
+            state->t_current, state->noise_capacity, t_noise_start);
         /* Sync before pointer swap — need all copies complete */
         CUDA_CHECK(cudaDeviceSynchronize());
         
