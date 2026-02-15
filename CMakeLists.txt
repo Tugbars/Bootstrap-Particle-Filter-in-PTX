@@ -451,6 +451,36 @@ set_target_properties(test_jump_stress PROPERTIES
 )
 
 # ==============================================================================
+# Target: test_jump_bands (Jump diffusion + Adaptive bands combined test)
+#
+# Tests 4 configs (standard, jumps-only, bands-only, jumps+bands) across
+# 6 scenarios (oracle, misspec 2x/4x, spikes, regime teleport, combined).
+# ==============================================================================
+
+add_executable(test_jump_bands tests/test_jump_bands.cu)
+
+target_include_directories(test_jump_bands PRIVATE
+    ${CMAKE_SOURCE_DIR}/gpu_bpf
+    ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+target_link_libraries(test_jump_bands PRIVATE
+    gpu_bpf_ptx_full
+    CUDA::cuda_driver
+    CUDA::cudart
+    CUDA::curand
+)
+
+set_target_properties(test_jump_bands PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+if(TARGET ptx_cubin_full)
+    add_dependencies(test_jump_bands ptx_cubin_full)
+endif()
+
+# ==============================================================================
 # Print summary
 # ==============================================================================
 
