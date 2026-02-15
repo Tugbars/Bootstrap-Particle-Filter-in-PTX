@@ -1121,7 +1121,7 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     state->N_inner = N_inner;
     state->ess_threshold_outer = 0.5f;
     state->ess_threshold_inner = 0.5f;
-    state->K_rejuv = 20;
+    state->K_rejuv = 10;
     
     int N_total = N_theta * N_inner;
     

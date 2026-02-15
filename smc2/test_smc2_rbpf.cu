@@ -25,7 +25,7 @@
  *═══════════════════════════════════════════════════════════════════════════*/
 
 #ifndef N_THETA
-#define N_THETA 2048
+#define N_THETA 1024
 #endif
 
 #ifndef N_INNER
@@ -317,7 +317,7 @@ void test_parameter_learning(void) {
     printf("═══════════════════════════════════════════════════════════════\n");
     
     RSVParams truth = make_truth(0.95, 0.10, -1.0, 0.15);
-    int T = 1200;
+    int T = 3000;
     
     float* y = (float*)malloc(T * sizeof(float));
     float* h = (float*)malloc(T * sizeof(float));
@@ -393,7 +393,7 @@ void test_high_vol(void) {
     printf("═══════════════════════════════════════════════════════════════\n");
     
     RSVParams truth = make_truth(0.98, 0.08, 2.0, 0.20);
-    int T = 1000;
+    int T = 3000;
     
     float* y = (float*)malloc(T * sizeof(float));
     float* h = (float*)malloc(T * sizeof(float));
