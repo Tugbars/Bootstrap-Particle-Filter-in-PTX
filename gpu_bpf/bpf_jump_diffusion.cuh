@@ -1,15 +1,18 @@
 /**
  * @file bpf_jump_diffusion.cuh
- * @brief Minimal Jump-Diffusion Perturbation for BPF
+ * @brief Mixture Innovation Model for BPF — Bernoulli Jump Perturbation
  *
- * Fixed lambda, fixed sigma_J. No learning. Just the kernel.
+ * Each tick, every particle independently draws J_t ~ Bernoulli(lambda).
+ * If J_t = 1:  h[i] += sigma_J * N(0,1)
+ * If J_t = 0:  h[i] unchanged (normal diffusion only)
  *
- * State transition becomes:
- *   h_t = mu + rho*(h_{t-1} - mu) + sigma_z*eps + J_t*sigma_J*eta
- *   J_t ~ Bernoulli(lambda), eta ~ N(0,1)
+ * Implements a two-component MIM where resampling performs posterior
+ * component selection. Jumpers are uniformly distributed across all
+ * particle indices, so they naturally overlap with adaptive sigma_z
+ * bands — no placement tuning needed.
  *
  * Integration: call jump_perturb() on d_h AFTER propagation, BEFORE weighting.
- * That's it. One extra kernel launch per tick.
+ * One extra kernel launch per tick, full N threads.
  */
 
 #ifndef BPF_JUMP_DIFFUSION_CUH
@@ -26,10 +29,9 @@ typedef struct JumpState {
     float  lambda;              /**< Jump probability per particle per tick */
     float  sigma_J;             /**< Jump size std dev                     */
     unsigned int* d_seeds;      /**< [N] per-particle PRNG seeds           */
-    float* d_jump_ind;          /**< [N] jump indicators (for diagnostics) */
 } JumpState;
 
-/** Create jump state. Allocates device memory. */
+/** Create jump state. Allocates device memory for N particles. */
 JumpState* jump_create(int n_particles, float lambda, float sigma_J,
                        int seed, cudaStream_t stream);
 
@@ -39,6 +41,7 @@ void jump_destroy(JumpState* js);
 /**
  * Apply jump perturbation to propagated h values.
  * Call AFTER propagation kernel, BEFORE weight kernel.
+ * Launches ceil(N/256) blocks — full particle count.
  */
 void jump_perturb(JumpState* js, float* d_h, cudaStream_t stream);
 

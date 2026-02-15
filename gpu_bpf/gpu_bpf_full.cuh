@@ -66,7 +66,7 @@ typedef enum {
 // Bootstrap Particle Filter — Pure PTX (PCG32 RNG)
 // =============================================================================
 
-struct JumpState;  // before the struct definition
+struct JumpState;
 
 /**
  * @brief Opaque state for the GPU Bootstrap Particle Filter.
@@ -78,6 +78,7 @@ struct JumpState;  // before the struct definition
  *   - Adaptive sigma_z bands (calm/alert/panic regimes)
  *   - Optional Silverman kernel jittering post-resample
  *   - Online mu learning via kernel 14 gradient + Adam optimizer
+ *   - Bernoulli jump diffusion (mixture innovation model)
  */
 typedef struct {
     float*    d_h;              /**< Particle states h_t [N]                        */
@@ -126,7 +127,8 @@ typedef struct {
     float     rm_t0;            /**< RM offset (prevents huge initial steps)       */
     float     rm_gamma;         /**< RM exponent (2/3 for nat grad, 1/2 vanilla)  */
 
-    struct JumpState* jump;
+    // ── Jump diffusion (Bernoulli MIM) ──────────────────────────────────────
+    struct JumpState* jump;     /**< Jump state (NULL = disabled)                  */
 } GpuBpfState;
 
 /**
@@ -288,6 +290,34 @@ void gpu_bpf_set_ess_threshold(GpuBpfState* state, float threshold);
 /** @brief Return cumulative number of ticks where resampling fired. */
 int gpu_bpf_get_resample_count(GpuBpfState* state);
 
+// ── Bernoulli jump diffusion (MIM) ─────────────────────────────────────────
+
+/**
+ * @brief Enable Bernoulli jump perturbation (mixture innovation model).
+ *
+ * Each particle independently draws J_t ~ Bernoulli(lambda). If J_t = 1,
+ * h[i] += sigma_J * N(0,1) after propagation, before weighting. Implements
+ * a two-component MIM where resampling performs posterior component selection.
+ *
+ * Jumpers are uniformly distributed across all particle indices, naturally
+ * overlapping with adaptive sigma_z bands for combined exploration reach.
+ *
+ * @param s        BPF instance
+ * @param lambda   Jump probability per particle per tick (recommend 0.03)
+ * @param sigma_J  Jump size std dev (recommend ~2.5 from stress tests)
+ * @param seed     PRNG seed for jump RNG
+ */
+void  gpu_bpf_enable_jump_diffusion(GpuBpfState* s, float lambda, float sigma_J, int seed);
+
+/** @brief Disable jump diffusion. Frees jump state memory. */
+void  gpu_bpf_disable_jump_diffusion(GpuBpfState* s);
+
+/** @brief Return current jump probability (0 if disabled). */
+float gpu_bpf_get_lambda(const GpuBpfState* s);
+
+/** @brief Return current jump sigma (0 if disabled). */
+float gpu_bpf_get_sigma_J(const GpuBpfState* s);
+
 // ── Batch RMSE convenience ──────────────────────────────────────────────────
 
 /**
@@ -361,10 +391,5 @@ double gpu_apf_run_rmse(
     int n_particles, float rho, float sigma_z, float mu,
     float nu_state, float nu_obs, int seed
 );
-
-void  gpu_bpf_enable_jump_diffusion(GpuBpfState* s, float lambda, float sigma_J, int seed);
-void  gpu_bpf_disable_jump_diffusion(GpuBpfState* s);
-float gpu_bpf_get_lambda(const GpuBpfState* s);
-float gpu_bpf_get_sigma_J(const GpuBpfState* s);
 
 #endif // GPU_BPF_FULL_CUH

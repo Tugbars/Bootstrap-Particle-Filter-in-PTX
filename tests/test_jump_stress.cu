@@ -1,17 +1,13 @@
 // =============================================================================
-// STRESS TEST: Combined BPF vs Combined + Jump Diffusion (fixed params)
+// STRESS TEST: Combined BPF vs Combined + Jump Diffusion (Bernoulli MIM)
 //
-// Phase 1: Parameter sweep on Spike Gauntlet (oracle) to find best sigma_J
-// Phase 2: Full stress test at best sigma_J across all scenarios + misspec
+// Phase 1:  sigma_J sweep (fixed lambda=0.02)
+// Phase 1b: lambda sweep at best sigma_J
+// Phase 2:  Full stress test at best (lambda, sigma_J)
 //
-// Requires 3 lines added to gpu_bpf_ptx_full.cu:
-//   1. #include "bpf_jump_diffusion.cuh" + JumpState* jump in GpuBpfState
-//   2. gpu_bpf_enable_jump_diffusion(state, lambda, sigma_J, seed)
-//   3. if (state->jump) jump_perturb(state->jump, state->d_h, state->stream);
-//      placed AFTER propagation kernel, BEFORE weight kernel
-//
-// Build: nvcc -O3 test_jump_stress.cu gpu_bpf_ptx_full.cu bpf_jump_diffusion.cu \
-//        -o test_jump_stress -lcuda -lcurand
+// Jump model: each particle draws J_t ~ Bernoulli(lambda) independently.
+// If jump: h[i] += sigma_J * N(0,1). Jumpers uniformly distributed across
+// all indices = natural overlap with adaptive sigma_z bands.
 // =============================================================================
 
 #include "gpu_bpf_full.cuh"
@@ -222,7 +218,7 @@ static Metrics run_bpf(const ScenarioData& sc,
     gpu_bpf_enable_rho_learning(state, 1);
     gpu_bpf_set_ess_threshold(state, 0.5f);
 
-    /* Jump diffusion (fixed params, no learning) */
+    /* Bernoulli jump diffusion */
     if (enable_jump) {
         gpu_bpf_enable_jump_diffusion(state, lambda, sigma_J, seed + 9999);
     }
@@ -286,7 +282,7 @@ int main(int argc, char** argv) {
 
     printf("\n");
     printf("══════════════════════════════════════════════════════════════════════════════════\n");
-    printf("  Combined BPF vs Combined + Jump Diffusion (fixed params)\n");
+    printf("  Combined BPF vs Combined + Bernoulli Jump Diffusion (MIM)\n");
     printf("──────────────────────────────────────────────────────────────────────────────────\n");
     printf("  Particles: %dK   nu_obs=%.0f   True DGP: rho=%.2f sigma_z=%.2f mu=%.1f\n",
            N/1000, bnu, true_rho, true_sz, true_mu);

@@ -1,11 +1,14 @@
 /**
  * @file bpf_jump_diffusion.cu
- * @brief Minimal Jump-Diffusion — CUDA kernel + host logic
+ * @brief Mixture Innovation Model — Bernoulli jump CUDA kernel + host logic
+ *
+ * Per particle: Bernoulli(lambda) -> if jump, h[i] += sigma_J * N(0,1)
+ * Jumpers are uniformly distributed across all indices, naturally
+ * overlapping with adaptive sigma_z bands.
  */
 
 #include "bpf_jump_diffusion.cuh"
 #include <stdlib.h>
-#include <string.h>
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Device: LCG PRNG
@@ -22,16 +25,18 @@ float jd_uniform(unsigned int s) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Kernel: Jump Perturbation
+ * Kernel: Bernoulli Jump Perturbation
  *
  * Per particle:
- *   1. Bernoulli(lambda) from LCG
- *   2. If jump: Box-Muller normal, h[i] += sigma_J * normal
+ *   1. Draw u ~ Uniform(0,1). If u < lambda → jump.
+ *   2. If jump: Box-Muller normal, h[i] += sigma_J * N(0,1)
+ *   3. If no jump: h[i] unchanged.
+ *
+ * Warp divergence is minimal at low lambda (97%+ threads skip).
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 __global__ void jump_perturb_kernel(
     float*        d_h,
-    float*        d_jump_ind,
     unsigned int* d_seeds,
     float         lambda,
     float         sigma_J,
@@ -55,9 +60,6 @@ __global__ void jump_perturb_kernel(
         float eta = sqrtf(-2.0f * logf(u1)) * cosf(2.0f * 3.14159265f * u2);
 
         d_h[tid] += sigma_J * eta;
-        d_jump_ind[tid] = 1.0f;
-    } else {
-        d_jump_ind[tid] = 0.0f;
     }
 
     d_seeds[tid] = seed;
@@ -74,15 +76,14 @@ JumpState* jump_create(int n_particles, float lambda, float sigma_J,
     js->lambda      = lambda;
     js->sigma_J     = sigma_J;
 
-    cudaMalloc(&js->d_seeds,    n_particles * sizeof(unsigned int));
-    cudaMalloc(&js->d_jump_ind, n_particles * sizeof(float));
+    cudaMalloc(&js->d_seeds, n_particles * sizeof(unsigned int));
 
-    /* Initialize per-particle seeds */
+    /* Initialize per-particle seeds from host-side LCG */
     unsigned int* h_seeds = (unsigned int*)malloc(n_particles * sizeof(unsigned int));
     unsigned int s = (unsigned int)seed;
     for (int i = 0; i < n_particles; i++) {
         s = s * 6364136223846793005ULL + 1442695040888963407ULL;
-        h_seeds[i] = s;
+        h_seeds[i] = (unsigned int)s;
     }
     cudaMemcpyAsync(js->d_seeds, h_seeds, n_particles * sizeof(unsigned int),
                     cudaMemcpyHostToDevice, stream);
@@ -94,12 +95,11 @@ JumpState* jump_create(int n_particles, float lambda, float sigma_J,
 void jump_destroy(JumpState* js) {
     if (!js) return;
     cudaFree(js->d_seeds);
-    cudaFree(js->d_jump_ind);
     free(js);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Host: Perturb
+ * Host: Perturb — launches full N threads
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 void jump_perturb(JumpState* js, float* d_h, cudaStream_t stream) {
@@ -108,8 +108,7 @@ void jump_perturb(JumpState* js, float* d_h, cudaStream_t stream) {
     int blocks  = (js->n_particles + threads - 1) / threads;
 
     jump_perturb_kernel<<<blocks, threads, 0, stream>>>(
-        d_h, js->d_jump_ind, js->d_seeds,
-        js->lambda, js->sigma_J, js->n_particles
+        d_h, js->d_seeds, js->lambda, js->sigma_J, js->n_particles
     );
 }
 

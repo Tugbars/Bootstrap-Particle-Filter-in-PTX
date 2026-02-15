@@ -602,8 +602,9 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
         ptx_launch(g_ptx.propagate_weight, st, g, b, 0, params);
     }
 
-    // [JUMP] edit 4/5 — perturbation AFTER propagation, BEFORE weight accumulation
-    // Each particle independently: Bernoulli(lambda) -> if jump, h[i] += sigma_J * N(0,1)
+    // [JUMP] edit 4/5 — Bernoulli perturbation AFTER propagation, BEFORE weight accumulation
+    // Each particle independently: Bernoulli(lambda) -> if jump, h[i] += sigma_J * N(0,1).
+    // Jumpers uniformly distributed across all indices = natural overlap with adaptive bands.
     // During calm: jumped particles get low obs weight, resampled away. No harm.
     // During spikes: jumped particles land near truth, get high weight. Instant tracking.
     if (s->jump) {
@@ -840,7 +841,7 @@ void gpu_bpf_set_rho(GpuBpfState* s, float rho) {
 }
 
 // =============================================================================
-// [JUMP] edit 5/5 — Jump diffusion API (fixed params, no learning)
+// [JUMP] edit 5/5 — Jump diffusion API (Bernoulli MIM)
 // =============================================================================
 
 void gpu_bpf_enable_jump_diffusion(GpuBpfState* s, float lambda,
