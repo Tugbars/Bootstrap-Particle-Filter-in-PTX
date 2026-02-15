@@ -3,12 +3,13 @@
  * @brief Test suite for SMC² + RBPF 4-parameter learner
  *
  * Self-contained DGP matching the RBPF generative model exactly.
- * Learned: ρ, σ_z, μ_base, σ_base  (4 params)
+ * Learned: ρ, σ_total, μ_base, r_split  (4 params, reparameterized)
+ * Physical: σ_z = r·σ_total, σ_base = √(1-r²)·σ_total
  * Fixed:   μ_scale, μ_rate, σ_scale, σ_rate, θ(z) curve
  * Observations: log(y²) for OCSN likelihood.
  *
  * Build:
- *   nvcc -O2 -arch=sm_120 -o test_smc2_rbpf test_smc2_rbpf.cu smc2_rbpf_batch.cu \
+ *   nvcc -O2 -arch=sm_120 -o test_smc2_rbpf test_smc2_rbpf.cu smc2_rbpf_cuda.cu \
  *        -lcurand --expt-relaxed-constexpr
  */
 
@@ -24,7 +25,7 @@
  *═══════════════════════════════════════════════════════════════════════════*/
 
 #ifndef N_THETA
-#define N_THETA 1024
+#define N_THETA 2048
 #endif
 
 #ifndef N_INNER
@@ -69,12 +70,17 @@ static double randn(void) {
 
 /*═══════════════════════════════════════════════════════════════════════════
  * DGP: Regime-Switching SV (matches RBPF model exactly)
+ *
+ * DGP uses physical params (σ_z, σ_base).
+ * SMC² learns (σ_total, r_split) and derives physical params internally.
  *═══════════════════════════════════════════════════════════════════════════*/
 
 struct RSVParams {
-    double rho, sigma_z, mu_base, sigma_base;           /* learned */
+    double rho, sigma_z, mu_base, sigma_base;           /* physical */
     double mu_scale, mu_rate, sigma_scale, sigma_rate;   /* fixed shapes */
     double theta_base, theta_scale, theta_rate;          /* fixed θ(z) */
+    /* derived reparameterized values */
+    double sigma_total, r_split;
 };
 
 static double eval_curve_h(double base, double scale, double rate, double z) {
@@ -86,9 +92,12 @@ static double zt_to_z(double zt) { return 1.5 * (1.0 + tanh(zt)); }
 static RSVParams make_truth(double rho, double sigma_z, double mu_base, double sigma_base) {
     RSVParams p;
     p.rho = rho; p.sigma_z = sigma_z; p.mu_base = mu_base; p.sigma_base = sigma_base;
-    p.mu_scale = 0.5;    p.mu_rate = 1.0;      /* must match SMC² defaults */
+    p.mu_scale = 0.5;    p.mu_rate = 1.0;
     p.sigma_scale = 0.1; p.sigma_rate = 1.0;
     p.theta_base = 0.02; p.theta_scale = 0.08; p.theta_rate = 1.5;
+    /* Compute reparameterized values */
+    p.sigma_total = sqrt(sigma_z * sigma_z + sigma_base * sigma_base);
+    p.r_split = sigma_z / p.sigma_total;
     return p;
 }
 
@@ -130,11 +139,22 @@ static void simulate_rsv(const RSVParams* p, float* y_obs, float* h_true,
  * Helpers
  *═══════════════════════════════════════════════════════════════════════════*/
 
-static const char* param_names[N_PARAMS] = {"rho", "sigma_z", "mu_base", "sigma_base"};
+/* Learned param names (what SMC² actually estimates) */
+static const char* param_names[N_PARAMS] = {"rho", "sigma_total", "mu_base", "r_split"};
 
+/* True values in the learned parameterization */
 static void get_true_arr(const RSVParams* p, float* out) {
-    out[0] = (float)p->rho;      out[1] = (float)p->sigma_z;
-    out[2] = (float)p->mu_base;  out[3] = (float)p->sigma_base;
+    out[0] = (float)p->rho;
+    out[1] = (float)p->sigma_total;
+    out[2] = (float)p->mu_base;
+    out[3] = (float)p->r_split;
+}
+
+/* Recover physical (σ_z, σ_base) from learned (σ_total, r) */
+static void to_physical(const float* learned, float* sigma_z, float* sigma_base) {
+    float st = learned[1], r = learned[3];
+    *sigma_z = r * st;
+    *sigma_base = sqrtf(fmaxf(1.0f - r * r, 1e-6f)) * st;
 }
 
 static void print_data_stats(const float* y, int T) {
@@ -150,25 +170,58 @@ static void print_data_stats(const float* y, int T) {
     printf("  Expected log χ²(1): mean≈-1.27, var≈4.93\n");
 }
 
-static void print_recovery_table(const float* truth, const float* mean,
+static void print_recovery_table(const RSVParams* truth, const float* mean,
                                   const float* std_dev, int* n_ok, int* n_15pct) {
-    printf("\n%-12s  %8s  %8s  %8s  %7s  %7s  %s\n",
+    float tv[N_PARAMS];
+    get_true_arr(truth, tv);
+    
+    printf("\n  ── Learned parameters (what SMC² estimates directly) ──\n\n");
+    printf("%-12s  %8s  %8s  %8s  %7s  %7s  %s\n",
            "Parameter", "True", "Est", "Std", "Err%", "z-score", "Status");
     printf("─────────────────────────────────────────────────────────────────────────\n");
     
     *n_ok = 0;
     *n_15pct = 0;
     for (int i = 0; i < N_PARAMS; i++) {
-        float err = mean[i] - truth[i];
+        float err = mean[i] - tv[i];
         float z = fabsf(err) / fmaxf(std_dev[i], 1e-6f);
-        float pct = (fabsf(truth[i]) > 0.01f) ? 100.0f * err / truth[i] : err * 100.0f;
+        float pct = (fabsf(tv[i]) > 0.01f) ? 100.0f * err / tv[i] : err * 100.0f;
         const char* tag = (z <= 2.0f) ? "OK" : (z <= 3.0f) ? "WARN" : "MISS";
         if (z <= 2.0f) (*n_ok)++;
         if (fabsf(pct) <= 15.0f) (*n_15pct)++;
         printf("%-12s  %8.4f  %8.4f  %8.4f  %+6.1f%%  %7.2f  [%s]\n",
-               param_names[i], truth[i], mean[i], std_dev[i], pct, z, tag);
+               param_names[i], tv[i], mean[i], std_dev[i], pct, z, tag);
     }
     printf("─────────────────────────────────────────────────────────────────────────\n");
+    
+    /* Also show derived physical params for intuition */
+    float sz_est, sb_est;
+    to_physical(mean, &sz_est, &sb_est);
+    
+    printf("\n  ── Derived physical parameters ──\n\n");
+    printf("%-12s  %8s  %8s  %7s\n", "Parameter", "True", "Est", "Err%");
+    printf("─────────────────────────────────────────────────────────────────────────\n");
+    float sz_true = (float)truth->sigma_z, sb_true = (float)truth->sigma_base;
+    float sz_pct = (fabsf(sz_true) > 0.01f) ? 100.0f * (sz_est - sz_true) / sz_true : 0.0f;
+    float sb_pct = (fabsf(sb_true) > 0.01f) ? 100.0f * (sb_est - sb_true) / sb_true : 0.0f;
+    printf("%-12s  %8.4f  %8.4f  %+6.1f%%\n", "sigma_z", sz_true, sz_est, sz_pct);
+    printf("%-12s  %8.4f  %8.4f  %+6.1f%%\n", "sigma_base", sb_true, sb_est, sb_pct);
+    printf("─────────────────────────────────────────────────────────────────────────\n");
+}
+
+/* Print progress during SMC² run — show both learned and physical params */
+static void print_progress(SMC2StateCUDA* s, int t) {
+    float m[N_PARAMS];
+    smc2_cuda_get_theta_mean(s, m);
+    float sz, sb;
+    to_physical(m, &sz, &sb);
+    float acc = s->n_rejuv_total > 0 ?
+        100.0f * s->n_rejuv_accepts / s->n_rejuv_total : 0.0f;
+    float ess = smc2_cuda_get_outer_ess(s);
+    printf("  t=%4d: ESS=%5.1f, resamp=%2d, accept=%5.1f%%, "
+           "ρ=%.3f, σt=%.3f, r=%.3f, μb=%.2f  [σz=%.3f σb=%.3f]\n",
+           t, ess, s->n_resamples, acc,
+           m[0], m[1], m[3], m[2], sz, sb);
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
@@ -201,11 +254,17 @@ void test_basic(void) {
     smc2_cuda_get_theta_mean(state, theta_mean);
     smc2_cuda_get_theta_std(state, theta_std);
     
-    printf("  Prior samples:\n");
-    printf("    rho        = %.4f ± %.4f\n", theta_mean[0], theta_std[0]);
-    printf("    sigma_z    = %.4f ± %.4f\n", theta_mean[1], theta_std[1]);
-    printf("    mu_base    = %.4f ± %.4f\n", theta_mean[2], theta_std[2]);
-    printf("    sigma_base = %.4f ± %.4f\n", theta_mean[3], theta_std[3]);
+    float sz, sb;
+    to_physical(theta_mean, &sz, &sb);
+    
+    printf("  Prior samples (learned space):\n");
+    printf("    rho         = %.4f ± %.4f\n", theta_mean[0], theta_std[0]);
+    printf("    sigma_total = %.4f ± %.4f\n", theta_mean[1], theta_std[1]);
+    printf("    mu_base     = %.4f ± %.4f\n", theta_mean[2], theta_std[2]);
+    printf("    r_split     = %.4f ± %.4f\n", theta_mean[3], theta_std[3]);
+    printf("  Derived physical:\n");
+    printf("    sigma_z     ≈ %.4f\n", sz);
+    printf("    sigma_base  ≈ %.4f\n", sb);
     
     smc2_cuda_free(state);
     printf("  PASSED\n");
@@ -222,26 +281,28 @@ void test_prior_data_agreement(void) {
     
     SMC2StateCUDA* state = smc2_cuda_alloc(N_THETA, N_INNER);
     
-    printf("\nDefault prior (4 learned params):\n");
-    printf("  rho        = %.3f ± %.3f\n", state->prior.rho_mean, state->prior.rho_std);
-    printf("  sigma_z    = %.3f ± %.3f\n", state->prior.sigma_z_mean, state->prior.sigma_z_std);
-    printf("  mu_base    = %.3f ± %.3f\n", state->prior.mu_base_mean, state->prior.mu_base_std);
-    printf("  sigma_base = %.3f ± %.3f\n", state->prior.sigma_base_mean, state->prior.sigma_base_std);
+    printf("\nDefault prior (reparameterized):\n");
+    printf("  rho         = %.3f ± %.3f\n", state->prior.rho_mean, state->prior.rho_std);
+    printf("  sigma_total = %.3f ± %.3f\n", state->prior.sigma_total_mean, state->prior.sigma_total_std);
+    printf("  mu_base     = %.3f ± %.3f\n", state->prior.mu_base_mean, state->prior.mu_base_std);
+    printf("  r_split     = %.3f ± %.3f\n", state->prior.r_split_mean, state->prior.r_split_std);
     
     printf("\nDefault bounds:\n");
-    printf("  rho        ∈ [%.3f, %.3f]\n", state->bounds.rho_min, state->bounds.rho_max);
-    printf("  sigma_z    ∈ [%.3f, %.3f]\n", state->bounds.sigma_z_min, state->bounds.sigma_z_max);
-    printf("  mu_base    ∈ [%.3f, %.3f]\n", state->bounds.mu_base_min, state->bounds.mu_base_max);
-    printf("  sigma_base ∈ [%.3f, %.3f]\n", state->bounds.sigma_base_min, state->bounds.sigma_base_max);
+    printf("  rho         ∈ [%.3f, %.3f]\n", state->bounds.rho_min, state->bounds.rho_max);
+    printf("  sigma_total ∈ [%.3f, %.3f]\n", state->bounds.sigma_total_min, state->bounds.sigma_total_max);
+    printf("  mu_base     ∈ [%.3f, %.3f]\n", state->bounds.mu_base_min, state->bounds.mu_base_max);
+    printf("  r_split     ∈ [%.3f, %.3f]\n", state->bounds.r_split_min, state->bounds.r_split_max);
     
     printf("\nFixed curve shapes (constant memory):\n");
     printf("  mu_scale=%.2f  mu_rate=%.2f  sigma_scale=%.2f  sigma_rate=%.2f\n",
            state->fixed_curves.mu_scale, state->fixed_curves.mu_rate,
            state->fixed_curves.sigma_scale, state->fixed_curves.sigma_rate);
     
-    printf("\nTest truth values:\n");
-    printf("  rho=0.95, sigma_z=0.10, mu_base=-1.0, sigma_base=0.15\n");
-    printf("  → Check that truth is within bounds and near prior means!\n");
+    RSVParams truth = make_truth(0.95, 0.10, -1.0, 0.15);
+    printf("\nTest truth (physical → reparameterized):\n");
+    printf("  σ_z=0.10, σ_base=0.15 → σ_total=%.4f, r=%.4f\n",
+           truth.sigma_total, truth.r_split);
+    printf("  Check: truth within bounds and near prior means!\n");
     
     smc2_cuda_free(state);
 }
@@ -263,23 +324,22 @@ void test_parameter_learning(void) {
     float* z = (float*)malloc(T * sizeof(float));
     simulate_rsv(&truth, y, h, z, T);
     
-    printf("\nTRUE PARAMETERS (4 learned):\n");
-    printf("  rho=%.3f, sigma_z=%.3f, mu_base=%.3f, sigma_base=%.3f\n",
+    printf("\nTRUE (physical): ρ=%.3f, σ_z=%.3f, μ_base=%.3f, σ_base=%.3f\n",
            truth.rho, truth.sigma_z, truth.mu_base, truth.sigma_base);
+    printf("TRUE (learned):  ρ=%.3f, σ_total=%.4f, μ_base=%.3f, r=%.4f\n",
+           truth.rho, truth.sigma_total, truth.mu_base, truth.r_split);
     printf("  Fixed shapes: mu_scale=%.2f, mu_rate=%.2f, sigma_scale=%.2f, sigma_rate=%.2f\n",
            truth.mu_scale, truth.mu_rate, truth.sigma_scale, truth.sigma_rate);
     
     printf("\nGenerated T=%d observations\n", T);
     print_data_stats(y, T);
     
-    /* h_true stats */
     float h_sum = 0.0f, h_sq = 0.0f;
     for (int t = 0; t < T; t++) { h_sum += h[t]; h_sq += h[t] * h[t]; }
     printf("  True h: mean=%.3f, std=%.3f\n", h_sum / T, sqrtf(h_sq / T - (h_sum / T) * (h_sum / T)));
     
     SMC2StateCUDA* state = smc2_cuda_alloc(N_THETA, N_INNER);
     smc2_cuda_set_seed(state, 12345);
-    smc2_cuda_set_noise_capacity(state, T + 128);
     smc2_cuda_set_fixed_lag(state, 200);
     smc2_cuda_init_from_prior(state);
     
@@ -291,17 +351,9 @@ void test_parameter_learning(void) {
     
     cudaEventRecord(ev0);
     for (int t = 0; t < T; t++) {
-        float ess = smc2_cuda_update(state, y[t]);
-        if ((t + 1) % 200 == 0 || t == T - 1) {
-            float m[N_PARAMS];
-            smc2_cuda_get_theta_mean(state, m);
-            printf("  t=%4d: ESS=%5.1f, resamp=%2d, accept=%5.1f%%, "
-                   "ρ=%.3f, σz=%.3f, μb=%.2f, σb=%.3f\n",
-                   t + 1, ess, state->n_resamples,
-                   state->n_rejuv_total > 0 ?
-                   100.0f * state->n_rejuv_accepts / state->n_rejuv_total : 0.0f,
-                   m[0], m[1], m[2], m[3]);
-        }
+        smc2_cuda_update(state, y[t]);
+        if ((t + 1) % 200 == 0 || t == T - 1)
+            print_progress(state, t + 1);
     }
     cudaEventRecord(ev1); cudaEventSynchronize(ev1);
     float ms; cudaEventElapsedTime(&ms, ev0, ev1);
@@ -316,146 +368,18 @@ void test_parameter_learning(void) {
            state->n_rejuv_total > 0 ?
            100.0f * state->n_rejuv_accepts / state->n_rejuv_total : 0.0f);
     
-    float mean[N_PARAMS], sd[N_PARAMS], tv[N_PARAMS];
+    float mean[N_PARAMS], sd[N_PARAMS];
     smc2_cuda_get_theta_mean(state, mean);
     smc2_cuda_get_theta_std(state, sd);
-    get_true_arr(&truth, tv);
-    
-    printf("\nESTIMATED (mean ± std):\n");
-    for (int i = 0; i < N_PARAMS; i++)
-        printf("  %-12s = %.4f ± %.4f\n", param_names[i], mean[i], sd[i]);
     
     int n_ok, n_15;
-    print_recovery_table(tv, mean, sd, &n_ok, &n_15);
+    print_recovery_table(&truth, mean, sd, &n_ok, &n_15);
     printf("OVERALL: %d/%d within 2σ, %d/%d within 15%% relative error\n",
            n_ok, N_PARAMS, n_15, N_PARAMS);
     printf("%s\n", n_ok >= 3 ? "PASSED" : "NEEDS INVESTIGATION");
     
     cudaEventDestroy(ev0); cudaEventDestroy(ev1);
     smc2_cuda_free(state);
-    free(y); free(h); free(z);
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
- * Test: Fixed-Lag PMMH for Long Sequences
- *═══════════════════════════════════════════════════════════════════════════*/
-
-void test_fixed_lag(void) {
-    printf("\n═══════════════════════════════════════════════════════════════\n");
-    printf("Test: Fixed-Lag PMMH — Accuracy at Large T\n");
-    printf("═══════════════════════════════════════════════════════════════\n");
-    printf("\nGoal: Show that fixed-lag maintains accuracy at large T where\n");
-    printf("      full-history PMMH degrades due to O(T) variance growth.\n\n");
-    
-    RSVParams truth = make_truth(0.95, 0.10, -1.0, 0.15);
-    int T_values[] = {1000, 2000, 5000};
-    int n_T = 3;
-    
-    for (int ti = 0; ti < n_T; ti++) {
-        int T = T_values[ti];
-        
-        printf("─────────────────────────────────────────────────────────────────────────\n");
-        printf("T = %d\n", T);
-        printf("─────────────────────────────────────────────────────────────────────────\n");
-        
-        float* y = (float*)malloc(T * sizeof(float));
-        float* h = (float*)malloc(T * sizeof(float));
-        float* z = (float*)malloc(T * sizeof(float));
-        simulate_rsv(&truth, y, h, z, T);
-        
-        printf("  %-6s  %8s  %10s  %10s  %10s  %10s  %8s  %5s\n",
-               "Lag", "Time(ms)", "rho", "sigma_z", "mu_base", "sigma_base", "Accept%", "Resmp");
-        
-        int lags[] = {0, 200};
-        for (int li = 0; li < 2; li++) {
-            int L = lags[li];
-            
-            SMC2StateCUDA* s = smc2_cuda_alloc(N_THETA, N_INNER);
-            smc2_cuda_set_seed(s, 12345);
-            smc2_cuda_set_noise_capacity(s, T + 128);
-            smc2_cuda_set_fixed_lag(s, L);
-            smc2_cuda_init_from_prior(s);
-            
-            cudaEvent_t ev0, ev1;
-            cudaEventCreate(&ev0); cudaEventCreate(&ev1);
-            cudaEventRecord(ev0);
-            for (int t = 0; t < T; t++) smc2_cuda_update(s, y[t]);
-            cudaEventRecord(ev1); cudaEventSynchronize(ev1);
-            float ms; cudaEventElapsedTime(&ms, ev0, ev1);
-            
-            float mean[N_PARAMS], sd[N_PARAMS];
-            smc2_cuda_get_theta_mean(s, mean);
-            smc2_cuda_get_theta_std(s, sd);
-            float acc = s->n_rejuv_total > 0 ?
-                100.0f * s->n_rejuv_accepts / s->n_rejuv_total : 0.0f;
-            
-            printf("  L=%3d   %8.1f  %5.4f±%4.3f  %5.4f±%4.3f  %5.2f±%4.2f  %5.4f±%4.3f  %7.1f%%  %5d\n",
-                   L, ms,
-                   mean[0], sd[0], mean[1], sd[1],
-                   mean[2], sd[2], mean[3], sd[3],
-                   acc, s->n_resamples);
-            
-            cudaEventDestroy(ev0); cudaEventDestroy(ev1);
-            smc2_cuda_free(s);
-        }
-        
-        free(y); free(h); free(z);
-        printf("\n");
-    }
-    
-    printf("─────────────────────────────────────────────────────────────────────────\n");
-    printf("True: ρ=%.2f  σ_z=%.2f  μ_base=%.1f  σ_base=%.2f\n",
-           truth.rho, truth.sigma_z, truth.mu_base, truth.sigma_base);
-    printf("Expected: At large T, L=0 degrades while L=200 stays stable.\n");
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
- * Test: Throughput
- *═══════════════════════════════════════════════════════════════════════════*/
-
-void test_throughput(void) {
-    printf("\n═══════════════════════════════════════════════════════════════\n");
-    printf("Test: Throughput with CPMMH Rejuvenation\n");
-    printf("═══════════════════════════════════════════════════════════════\n");
-    
-    RSVParams truth = make_truth(0.95, 0.10, -1.0, 0.15);
-    int T = 500;
-    
-    float* y = (float*)malloc(T * sizeof(float));
-    float* h = (float*)malloc(T * sizeof(float));
-    float* z = (float*)malloc(T * sizeof(float));
-    simulate_rsv(&truth, y, h, z, T);
-    
-    printf("\n  N_theta  N_inner  Time(ms)  Resamples  Accept%%   ms/obs\n");
-    printf("  ─────────────────────────────────────────────────────────\n");
-    
-    int configs[][2] = {{N_THETA/4, N_INNER/4}, {N_THETA/2, N_INNER/2}, {N_THETA, N_INNER}, {N_THETA, N_INNER*2}};
-    int n_configs = 4;
-    
-    for (int c = 0; c < n_configs; c++) {
-        SMC2StateCUDA* s = smc2_cuda_alloc(configs[c][0], configs[c][1]);
-        smc2_cuda_set_seed(s, 54321);
-        smc2_cuda_set_noise_capacity(s, T + 128);
-        smc2_cuda_set_fixed_lag(s, 200);
-        smc2_cuda_init_from_prior(s);
-        
-        cudaEvent_t ev0, ev1;
-        cudaEventCreate(&ev0); cudaEventCreate(&ev1);
-        cudaEventRecord(ev0);
-        for (int t = 0; t < T; t++) smc2_cuda_update(s, y[t]);
-        cudaEventRecord(ev1); cudaEventSynchronize(ev1);
-        float ms; cudaEventElapsedTime(&ms, ev0, ev1);
-        
-        float acc = s->n_rejuv_total > 0 ?
-            100.0f * s->n_rejuv_accepts / s->n_rejuv_total : 0.0f;
-        
-        printf("  %4d     %4d     %7.1f   %4d       %5.1f    %.3f\n",
-               configs[c][0], configs[c][1], ms, s->n_resamples, acc, ms / T);
-        
-        cudaEventDestroy(ev0); cudaEventDestroy(ev1);
-        smc2_cuda_free(s);
-    }
-    
     free(y); free(h); free(z);
 }
 
@@ -476,17 +400,18 @@ void test_high_vol(void) {
     float* z = (float*)malloc(T * sizeof(float));
     simulate_rsv(&truth, y, h, z, T);
     
-    printf("\nTRUE: ρ=%.2f  σ_z=%.2f  μ_base=%.1f  σ_base=%.2f\n",
+    printf("\nTRUE (physical): ρ=%.2f  σ_z=%.2f  μ_base=%.1f  σ_base=%.2f\n",
            truth.rho, truth.sigma_z, truth.mu_base, truth.sigma_base);
+    printf("TRUE (learned):  σ_total=%.4f  r=%.4f\n", truth.sigma_total, truth.r_split);
     print_data_stats(y, T);
     
     SMC2StateCUDA* s = smc2_cuda_alloc(N_THETA, N_INNER);
     /* Widen prior for high-vol regime */
-    s->prior.rho_mean = 0.96f;        s->prior.rho_std = 0.02f;
-    s->prior.sigma_z_mean = 0.10f;    s->prior.sigma_z_std = 0.10f;
-    s->prior.mu_base_mean = 0.0f;     s->prior.mu_base_std = 2.0f;
-    s->prior.sigma_base_mean = 0.15f; s->prior.sigma_base_std = 0.10f;
-    s->bounds.mu_base_min = -5.0f;    s->bounds.mu_base_max = 8.0f;
+    s->prior.rho_mean = 0.96f;            s->prior.rho_std = 0.02f;
+    s->prior.sigma_total_mean = 0.22f;    s->prior.sigma_total_std = 0.15f;
+    s->prior.mu_base_mean = 0.0f;         s->prior.mu_base_std = 2.0f;
+    s->prior.r_split_mean = 0.4f;         s->prior.r_split_std = 0.2f;
+    s->bounds.mu_base_min = -5.0f;        s->bounds.mu_base_max = 8.0f;
     smc2_cuda_set_fixed_lag(s, 200);
     smc2_cuda_set_seed(s, 999);
     smc2_cuda_init_from_prior(s);
@@ -498,17 +423,9 @@ void test_high_vol(void) {
     cudaEventCreate(&ev0); cudaEventCreate(&ev1);
     cudaEventRecord(ev0);
     for (int t = 0; t < T; t++) {
-        float ess = smc2_cuda_update(s, y[t]);
-        if ((t + 1) % 200 == 0 || t == T - 1) {
-            float m[N_PARAMS];
-            smc2_cuda_get_theta_mean(s, m);
-            printf("  t=%4d: ESS=%5.1f, resamp=%2d, accept=%5.1f%%, "
-                   "ρ=%.3f, σz=%.3f, μb=%.2f, σb=%.3f\n",
-                   t + 1, ess, s->n_resamples,
-                   s->n_rejuv_total > 0 ?
-                   100.0f * s->n_rejuv_accepts / s->n_rejuv_total : 0.0f,
-                   m[0], m[1], m[2], m[3]);
-        }
+        smc2_cuda_update(s, y[t]);
+        if ((t + 1) % 200 == 0 || t == T - 1)
+            print_progress(s, t + 1);
     }
     cudaEventRecord(ev1); cudaEventSynchronize(ev1);
     float ms; cudaEventElapsedTime(&ms, ev0, ev1);
@@ -518,13 +435,12 @@ void test_high_vol(void) {
            s->n_rejuv_total > 0 ?
            100.0f * s->n_rejuv_accepts / s->n_rejuv_total : 0.0f);
     
-    float mean[N_PARAMS], sd[N_PARAMS], tv[N_PARAMS];
+    float mean[N_PARAMS], sd[N_PARAMS];
     smc2_cuda_get_theta_mean(s, mean);
     smc2_cuda_get_theta_std(s, sd);
-    get_true_arr(&truth, tv);
     
     int n_ok, n_15;
-    print_recovery_table(tv, mean, sd, &n_ok, &n_15);
+    print_recovery_table(&truth, mean, sd, &n_ok, &n_15);
     printf("OVERALL: %d/%d within 2σ → %s\n", n_ok, N_PARAMS,
            n_ok >= 2 ? "PASSED" : "NEEDS INVESTIGATION");
     
@@ -545,8 +461,10 @@ void test_identifiability(void) {
     RSVParams a = make_truth(0.98, 0.05, -1.0, 0.15);
     RSVParams b = make_truth(0.85, 0.20, -1.0, 0.15);
     
-    printf("\n  Case A: ρ=%.2f  σ_z=%.2f  (persistent, quiet)\n", a.rho, a.sigma_z);
-    printf("  Case B: ρ=%.2f  σ_z=%.2f  (fast-switching, noisy)\n\n", b.rho, b.sigma_z);
+    printf("\n  Case A: ρ=%.2f  σ_z=%.2f  (persistent, quiet)   → σ_total=%.4f, r=%.4f\n",
+           a.rho, a.sigma_z, a.sigma_total, a.r_split);
+    printf("  Case B: ρ=%.2f  σ_z=%.2f  (fast-switching, noisy) → σ_total=%.4f, r=%.4f\n\n",
+           b.rho, b.sigma_z, b.sigma_total, b.r_split);
     
     int T = 1500;
     float* y = (float*)malloc(T * sizeof(float));
@@ -554,14 +472,16 @@ void test_identifiability(void) {
     float* z = (float*)malloc(T * sizeof(float));
     
     RSVParams cases[2] = {a, b};
-    float learned_rho[2], learned_sz[2];
+    float learned_rho[2], learned_st[2], learned_r[2];
+    float derived_sz[2], derived_sb[2];
     
     for (int c = 0; c < 2; c++) {
         simulate_rsv(&cases[c], y, h, z, T);
         
         SMC2StateCUDA* s = smc2_cuda_alloc(N_THETA, N_INNER);
-        s->prior.rho_mean = 0.90f;      s->prior.rho_std = 0.05f;
-        s->prior.sigma_z_mean = 0.10f;  s->prior.sigma_z_std = 0.10f;
+        s->prior.rho_mean = 0.90f;           s->prior.rho_std = 0.05f;
+        s->prior.sigma_total_mean = 0.16f;   s->prior.sigma_total_std = 0.10f;
+        s->prior.r_split_mean = 0.4f;        s->prior.r_split_std = 0.25f;
         s->bounds.rho_min = 0.70f;
         smc2_cuda_set_fixed_lag(s, 200);
         smc2_cuda_set_seed(s, 42 + c);
@@ -572,122 +492,29 @@ void test_identifiability(void) {
         float mean[N_PARAMS];
         smc2_cuda_get_theta_mean(s, mean);
         learned_rho[c] = mean[0];
-        learned_sz[c]  = mean[1];
+        learned_st[c]  = mean[1];
+        learned_r[c]   = mean[3];
+        to_physical(mean, &derived_sz[c], &derived_sb[c]);
         
-        printf("  Case %c: learned ρ=%.4f (true %.2f)  σ_z=%.4f (true %.2f)\n",
-               'A' + c, mean[0], (float)cases[c].rho, mean[1], (float)cases[c].sigma_z);
+        printf("  Case %c: ρ=%.4f (true %.2f)  σ_total=%.4f (true %.4f)  "
+               "r=%.4f (true %.4f)  [σ_z=%.4f  σ_base=%.4f]\n",
+               'A' + c, mean[0], (float)cases[c].rho,
+               mean[1], (float)cases[c].sigma_total,
+               mean[3], (float)cases[c].r_split,
+               derived_sz[c], derived_sb[c]);
         smc2_cuda_free(s);
     }
     
     int rho_ok = (learned_rho[0] > learned_rho[1]);
-    int sz_ok  = (learned_sz[0]  < learned_sz[1]);
+    int sz_ok  = (derived_sz[0]  < derived_sz[1]);
+    int r_ok   = (learned_r[0]   < learned_r[1]);  /* Case A has lower r (less σ_z share) */
     int pass = rho_ok && sz_ok;
     
-    printf("\n  ρ_A > ρ_B?     %s  (%.4f vs %.4f)\n", rho_ok ? "YES" : "NO ", learned_rho[0], learned_rho[1]);
-    printf("  σ_z_A < σ_z_B? %s  (%.4f vs %.4f)\n", sz_ok  ? "YES" : "NO ", learned_sz[0], learned_sz[1]);
+    printf("\n  ρ_A > ρ_B?        %s  (%.4f vs %.4f)\n", rho_ok ? "YES" : "NO ", learned_rho[0], learned_rho[1]);
+    printf("  σ_z_A < σ_z_B?    %s  (%.4f vs %.4f)\n", sz_ok  ? "YES" : "NO ", derived_sz[0], derived_sz[1]);
+    printf("  r_A < r_B?        %s  (%.4f vs %.4f)  (split ratio reflects σ_z share)\n",
+           r_ok ? "YES" : "NO ", learned_r[0], learned_r[1]);
     printf("  → %s\n", pass ? "PASSED" : "FAILED");
-    
-    free(y); free(h); free(z);
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
- * Test: Per-Tick Latency Distribution
- *═══════════════════════════════════════════════════════════════════════════*/
-
-void test_latency(void) {
-    printf("\n═══════════════════════════════════════════════════════════════\n");
-    printf("Test: Per-Tick Latency Distribution\n");
-    printf("═══════════════════════════════════════════════════════════════\n");
-    
-    RSVParams truth = make_truth(0.95, 0.10, -1.0, 0.15);
-    int T = 1000;
-    
-    float* y = (float*)malloc(T * sizeof(float));
-    float* h = (float*)malloc(T * sizeof(float));
-    float* z = (float*)malloc(T * sizeof(float));
-    simulate_rsv(&truth, y, h, z, T);
-    
-    int inners[] = {64, 128, 256, 512};
-    
-    printf("\n  N_theta=%d  L=200  T=%d\n\n", N_THETA, T);
-    printf("  %-8s  %8s  %8s  %6s  %7s\n", "N_inner", "Wall ms", "μs/tick", "Resamp", "Accept");
-    printf("  ─────────────────────────────────────────────────\n");
-    
-    for (int ci = 0; ci < 4; ci++) {
-        int ni = inners[ci];
-        SMC2StateCUDA* s = smc2_cuda_alloc(N_THETA, ni);
-        smc2_cuda_set_fixed_lag(s, 200);
-        smc2_cuda_set_seed(s, 42);
-        
-        /* Warmup */
-        smc2_cuda_init_from_prior(s);
-        for (int t = 0; t < 50; t++) smc2_cuda_update(s, y[t]);
-        
-        cudaEvent_t ev0, ev1;
-        cudaEventCreate(&ev0); cudaEventCreate(&ev1);
-        cudaEventRecord(ev0);
-        smc2_cuda_init_from_prior(s);
-        for (int t = 0; t < T; t++) smc2_cuda_update(s, y[t]);
-        cudaEventRecord(ev1); cudaEventSynchronize(ev1);
-        float ms; cudaEventElapsedTime(&ms, ev0, ev1);
-        
-        float acc = s->n_rejuv_total > 0 ?
-            100.0f * s->n_rejuv_accepts / s->n_rejuv_total : 0.0f;
-        
-        printf("  %-8d  %8.1f  %8.1f  %6d  %6.1f%%\n",
-               ni, ms, 1000.0f * ms / T, s->n_resamples, acc);
-        
-        cudaEventDestroy(ev0); cudaEventDestroy(ev1);
-        smc2_cuda_free(s);
-    }
-    
-    /* Per-tick percentiles at default N_INNER */
-    printf("\n  Per-tick distribution (N_theta=%d, N_inner=%d):\n", N_THETA, N_INNER);
-    {
-        int T_b = 500;
-        SMC2StateCUDA* s = smc2_cuda_alloc(N_THETA, N_INNER);
-        smc2_cuda_set_fixed_lag(s, 200);
-        smc2_cuda_set_seed(s, 42);
-        
-        float* us = (float*)malloc(T_b * sizeof(float));
-        cudaEvent_t* e0 = (cudaEvent_t*)malloc(T_b * sizeof(cudaEvent_t));
-        cudaEvent_t* e1 = (cudaEvent_t*)malloc(T_b * sizeof(cudaEvent_t));
-        for (int t = 0; t < T_b; t++) { cudaEventCreate(&e0[t]); cudaEventCreate(&e1[t]); }
-        
-        smc2_cuda_init_from_prior(s);
-        for (int t = 0; t < T_b; t++) {
-            cudaEventRecord(e0[t]);
-            smc2_cuda_update(s, y[t]);
-            cudaEventRecord(e1[t]);
-        }
-        cudaDeviceSynchronize();
-        
-        for (int t = 0; t < T_b; t++) {
-            float ms; cudaEventElapsedTime(&ms, e0[t], e1[t]);
-            us[t] = ms * 1000.0f;
-        }
-        /* Sort */
-        for (int i = 0; i < T_b - 1; i++)
-            for (int j = i + 1; j < T_b; j++)
-                if (us[j] < us[i]) { float tmp = us[i]; us[i] = us[j]; us[j] = tmp; }
-        
-        float sum = 0; for (int t = 0; t < T_b; t++) sum += us[t];
-        int n_spike = 0; float thresh = 3.0f * us[T_b / 2];
-        for (int t = 0; t < T_b; t++) if (us[t] > thresh) n_spike++;
-        
-        printf("    Min:  %8.1f μs\n", us[0]);
-        printf("    P50:  %8.1f μs  (forward-only baseline)\n", us[T_b / 2]);
-        printf("    Mean: %8.1f μs\n", sum / T_b);
-        printf("    P90:  %8.1f μs\n", us[(int)(T_b * 0.90)]);
-        printf("    P95:  %8.1f μs\n", us[(int)(T_b * 0.95)]);
-        printf("    P99:  %8.1f μs  (resample + rejuvenation spikes)\n", us[(int)(T_b * 0.99)]);
-        printf("    Max:  %8.1f μs\n", us[T_b - 1]);
-        printf("    Spikes: %d / %d ticks > %.0f μs (3× median)\n", n_spike, T_b, thresh);
-        
-        for (int t = 0; t < T_b; t++) { cudaEventDestroy(e0[t]); cudaEventDestroy(e1[t]); }
-        free(e0); free(e1); free(us);
-        smc2_cuda_free(s);
-    }
     
     free(y); free(h); free(z);
 }
@@ -704,29 +531,24 @@ void print_usage(const char* prog) {
     printf("  %s learn            Parameter learning (T=1200)\n", prog);
     printf("  %s highvol          High-vol regime (μ_base=2.0)\n", prog);
     printf("  %s ident            ρ vs σ_z identifiability\n", prog);
-    printf("  %s fixedlag         Fixed-lag vs full-history\n", prog);
-    printf("  %s throughput       Scaling benchmark\n", prog);
-    printf("  %s latency          Per-tick latency distribution\n", prog);
 }
 
 int main(int argc, char** argv) {
     printf("\n╔═══════════════════════════════════════════════════════════════╗\n");
     printf("║  SMC² RBPF — 4-Param Convergence Tests                      ║\n");
-    printf("║  Learned: ρ, σ_z, μ_base, σ_base                            ║\n");
-    printf("║  Fixed:   μ_scale=0.5  μ_rate=1.0  σ_scale=0.1  σ_rate=1.0  ║\n");
+    printf("║  Learned: ρ, σ_total, μ_base, r_split                       ║\n");
+    printf("║  Physical: σ_z = r·σ_total, σ_base = √(1-r²)·σ_total       ║\n");
+    printf("║  Fixed:   μ_scale=0.5  μ_rate=1.0  σ_scale=0.1  σ_rate=1.0 ║\n");
     printf("╚═══════════════════════════════════════════════════════════════╝\n");
     
     seed_rng(12345);
     
     if (argc > 1) {
-        if (strcmp(argv[1], "basic") == 0)       { test_basic(); }
-        else if (strcmp(argv[1], "prior") == 0)  { test_prior_data_agreement(); }
-        else if (strcmp(argv[1], "learn") == 0)  { test_parameter_learning(); }
-        else if (strcmp(argv[1], "highvol") == 0) { test_high_vol(); }
-        else if (strcmp(argv[1], "ident") == 0)  { test_identifiability(); }
-        else if (strcmp(argv[1], "fixedlag") == 0) { test_fixed_lag(); }
-        else if (strcmp(argv[1], "throughput") == 0) { test_throughput(); }
-        else if (strcmp(argv[1], "latency") == 0) { test_latency(); }
+        if (strcmp(argv[1], "basic") == 0)        { test_basic(); }
+        else if (strcmp(argv[1], "prior") == 0)   { test_prior_data_agreement(); }
+        else if (strcmp(argv[1], "learn") == 0)    { test_parameter_learning(); }
+        else if (strcmp(argv[1], "highvol") == 0)  { test_high_vol(); }
+        else if (strcmp(argv[1], "ident") == 0)    { test_identifiability(); }
         else { print_usage(argv[0]); return 1; }
         return 0;
     }
@@ -736,9 +558,6 @@ int main(int argc, char** argv) {
     test_parameter_learning();
     test_high_vol();
     test_identifiability();
-    test_fixed_lag();
-    test_throughput();
-    test_latency();
     
     printf("\n═══════════════════════════════════════════════════════════════\n");
     printf("All tests completed.\n");

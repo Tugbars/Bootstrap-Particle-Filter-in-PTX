@@ -45,10 +45,19 @@
  * ========================================
  * 
  * Learned by SMC²:
- *   ρ        - AR(1) persistence of z̃ (dynamics)
- *   σ_z      - Innovation scale of z̃ (dynamics)
- *   μ_base   - Base mean level (curve level)
- *   σ_base   - Base vol-of-vol (curve level)
+ *   ρ            - AR(1) persistence of z̃ (dynamics)
+ *   σ_total      - Total vol-of-vol: √(σ_z² + σ_base²) (well-identified)
+ *   μ_base       - Base mean level (curve level)
+ *   r            - Vol-of-vol split: σ_z/σ_total ∈ (0,1) (weakly identified)
+ * 
+ * Physical parameters recovered as:
+ *   σ_z    = r · σ_total        (z̃ innovation scale)
+ *   σ_base = √(1-r²) · σ_total (σ_h curve base level)
+ * 
+ * Rationale: σ_z and σ_base have an identification ridge — the data constrains
+ * their combined effect (σ_total) but not how it's split between the two
+ * channels. This reparameterization aligns CPMMH proposals with the likelihood
+ * geometry, improving acceptance rates and posterior accuracy.
  * 
  * Fixed (calibrated offline):
  *   μ_scale, μ_rate     - Mean curve shape
@@ -154,9 +163,9 @@
  */
 struct SVPrior {
     float rho_mean, rho_std;
-    float sigma_z_mean, sigma_z_std;
+    float sigma_total_mean, sigma_total_std;
     float mu_base_mean, mu_base_std;
-    float sigma_base_mean, sigma_base_std;
+    float r_split_mean, r_split_std;
 };
 
 /**
@@ -166,9 +175,9 @@ struct SVPrior {
  */
 struct SVBounds {
     float rho_min, rho_max;
-    float sigma_z_min, sigma_z_max;
+    float sigma_total_min, sigma_total_max;
     float mu_base_min, mu_base_max;
-    float sigma_base_min, sigma_base_max;
+    float r_split_min, r_split_max;
 };
 
 /**
@@ -198,16 +207,17 @@ struct SVCurve {
  * 
  * Memory layout uses Structure-of-Arrays for coalesced GPU access.
  * 
- * Only 4 parameters are learned (rho, sigma_z, mu_base, sigma_base).
+ * Only 4 parameters are learned (rho, sigma_total, mu_base, r_split).
+ * Physical sigma_z = r_split * sigma_total, sigma_base = sqrt(1-r²) * sigma_total.
  * Curve shapes (mu_scale, mu_rate, sigma_scale, sigma_rate) live in
  * constant memory as SVFixedCurves.
  */
 struct ThetaParticlesSoA {
     /* ═══ Learned θ-level arrays (N_theta elements) ═══ */
     float* rho;              /**< AR(1) coefficient for z̃ dynamics */
-    float* sigma_z;          /**< Innovation std for z̃ */
+    float* sigma_total;      /**< Total vol-of-vol: √(σ_z² + σ_base²) */
     float* mu_base;          /**< μ(z) curve: base parameter (learned) */
-    float* sigma_base;       /**< σ_h(z) curve: base parameter (learned) */
+    float* r_split;          /**< Vol-of-vol split ratio: σ_z / σ_total ∈ (0,1) */
     
     float* log_weight;
     float* weight;
@@ -455,7 +465,7 @@ __global__ void kernel_copy_noise_arrays(
     const noise_t* src_z, noise_t* dst_z,
     const noise_t* src_u0, noise_t* dst_u0,
     const int* d_ancestors, int N_theta, int N_inner,
-    int t_current, int noise_capacity
+    int t_current, int noise_capacity, int t_start
 );
 
 /* CPMMH rejuvenation: template-dispatched, declared in .cu via
@@ -529,7 +539,7 @@ void smc2_cuda_set_cpmmh_rho(SMC2StateCUDA* state, float rho);
 
 /**
  * @brief Set proposal standard deviations
- * @param std  Array of N_PARAMS floats [rho, sigma_z, mu_base, sigma_base], or NULL for defaults
+ * @param std  Array of N_PARAMS floats [rho, sigma_total, mu_base, r_split], or NULL for defaults
  */
 void smc2_cuda_set_proposal_std(SMC2StateCUDA* state, const float* std);
 
@@ -539,7 +549,7 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs);
 /**
  * @brief Get posterior mean of learned θ parameters
  * @param theta_mean  Output array of size N_PARAMS
- * Order: [rho, sigma_z, mu_base, sigma_base]
+ * Order: [rho, sigma_total, mu_base, r_split]
  */
 void smc2_cuda_get_theta_mean(SMC2StateCUDA* state, float* theta_mean);
 void smc2_cuda_get_theta_std(SMC2StateCUDA* state, float* theta_std);
