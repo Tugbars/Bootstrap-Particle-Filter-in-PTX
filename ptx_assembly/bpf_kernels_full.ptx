@@ -20,6 +20,8 @@
 //  11.  bpf_compute_var       -- Variance for Silverman bandwidth
 //  12.  bpf_gen_noise         -- ICDF normal generation from PCG32
 //  13.  bpf_silverman_jitter  -- Post-resample kernel smoothing
+//  14.  bpf_grad_alpha        -- Fused gradient+Fisher for mu/rho learning
+//  15.  bpf_jump_perturb      -- Bernoulli MIM jump diffusion (regime-adaptive)
 //
 // PCG32 State: 2 x u64 per particle [state, inc] in flat array
 // ICDF: Beasley-Springer-Moro rational approximation (~7 digit accuracy)
@@ -29,6 +31,12 @@
 //     Saves 5 bar.sync + 15 shared memory ops per invocation
 //   - Kernel 5: CAS atomicMax kept (atom.global.max.f32 not in SM_120 ptxas 13.1)
 //   - Net: 20 fewer block stalls per tick (4 reduction invocations)
+//
+// v3 changes (kernel 15: jump diffusion):
+//   - Bernoulli MIM via PTX: reuses PCG32 RNG, Acklam ICDF
+//   - Eliminates nvcc-compiled bpf_jump library + separate LCG seeds
+//   - Regime-adaptive lambda: calm/alert/panic set by host from surprise EMA
+//   - 2 PCG32 steps for jumpers, 1 for non-jumpers (minimal warp divergence)
 //
 // Compile:  ptxas -arch=sm_120 -o bpf_kernels.cubin bpf_kernels.ptx
 // =============================================================================
@@ -71,20 +79,17 @@
     setp.ge.u32     %p_bound, %idx, %r_n;
     @%p_bound bra   INIT_RNG_EXIT;
 
-    // inc = (2*i + 1) | 1  (unique odd per particle)
     shl.b32         %r_idx2,  %idx, 1;
     add.u32         %r_idx2,  %r_idx2, 1;
     cvt.u64.u32     %rd_inc,  %r_idx2;
     or.b64          %rd_inc,  %rd_inc, 1;
 
-    // state = seed * MULT + inc, then one step
     mov.u64         %rd_mul,  6364136223846793005;
     mul.lo.u64      %rd_state, %rd_seed, %rd_mul;
     add.u64         %rd_state, %rd_state, %rd_inc;
     mul.lo.u64      %rd_tmp,   %rd_state, %rd_mul;
     add.u64         %rd_state, %rd_tmp, %rd_inc;
 
-    // Store [state, inc]
     mul.wide.u32    %rd_off,  %idx, 16;
     add.u64         %rd_addr, %rd_rng, %rd_off;
     st.global.u64   [%rd_addr + 0], %rd_state;
@@ -97,7 +102,6 @@ INIT_RNG_EXIT:
 
 // =============================================================================
 // Kernel 2: bpf_init_particles
-//   h[i] = mu + std_stat * icdf(pcg32_float(rng[i]))
 // =============================================================================
 
 .visible .entry bpf_init_particles(
@@ -131,19 +135,16 @@ INIT_RNG_EXIT:
     setp.ge.u32     %p_bound, %idx, %r_n;
     @%p_bound bra   INIT_P_EXIT;
 
-    // Load RNG
     mul.wide.u32    %rd_off,      %idx, 16;
     add.u64         %rd_rng_addr, %rd_rng, %rd_off;
     ld.global.u64   %rd_state, [%rd_rng_addr + 0];
     ld.global.u64   %rd_inc,   [%rd_rng_addr + 8];
 
-    // PCG32 step
     mov.u64         %rd_old, %rd_state;
     mov.u64         %rd_mul, 6364136223846793005;
     mul.lo.u64      %rd_tmp, %rd_state, %rd_mul;
     add.u64         %rd_state, %rd_tmp, %rd_inc;
 
-    // PCG32 output
     shr.u64         %rd_tmp, %rd_old, 18;
     xor.b64         %rd_tmp, %rd_tmp, %rd_old;
     shr.u64         %rd_tmp, %rd_tmp, 27;
@@ -156,12 +157,11 @@ INIT_RNG_EXIT:
     shl.b32         %r_hi, %r_xsh, %r_neg_rot;
     or.b32          %r_pcg, %r_lo, %r_hi;
 
-    // float in (0,1)
     shr.u32         %r_pcg, %r_pcg, 9;
     cvt.rn.f32.u32  %f_u, %r_pcg;
-    mul.f32         %f_u, %f_u, 0f34000000;      // 1/8388608
-    max.f32         %f_u, %f_u, 0f358637BD;      // 1e-6
-    min.f32         %f_u, %f_u, 0f3F7FFBCE;      // 1-1e-6
+    mul.f32         %f_u, %f_u, 0f34000000;
+    max.f32         %f_u, %f_u, 0f358637BD;
+    min.f32         %f_u, %f_u, 0f3F7FFBCE;
 
     // ICDF (full Acklam)
     sub.f32         %f_q, %f_u, 0f3F000000;
@@ -220,12 +220,6 @@ INIT_P_EXIT:
 
 // =============================================================================
 // Kernel 3: bpf_propagate_weight
-//   Propagate (OU + optional Student-t noise) + compute observation log-weight
-//   chi2 variates pre-generated on host (param_chi2 array)
-//   Student-t obs constant precomputed on host (param_C_obs)
-//   Adaptive bands: sigma_z scaled by k_b from d_mix_config constant memory
-//   Band lookup: contiguous ranges -> zero warp divergence
-//   No importance weight correction -- observation likelihood does natural selection
 // =============================================================================
 
 .visible .entry bpf_propagate_weight(
@@ -277,14 +271,12 @@ INIT_P_EXIT:
     setp.ge.u32     %p_bound, %idx, %r_n;
     @%p_bound bra   PW_EXIT;
 
-    // Load h[i]
     mul.wide.u32    %rd_off, %idx, 4;
     .reg .u64 %rd_h_addr, %rd_lw_addr;
     add.u64         %rd_h_addr,  %rd_h, %rd_off;
     add.u64         %rd_lw_addr, %rd_lw, %rd_off;
     ld.global.f32   %f_hi, [%rd_h_addr];
 
-    // Load RNG
     mul.wide.u32    %rd_off, %idx, 16;
     add.u64         %rd_rng_addr, %rd_rng, %rd_off;
     ld.global.u64   %rd_state, [%rd_rng_addr + 0];
@@ -294,7 +286,7 @@ INIT_P_EXIT:
     setp.ne.s32     %p_do_prop, %r_do_prop, 0;
     @!%p_do_prop bra PW_WEIGHT;
 
-    // === ADAPTIVE BAND LOOKUP (constant memory) ===
+    // === ADAPTIVE BAND LOOKUP ===
     .reg .f32   %f_kb;
     .reg .s32   %r_nb, %r_bnd;
     .reg .pred  %p_skip_bands, %p_in_band;
@@ -323,9 +315,7 @@ INIT_P_EXIT:
 PW_BANDS_DONE:
     mul.f32         %f_sigma_z, %f_sigma_z, %f_kb;
 
-    // === PROPAGATION ===
-
-    // PCG32 step -> uniform -> ICDF -> z ~ N(0,1)
+    // === PROPAGATION: PCG32 -> ICDF -> OU transition ===
     mov.u64         %rd_old, %rd_state;
     mul.lo.u64      %rd_tmp, %rd_state, %rd_mul;
     add.u64         %rd_state, %rd_tmp, %rd_inc;
@@ -346,7 +336,7 @@ PW_BANDS_DONE:
     max.f32         %f_u, %f_u, 0f358637BD;
     min.f32         %f_u, %f_u, 0f3F7FFBCE;
 
-    // ICDF (full Acklam)
+    // ICDF
     sub.f32         %f_q, %f_u, 0f3F000000;
     abs.f32         %f_abs_q, %f_q;
     setp.lt.f32     %p_central, %f_abs_q, 0f3EF39581;
@@ -390,7 +380,6 @@ PW_TAIL:
 PW_ICDF_OK:
     mov.f32         %f_eps, %f_z;
 
-    // Student-t state noise: eps = z * sqrt(nu / chi2)
     setp.gt.f32     %p_t_state, %f_nu_state, 0f00000000;
     @!%p_t_state bra PW_TRANS;
 
@@ -412,7 +401,6 @@ PW_TRANS:
     st.global.f32   [%rd_h_addr], %f_hi;
 
 PW_WEIGHT:
-    // === OBSERVATION WEIGHT ===
     .reg .f32 %f_neg_half, %f_exp_arg;
     mov.f32         %f_neg_half, 0fBF000000;
     mul.f32         %f_exp_arg, %f_hi, %f_neg_half;
@@ -423,7 +411,6 @@ PW_WEIGHT:
     setp.gt.f32     %p_t_obs, %f_nu_obs, 0f00000000;
     @%p_t_obs bra   PW_T_OBS;
 
-    // Gaussian obs
     mul.f32         %f_eta2, %f_eta, %f_eta;
     mov.f32         %f_log_w, 0fBF6B3F8E;
     fma.rn.f32      %f_log_w, %f_neg_half, %f_eta2, %f_log_w;
@@ -431,12 +418,9 @@ PW_WEIGHT:
     bra             PW_STORE;
 
 PW_T_OBS:
-    // Student-t obs
     .reg .f32 %f_nu_p1h, %f_t_arg, %f_log_t;
-
     add.f32         %f_nu_p1h, %f_nu_obs, 0f3F800000;
     mul.f32         %f_nu_p1h, %f_nu_p1h, 0f3F000000;
-
     mul.f32         %f_eta2, %f_eta, %f_eta;
     div.approx.f32  %f_t_arg, %f_eta2, %f_nu_obs;
     add.f32         %f_t_arg, %f_t_arg, 0f3F800000;
@@ -445,7 +429,6 @@ PW_T_OBS:
     .reg .f32 %f_neg_nph;
     neg.f32         %f_neg_nph, %f_nu_p1h;
     mul.f32         %f_log_t, %f_neg_nph, %f_log_t;
-
     add.f32         %f_log_w, %f_C_obs, %f_log_t;
     fma.rn.f32      %f_log_w, %f_neg_half, %f_hi, %f_log_w;
 
@@ -459,7 +442,7 @@ PW_EXIT:
 
 
 // =============================================================================
-// Kernel 4: bpf_set_scalar    *scalar = val
+// Kernel 4: bpf_set_scalar
 // =============================================================================
 
 .visible .entry bpf_set_scalar(
@@ -477,12 +460,6 @@ PW_EXIT:
 
 // =============================================================================
 // Kernel 5: bpf_reduce_max   (v2: warp shuffle)
-//
-//   Inter-warp: shared memory tree reduction (s >= 32) with bar.sync
-//   Intra-warp: shfl.sync.bfly (s = 16..1) -- 5 rounds, no bar.sync
-//   Final:      CAS loop for float atomicMax (native f32 max not in SM_120 ptxas)
-//
-//   Saves 5 bar.sync + 15 shared memory ops per invocation
 // =============================================================================
 
 .visible .entry bpf_reduce_max(
@@ -508,7 +485,6 @@ PW_EXIT:
     mad.lo.u32 %idx, %r_ctaid, %r_ntid, %r_tid;
     mov.u64 %rd_smem_base, smem_raw;
 
-    // Load or -inf sentinel
     mov.f32 %f_val, 0fF49A4F80;
     setp.lt.u32 %p_bound, %idx, %r_n;
     @!%p_bound bra RM_LD;
@@ -523,7 +499,6 @@ RM_LD:
     st.shared.f32 [%rd_smem], %f_val;
     bar.sync 0;
 
-    // === Inter-warp reduction (s >= 32): shared memory + bar.sync ===
     shr.u32 %r_s, %r_ntid, 1;
 RM_LP:
     setp.lt.u32 %p_warp, %r_s, 32;
@@ -543,11 +518,7 @@ RM_SK:
     bra RM_LP;
 
 RM_WARP:
-    // === Intra-warp reduction: shfl.sync.bfly -- no bar.sync needed ===
-    // After inter-warp phase, smem[0..31] holds 32 partial maxima.
-    // Each warp loads its own slot; only warp 0's result matters.
     ld.shared.f32 %f_val, [%rd_smem];
-
     shfl.sync.bfly.b32 %f_shfl, %f_val, 16, 31, 0xFFFFFFFF;
     max.f32 %f_val, %f_val, %f_shfl;
     shfl.sync.bfly.b32 %f_shfl, %f_val, 8, 31, 0xFFFFFFFF;
@@ -559,7 +530,6 @@ RM_WARP:
     shfl.sync.bfly.b32 %f_shfl, %f_val, 1, 31, 0xFFFFFFFF;
     max.f32 %f_val, %f_val, %f_shfl;
 
-    // === tid 0: float atomicMax via CAS loop ===
     setp.eq.u32 %p_tid0, %r_tid, 0;
     @!%p_tid0 bra RM_EX;
     ld.global.u32 %r_old, [%rd_out];
@@ -578,9 +548,6 @@ RM_EX:
 
 // =============================================================================
 // Kernel 6: bpf_reduce_sum   (v2: warp shuffle)
-//
-//   Same hybrid strategy: shared memory for inter-warp, shfl for intra-warp.
-//   atom.global.add.f32 unchanged (already single instruction).
 // =============================================================================
 
 .visible .entry bpf_reduce_sum(
@@ -618,7 +585,6 @@ RS_LD:
     st.shared.f32 [%rd_smem], %f_val;
     bar.sync 0;
 
-    // === Inter-warp reduction (s >= 32): shared memory + bar.sync ===
     shr.u32 %r_s, %r_ntid, 1;
 RS_LP:
     setp.lt.u32 %p_warp, %r_s, 32;
@@ -638,9 +604,7 @@ RS_SK:
     bra RS_LP;
 
 RS_WARP:
-    // === Intra-warp reduction: shfl.sync.bfly ===
     ld.shared.f32 %f_val, [%rd_smem];
-
     shfl.sync.bfly.b32 %f_shfl, %f_val, 16, 31, 0xFFFFFFFF;
     add.f32 %f_val, %f_val, %f_shfl;
     shfl.sync.bfly.b32 %f_shfl, %f_val, 8, 31, 0xFFFFFFFF;
@@ -661,7 +625,7 @@ RS_EX:
 
 
 // =============================================================================
-// Kernel 7: bpf_exp_sub   w[i] = exp(log_w[i] - *d_max)
+// Kernel 7: bpf_exp_sub
 // =============================================================================
 
 .visible .entry bpf_exp_sub(
@@ -702,7 +666,7 @@ ES_EX:
 
 
 // =============================================================================
-// Kernel 8: bpf_scale_wh   w[i]/=sum, wh[i]=w[i]*h[i]
+// Kernel 8: bpf_scale_wh
 // =============================================================================
 
 .visible .entry bpf_scale_wh(
@@ -776,7 +740,7 @@ SW_EX:
 
 
 // =============================================================================
-// Kernel 10: bpf_resample   Systematic resampling
+// Kernel 10: bpf_resample
 // =============================================================================
 
 .visible .entry bpf_resample(
@@ -844,9 +808,6 @@ RE_EX:
 
 // =============================================================================
 // Kernel 11: bpf_compute_var   (v2: warp shuffle)
-//
-//   sum((h[i]-mean)^2) -> atomicAdd to *d_var
-//   Same hybrid reduction as kernels 5/6.
 // =============================================================================
 
 .visible .entry bpf_compute_var(
@@ -888,7 +849,6 @@ CV_SM:
     st.shared.f32 [%rd_smem], %f_d2;
     bar.sync 0;
 
-    // === Inter-warp reduction (s >= 32): shared memory + bar.sync ===
     shr.u32 %r_s, %r_ntid, 1;
 CV_LP:
     setp.lt.u32 %p_warp, %r_s, 32;
@@ -908,9 +868,7 @@ CV_SK:
     bra CV_LP;
 
 CV_WARP:
-    // === Intra-warp reduction: shfl.sync.bfly ===
     ld.shared.f32 %f_val, [%rd_smem];
-
     shfl.sync.bfly.b32 %f_shfl, %f_val, 16, 31, 0xFFFFFFFF;
     add.f32 %f_val, %f_val, %f_shfl;
     shfl.sync.bfly.b32 %f_shfl, %f_val, 8, 31, 0xFFFFFFFF;
@@ -931,7 +889,7 @@ CV_EX:
 
 
 // =============================================================================
-// Kernel 12: bpf_gen_noise   noise[i] = icdf(pcg32_float(rng[i]))
+// Kernel 12: bpf_gen_noise
 // =============================================================================
 
 .visible .entry bpf_gen_noise(
@@ -958,14 +916,12 @@ CV_EX:
     setp.ge.u32 %p_bound, %idx, %r_n;
     @%p_bound bra GN_EX;
 
-    // Load RNG
     mul.wide.u32 %rd_off, %idx, 16;
     add.u64 %rd_rng_addr, %rd_rng, %rd_off;
     ld.global.u64 %rd_state, [%rd_rng_addr + 0];
     ld.global.u64 %rd_inc,   [%rd_rng_addr + 8];
     mov.u64 %rd_mul, 6364136223846793005;
 
-    // PCG32 step
     mov.u64 %rd_old, %rd_state;
     mul.lo.u64 %rd_tmp, %rd_state, %rd_mul;
     add.u64 %rd_state, %rd_tmp, %rd_inc;
@@ -986,7 +942,6 @@ CV_EX:
     max.f32 %f_u, %f_u, 0f358637BD;
     min.f32 %f_u, %f_u, 0f3F7FFBCE;
 
-    // ICDF (full Acklam)
     sub.f32         %f_q, %f_u, 0f3F000000;
     abs.f32         %f_abs_q, %f_q;
     setp.lt.f32     %p_central, %f_abs_q, 0f3EF39581;
@@ -1039,7 +994,7 @@ GN_EX:
 
 
 // =============================================================================
-// Kernel 13: bpf_silverman_jitter   h[i] += bw*noise[i], clamp [mu-8,mu+8]
+// Kernel 13: bpf_silverman_jitter
 // =============================================================================
 
 .visible .entry bpf_silverman_jitter(
@@ -1114,10 +1069,10 @@ SJ_EX:
 // =============================================================================
 
 .visible .entry bpf_grad_alpha(
-    .param .u64 param_scalars,          // d_scalars base [9 floats]
-    .param .u64 param_w,                // normalized weights [N]
-    .param .u64 param_h,                // current h_t [N]
-    .param .u64 param_h_prev,           // previous h_{t-1} [N]
+    .param .u64 param_scalars,
+    .param .u64 param_w,
+    .param .u64 param_h,
+    .param .u64 param_h_prev,
     .param .f32 param_y_t,
     .param .f32 param_nu_obs,
     .param .f32 param_mu,
@@ -1150,15 +1105,11 @@ SJ_EX:
     mov.u32         %r_ntid,  %ntid.x;
     mad.lo.u32      %idx,     %r_ctaid, %r_ntid, %r_tid;
 
-    // Lane and warp IDs
     and.b32         %r_lane, %r_tid, 31;
     shr.u32         %r_warp, %r_tid, 5;
     shr.u32         %r_nwarps, %r_ntid, 5;
-
     mov.u64         %rd_smem_base, smem_raw;
 
-    // ═══ Phase 1: Per-particle compute ═══
-    // Out-of-bounds threads contribute zeros to reduction
     mov.f32         %f_v0, 0f00000000;
     mov.f32         %f_v1, 0f00000000;
     mov.f32         %f_v2, 0f00000000;
@@ -1167,7 +1118,6 @@ SJ_EX:
     setp.ge.u32     %p_bound, %idx, %r_n;
     @%p_bound bra   GF_REDUCE;
 
-    // Load w[i], h[i], h_prev[i]
     mul.wide.u32    %rd_off, %idx, 4;
     .reg .u64 %a0, %a1, %a2;
     add.u64         %a0, %rd_h,  %rd_off;
@@ -1177,117 +1127,72 @@ SJ_EX:
     ld.global.f32   %f_w,  [%a1];
     ld.global.f32   %f_hp, [%a2];
 
-    // eta_sq = y_t² * exp(-h)
     mul.f32         %f_yt2, %f_yt, %f_yt;
     neg.f32         %f_neg_h, %f_h;
-    mul.f32         %f_neg_h, %f_neg_h, 0f3FB8AA3B;      // * log2(e)
-    ex2.approx.f32  %f_exp_neg_h, %f_neg_h;               // exp(-h)
+    mul.f32         %f_neg_h, %f_neg_h, 0f3FB8AA3B;
+    ex2.approx.f32  %f_exp_neg_h, %f_neg_h;
     mul.f32         %f_eta_sq, %f_yt2, %f_exp_neg_h;
 
-    // Branch: Student-t vs Gaussian
     setp.gt.f32     %p_t_obs, %f_nu, 0f00000000;
     @%p_t_obs bra   GF_T_OBS;
 
-    // Gaussian: dlw = -0.5 + 0.5 * eta_sq
     fma.rn.f32      %f_dlw, %f_eta_sq, 0f3F000000, 0fBF000000;
     bra             GF_COMPUTE;
 
 GF_T_OBS:
-    // Student-t: dlw = -0.5 + (nu+1)/2 * eta_sq / (nu + eta_sq)
-    add.f32         %f_nup1h, %f_nu, 0f3F800000;          // nu + 1
-    mul.f32         %f_nup1h, %f_nup1h, 0f3F000000;       // (nu+1)/2
-    add.f32         %f_denom, %f_nu, %f_eta_sq;            // nu + eta_sq
+    add.f32         %f_nup1h, %f_nu, 0f3F800000;
+    mul.f32         %f_nup1h, %f_nup1h, 0f3F000000;
+    add.f32         %f_denom, %f_nu, %f_eta_sq;
     div.approx.f32  %f_ratio, %f_eta_sq, %f_denom;
     fma.rn.f32      %f_dlw, %f_nup1h, %f_ratio, 0fBF000000;
 
 GF_COMPUTE:
-    // dhdr = h_prev - mu  (∂h/∂ρ)
     sub.f32         %f_dhdr, %f_hp, %f_mu;
-
-    // dlw² and dhdr²
     mul.f32         %f_dlw2,  %f_dlw,  %f_dlw;
     mul.f32         %f_dhdr2, %f_dhdr, %f_dhdr;
-
-    // v0 = w * dlw              (grad_mu)
     mul.f32         %f_v0, %f_w, %f_dlw;
-    // v1 = w * dlw²             (fisher_mu)
     mul.f32         %f_v1, %f_w, %f_dlw2;
-    // v2 = w * dlw * dhdr       (grad_rho)
     mul.f32         %f_v2, %f_v0, %f_dhdr;
-    // v3 = w * dlw² * dhdr²     (fisher_rho)
     mul.f32         %f_v3, %f_v1, %f_dhdr2;
 
-    // ═══ Phase 2: Warp-level butterfly reduction (4 values × 5 rounds) ═══
-
 GF_REDUCE:
-    // v0
-    shfl.sync.bfly.b32 %f_shfl, %f_v0, 16, 31, 0xFFFFFFFF;
-    add.f32 %f_v0, %f_v0, %f_shfl;
-    shfl.sync.bfly.b32 %f_shfl, %f_v0, 8, 31, 0xFFFFFFFF;
-    add.f32 %f_v0, %f_v0, %f_shfl;
-    shfl.sync.bfly.b32 %f_shfl, %f_v0, 4, 31, 0xFFFFFFFF;
-    add.f32 %f_v0, %f_v0, %f_shfl;
-    shfl.sync.bfly.b32 %f_shfl, %f_v0, 2, 31, 0xFFFFFFFF;
-    add.f32 %f_v0, %f_v0, %f_shfl;
-    shfl.sync.bfly.b32 %f_shfl, %f_v0, 1, 31, 0xFFFFFFFF;
-    add.f32 %f_v0, %f_v0, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v0, 16, 31, 0xFFFFFFFF; add.f32 %f_v0, %f_v0, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v0, 8,  31, 0xFFFFFFFF; add.f32 %f_v0, %f_v0, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v0, 4,  31, 0xFFFFFFFF; add.f32 %f_v0, %f_v0, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v0, 2,  31, 0xFFFFFFFF; add.f32 %f_v0, %f_v0, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v0, 1,  31, 0xFFFFFFFF; add.f32 %f_v0, %f_v0, %f_shfl;
 
-    // v1
-    shfl.sync.bfly.b32 %f_shfl, %f_v1, 16, 31, 0xFFFFFFFF;
-    add.f32 %f_v1, %f_v1, %f_shfl;
-    shfl.sync.bfly.b32 %f_shfl, %f_v1, 8, 31, 0xFFFFFFFF;
-    add.f32 %f_v1, %f_v1, %f_shfl;
-    shfl.sync.bfly.b32 %f_shfl, %f_v1, 4, 31, 0xFFFFFFFF;
-    add.f32 %f_v1, %f_v1, %f_shfl;
-    shfl.sync.bfly.b32 %f_shfl, %f_v1, 2, 31, 0xFFFFFFFF;
-    add.f32 %f_v1, %f_v1, %f_shfl;
-    shfl.sync.bfly.b32 %f_shfl, %f_v1, 1, 31, 0xFFFFFFFF;
-    add.f32 %f_v1, %f_v1, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v1, 16, 31, 0xFFFFFFFF; add.f32 %f_v1, %f_v1, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v1, 8,  31, 0xFFFFFFFF; add.f32 %f_v1, %f_v1, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v1, 4,  31, 0xFFFFFFFF; add.f32 %f_v1, %f_v1, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v1, 2,  31, 0xFFFFFFFF; add.f32 %f_v1, %f_v1, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v1, 1,  31, 0xFFFFFFFF; add.f32 %f_v1, %f_v1, %f_shfl;
 
-    // v2
-    shfl.sync.bfly.b32 %f_shfl, %f_v2, 16, 31, 0xFFFFFFFF;
-    add.f32 %f_v2, %f_v2, %f_shfl;
-    shfl.sync.bfly.b32 %f_shfl, %f_v2, 8, 31, 0xFFFFFFFF;
-    add.f32 %f_v2, %f_v2, %f_shfl;
-    shfl.sync.bfly.b32 %f_shfl, %f_v2, 4, 31, 0xFFFFFFFF;
-    add.f32 %f_v2, %f_v2, %f_shfl;
-    shfl.sync.bfly.b32 %f_shfl, %f_v2, 2, 31, 0xFFFFFFFF;
-    add.f32 %f_v2, %f_v2, %f_shfl;
-    shfl.sync.bfly.b32 %f_shfl, %f_v2, 1, 31, 0xFFFFFFFF;
-    add.f32 %f_v2, %f_v2, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v2, 16, 31, 0xFFFFFFFF; add.f32 %f_v2, %f_v2, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v2, 8,  31, 0xFFFFFFFF; add.f32 %f_v2, %f_v2, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v2, 4,  31, 0xFFFFFFFF; add.f32 %f_v2, %f_v2, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v2, 2,  31, 0xFFFFFFFF; add.f32 %f_v2, %f_v2, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v2, 1,  31, 0xFFFFFFFF; add.f32 %f_v2, %f_v2, %f_shfl;
 
-    // v3
-    shfl.sync.bfly.b32 %f_shfl, %f_v3, 16, 31, 0xFFFFFFFF;
-    add.f32 %f_v3, %f_v3, %f_shfl;
-    shfl.sync.bfly.b32 %f_shfl, %f_v3, 8, 31, 0xFFFFFFFF;
-    add.f32 %f_v3, %f_v3, %f_shfl;
-    shfl.sync.bfly.b32 %f_shfl, %f_v3, 4, 31, 0xFFFFFFFF;
-    add.f32 %f_v3, %f_v3, %f_shfl;
-    shfl.sync.bfly.b32 %f_shfl, %f_v3, 2, 31, 0xFFFFFFFF;
-    add.f32 %f_v3, %f_v3, %f_shfl;
-    shfl.sync.bfly.b32 %f_shfl, %f_v3, 1, 31, 0xFFFFFFFF;
-    add.f32 %f_v3, %f_v3, %f_shfl;
-
-    // ═══ Phase 3: Lane 0 of each warp → shared memory ═══
-    // Layout: smem[warp + 0*nwarps]=v0, [warp+1*nw]=v1, [warp+2*nw]=v2, [warp+3*nw]=v3
+    shfl.sync.bfly.b32 %f_shfl, %f_v3, 16, 31, 0xFFFFFFFF; add.f32 %f_v3, %f_v3, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v3, 8,  31, 0xFFFFFFFF; add.f32 %f_v3, %f_v3, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v3, 4,  31, 0xFFFFFFFF; add.f32 %f_v3, %f_v3, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v3, 2,  31, 0xFFFFFFFF; add.f32 %f_v3, %f_v3, %f_shfl;
+    shfl.sync.bfly.b32 %f_shfl, %f_v3, 1,  31, 0xFFFFFFFF; add.f32 %f_v3, %f_v3, %f_shfl;
 
     setp.eq.u32     %p_lane0, %r_lane, 0;
     @!%p_lane0 bra  GF_SYNC;
 
     .reg .u32 %r_smoff;
-
-    // v0 → smem[warp_id]
     mul.wide.u32    %rd_off, %r_warp, 4;
     add.u64         %rd_smem, %rd_smem_base, %rd_off;
     st.shared.f32   [%rd_smem], %f_v0;
 
-    // v1 → smem[nwarps + warp_id]
     add.u32         %r_smoff, %r_nwarps, %r_warp;
     mul.wide.u32    %rd_off, %r_smoff, 4;
     add.u64         %rd_smem, %rd_smem_base, %rd_off;
     st.shared.f32   [%rd_smem], %f_v1;
 
-    // v2 → smem[2*nwarps + warp_id]
     .reg .u32 %r_nw2;
     shl.b32         %r_nw2, %r_nwarps, 1;
     add.u32         %r_smoff, %r_nw2, %r_warp;
@@ -1295,7 +1200,6 @@ GF_REDUCE:
     add.u64         %rd_smem, %rd_smem_base, %rd_off;
     st.shared.f32   [%rd_smem], %f_v2;
 
-    // v3 → smem[3*nwarps + warp_id]
     add.u32         %r_smoff, %r_nw2, %r_nwarps;
     add.u32         %r_smoff, %r_smoff, %r_warp;
     mul.wide.u32    %rd_off, %r_smoff, 4;
@@ -1305,14 +1209,12 @@ GF_REDUCE:
 GF_SYNC:
     bar.sync 0;
 
-    // ═══ Phase 4: Thread 0 sums warp partials + atomicAdd ═══
     setp.eq.u32     %p_tid0, %r_tid, 0;
     @!%p_tid0 bra   GF_EXIT;
 
     .reg .u32 %r_i;
     .reg .pred %p_wdone;
 
-    // Sum v0 (grad_mu) across warps
     mov.f32         %f_v0, 0f00000000;
     mov.u32         %r_i, 0;
 GF_SUM0:
@@ -1326,7 +1228,6 @@ GF_SUM0:
     bra             GF_SUM0;
 GF_SUM0_DONE:
 
-    // Sum v1 (fisher_mu) across warps
     mov.f32         %f_v1, 0f00000000;
     mov.u32         %r_i, 0;
 GF_SUM1:
@@ -1341,7 +1242,6 @@ GF_SUM1:
     bra             GF_SUM1;
 GF_SUM1_DONE:
 
-    // Sum v2 (grad_rho) across warps
     mov.f32         %f_v2, 0f00000000;
     mov.u32         %r_i, 0;
 GF_SUM2:
@@ -1356,7 +1256,6 @@ GF_SUM2:
     bra             GF_SUM2;
 GF_SUM2_DONE:
 
-    // Sum v3 (fisher_rho) across warps
     mov.f32         %f_v3, 0f00000000;
     .reg .u32 %r_base3;
     add.u32         %r_base3, %r_nw2, %r_nwarps;
@@ -1373,12 +1272,168 @@ GF_SUM3:
     bra             GF_SUM3;
 GF_SUM3_DONE:
 
-    // atomicAdd block partial sums to d_scalars[5..8]
-    atom.global.add.f32 %f_tmp, [%rd_scalars + 20], %f_v0;   // [5] grad_mu
-    atom.global.add.f32 %f_tmp, [%rd_scalars + 24], %f_v1;   // [6] fisher_mu
-    atom.global.add.f32 %f_tmp, [%rd_scalars + 28], %f_v2;   // [7] grad_rho
-    atom.global.add.f32 %f_tmp, [%rd_scalars + 32], %f_v3;   // [8] fisher_rho
+    atom.global.add.f32 %f_tmp, [%rd_scalars + 20], %f_v0;
+    atom.global.add.f32 %f_tmp, [%rd_scalars + 24], %f_v1;
+    atom.global.add.f32 %f_tmp, [%rd_scalars + 28], %f_v2;
+    atom.global.add.f32 %f_tmp, [%rd_scalars + 32], %f_v3;
 
 GF_EXIT:
+    ret;
+}
+
+
+// =============================================================================
+// Kernel 15: bpf_jump_perturb   (Bernoulli MIM, PCG32 RNG, Acklam ICDF)
+//
+// Per particle:
+//   1. PCG32 step -> u ~ Uniform(0,1)
+//   2. If u < lambda -> jump:
+//      a. PCG32 step -> u2 -> Acklam ICDF -> z ~ N(0,1)
+//      b. h[i] += sigma_J * z
+//   3. Store updated RNG state (advanced 1 or 2 steps)
+//
+// Reuses same d_rng as all other PTX kernels -- no separate PRNG.
+// Uses Acklam ICDF (same as kernels 2, 3, 12) -- not Box-Muller.
+// Warp divergence minimal: at lambda=0.03, 97% take short path.
+//
+// Lambda is regime-adaptive (set by host from surprise EMA):
+//   Calm(0.01) / Alert(0.03) / Panic(0.08)
+//
+// Integration: AFTER kernel 3 (propagate_weight), BEFORE kernels 5-8
+// =============================================================================
+
+.visible .entry bpf_jump_perturb(
+    .param .u64 param_h,
+    .param .u64 param_rng,
+    .param .f32 param_lambda,
+    .param .f32 param_sigma_J,
+    .param .s32 param_n
+)
+{
+    .reg .u32   %idx, %r_tid, %r_ctaid, %r_ntid, %r_n;
+    .reg .u64   %rd_h, %rd_rng, %rd_off, %rd_rng_addr;
+    .reg .u64   %rd_state, %rd_inc, %rd_old, %rd_mul, %rd_tmp;
+    .reg .u32   %r_pcg, %r_xsh, %r_rot, %r_neg_rot, %r_lo, %r_hi;
+    .reg .f32   %f_lambda, %f_sigma_J, %f_u, %f_hi;
+    .reg .f32   %f_z, %f_q, %f_r, %f_num, %f_den, %f_abs_q;
+    .reg .f32   %f_p, %f_log_p, %f_r_tail;
+    .reg .pred  %p_bound, %p_jump, %p_central, %p_low_tail;
+
+    ld.param.u64    %rd_h,       [param_h];
+    ld.param.u64    %rd_rng,     [param_rng];
+    ld.param.f32    %f_lambda,   [param_lambda];
+    ld.param.f32    %f_sigma_J,  [param_sigma_J];
+    ld.param.s32    %r_n,        [param_n];
+
+    mov.u32         %r_tid,   %tid.x;
+    mov.u32         %r_ctaid, %ctaid.x;
+    mov.u32         %r_ntid,  %ntid.x;
+    mad.lo.u32      %idx,     %r_ctaid, %r_ntid, %r_tid;
+
+    setp.ge.u32     %p_bound, %idx, %r_n;
+    @%p_bound bra   JP_EXIT;
+
+    mul.wide.u32    %rd_off,      %idx, 16;
+    add.u64         %rd_rng_addr, %rd_rng, %rd_off;
+    ld.global.u64   %rd_state, [%rd_rng_addr + 0];
+    ld.global.u64   %rd_inc,   [%rd_rng_addr + 8];
+    mov.u64         %rd_mul, 6364136223846793005;
+
+    // -- PCG32 step 1: Bernoulli draw --
+    mov.u64         %rd_old, %rd_state;
+    mul.lo.u64      %rd_tmp, %rd_state, %rd_mul;
+    add.u64         %rd_state, %rd_tmp, %rd_inc;
+    shr.u64         %rd_tmp, %rd_old, 18;
+    xor.b64         %rd_tmp, %rd_tmp, %rd_old;
+    shr.u64         %rd_tmp, %rd_tmp, 27;
+    cvt.u32.u64     %r_xsh, %rd_tmp;
+    shr.u64         %rd_tmp, %rd_old, 59;
+    cvt.u32.u64     %r_rot, %rd_tmp;
+    shr.u32         %r_lo, %r_xsh, %r_rot;
+    neg.s32         %r_neg_rot, %r_rot;
+    and.b32         %r_neg_rot, %r_neg_rot, 31;
+    shl.b32         %r_hi, %r_xsh, %r_neg_rot;
+    or.b32          %r_pcg, %r_lo, %r_hi;
+    shr.u32         %r_pcg, %r_pcg, 9;
+    cvt.rn.f32.u32  %f_u, %r_pcg;
+    mul.f32         %f_u, %f_u, 0f34000000;
+
+    setp.ge.f32     %p_jump, %f_u, %f_lambda;
+    @%p_jump bra    JP_STORE;
+
+    // -- PCG32 step 2: uniform for Acklam ICDF --
+    mov.u64         %rd_old, %rd_state;
+    mul.lo.u64      %rd_tmp, %rd_state, %rd_mul;
+    add.u64         %rd_state, %rd_tmp, %rd_inc;
+    shr.u64         %rd_tmp, %rd_old, 18;
+    xor.b64         %rd_tmp, %rd_tmp, %rd_old;
+    shr.u64         %rd_tmp, %rd_tmp, 27;
+    cvt.u32.u64     %r_xsh, %rd_tmp;
+    shr.u64         %rd_tmp, %rd_old, 59;
+    cvt.u32.u64     %r_rot, %rd_tmp;
+    shr.u32         %r_lo, %r_xsh, %r_rot;
+    neg.s32         %r_neg_rot, %r_rot;
+    and.b32         %r_neg_rot, %r_neg_rot, 31;
+    shl.b32         %r_hi, %r_xsh, %r_neg_rot;
+    or.b32          %r_pcg, %r_lo, %r_hi;
+    shr.u32         %r_pcg, %r_pcg, 9;
+    cvt.rn.f32.u32  %f_u, %r_pcg;
+    mul.f32         %f_u, %f_u, 0f34000000;
+    max.f32         %f_u, %f_u, 0f358637BD;
+    min.f32         %f_u, %f_u, 0f3F7FFBCE;
+
+    // -- Acklam ICDF --
+    sub.f32         %f_q, %f_u, 0f3F000000;
+    abs.f32         %f_abs_q, %f_q;
+    setp.lt.f32     %p_central, %f_abs_q, 0f3EF39581;
+    @!%p_central bra JP_TAIL;
+
+    mul.f32         %f_r, %f_q, %f_q;
+    fma.rn.f32      %f_num, %f_r, 0fC21EC98E, 0f435CF234;
+    fma.rn.f32      %f_num, %f_r, %f_num, 0fC389F6D9;
+    fma.rn.f32      %f_num, %f_r, %f_num, 0f430A5B96;
+    fma.rn.f32      %f_num, %f_r, %f_num, 0fC1F55182;
+    fma.rn.f32      %f_num, %f_r, %f_num, 0f40206C99;
+    mul.f32         %f_num, %f_q, %f_num;
+    fma.rn.f32      %f_den, %f_r, 0fC259E786, 0f432195F9;
+    fma.rn.f32      %f_den, %f_r, %f_den, 0fC31BB2F0;
+    fma.rn.f32      %f_den, %f_r, %f_den, 0f42859A46;
+    fma.rn.f32      %f_den, %f_r, %f_den, 0fC1547DAC;
+    fma.rn.f32      %f_den, %f_r, %f_den, 0f3F800000;
+    div.approx.f32  %f_z, %f_num, %f_den;
+    bra             JP_APPLY;
+
+JP_TAIL:
+    setp.lt.f32     %p_low_tail, %f_u, 0f3F000000;
+    mov.f32         %f_p, %f_u;
+    @!%p_low_tail sub.f32 %f_p, 0f3F800000, %f_u;
+    lg2.approx.f32  %f_log_p, %f_p;
+    mul.f32         %f_log_p, %f_log_p, 0f3F317218;
+    mul.f32         %f_r_tail, %f_log_p, 0fC0000000;
+    sqrt.approx.f32 %f_r_tail, %f_r_tail;
+    fma.rn.f32      %f_num, %f_r_tail, 0fBBFF186D, 0fBEA51126;
+    fma.rn.f32      %f_num, %f_r_tail, %f_num, 0fC019A606;
+    fma.rn.f32      %f_num, %f_r_tail, %f_num, 0fC0232ED1;
+    fma.rn.f32      %f_num, %f_r_tail, %f_num, 0f408BFD40;
+    fma.rn.f32      %f_num, %f_r_tail, %f_num, 0f403C0AE1;
+    fma.rn.f32      %f_den, %f_r_tail, 0f3BFF16C3, 0f3EA51A69;
+    fma.rn.f32      %f_den, %f_r_tail, %f_den, 0f401C7D14;
+    fma.rn.f32      %f_den, %f_r_tail, %f_den, 0f4070483B;
+    fma.rn.f32      %f_den, %f_r_tail, %f_den, 0f3F800000;
+    div.approx.f32  %f_z, %f_num, %f_den;
+    @!%p_low_tail neg.f32 %f_z, %f_z;
+
+JP_APPLY:
+    mul.wide.u32    %rd_off, %idx, 4;
+    .reg .u64 %rd_h_addr;
+    add.u64         %rd_h_addr, %rd_h, %rd_off;
+    ld.global.f32   %f_hi, [%rd_h_addr];
+    fma.rn.f32      %f_hi, %f_sigma_J, %f_z, %f_hi;
+    st.global.f32   [%rd_h_addr], %f_hi;
+
+JP_STORE:
+    st.global.u64   [%rd_rng_addr + 0], %rd_state;
+
+JP_EXIT:
     ret;
 }

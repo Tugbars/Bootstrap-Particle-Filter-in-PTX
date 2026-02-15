@@ -66,8 +66,6 @@ typedef enum {
 // Bootstrap Particle Filter — Pure PTX (PCG32 RNG)
 // =============================================================================
 
-struct JumpState;
-
 /**
  * @brief Opaque state for the GPU Bootstrap Particle Filter.
  *
@@ -78,7 +76,7 @@ struct JumpState;
  *   - Adaptive sigma_z bands (calm/alert/panic regimes)
  *   - Optional Silverman kernel jittering post-resample
  *   - Online mu learning via kernel 14 gradient + Adam optimizer
- *   - Bernoulli jump diffusion (mixture innovation model)
+ *   - Bernoulli jump diffusion (MIM via PTX kernel 15)
  */
 typedef struct {
     float*    d_h;              /**< Particle states h_t [N]                        */
@@ -127,8 +125,13 @@ typedef struct {
     float     rm_t0;            /**< RM offset (prevents huge initial steps)       */
     float     rm_gamma;         /**< RM exponent (2/3 for nat grad, 1/2 vanilla)  */
 
-    // ── Jump diffusion (Bernoulli MIM) ──────────────────────────────────────
-    struct JumpState* jump;     /**< Jump state (NULL = disabled)                  */
+    // ── Jump diffusion (Bernoulli MIM via PTX kernel 15) ───────────────────
+    int       jump_enabled;     /**< 0=off, 1=on                              */
+    float     jump_sigma_J;     /**< Jump size std dev (fixed, ~2.5)           */
+    float     jump_lambda_calm; /**< Lambda for calm  regime (default 0.01)    */
+    float     jump_lambda_alert;/**< Lambda for alert regime (default 0.03)    */
+    float     jump_lambda_panic;/**< Lambda for panic regime (default 0.08)    */
+    float     jump_lambda;      /**< Current tick's lambda (set by regime)     */
 } GpuBpfState;
 
 /**
@@ -290,30 +293,37 @@ void gpu_bpf_set_ess_threshold(GpuBpfState* state, float threshold);
 /** @brief Return cumulative number of ticks where resampling fired. */
 int gpu_bpf_get_resample_count(GpuBpfState* state);
 
-// ── Bernoulli jump diffusion (MIM) ─────────────────────────────────────────
+// ── Bernoulli jump diffusion (MIM via PTX kernel 15) ────────────────────────
 
 /**
  * @brief Enable Bernoulli jump perturbation (mixture innovation model).
  *
  * Each particle independently draws J_t ~ Bernoulli(lambda). If J_t = 1,
- * h[i] += sigma_J * N(0,1) after propagation, before weighting. Implements
- * a two-component MIM where resampling performs posterior component selection.
+ * h[i] += sigma_J * N(0,1) after propagation, before weighting.
  *
- * Jumpers are uniformly distributed across all particle indices, naturally
- * overlapping with adaptive sigma_z bands for combined exploration reach.
+ * Lambda is regime-adaptive by default:
+ *   Calm=0.01, Alert=0.03, Panic=0.08
+ * Override with gpu_bpf_set_jump_lambdas() or gpu_bpf_set_jump_lambda_fixed().
+ *
+ * Uses PTX kernel 15 with PCG32 + Acklam ICDF. Zero nvcc dependency.
+ * No device memory allocation (reuses existing d_rng).
  *
  * @param s        BPF instance
- * @param lambda   Jump probability per particle per tick (recommend 0.03)
  * @param sigma_J  Jump size std dev (recommend ~2.5 from stress tests)
- * @param seed     PRNG seed for jump RNG
  */
-void  gpu_bpf_enable_jump_diffusion(GpuBpfState* s, float lambda, float sigma_J, int seed);
+void  gpu_bpf_enable_jump_diffusion(GpuBpfState* s, float sigma_J);
 
-/** @brief Disable jump diffusion. Frees jump state memory. */
+/** @brief Disable jump diffusion. */
 void  gpu_bpf_disable_jump_diffusion(GpuBpfState* s);
 
-/** @brief Return current jump probability (0 if disabled). */
-float gpu_bpf_get_lambda(const GpuBpfState* s);
+/** @brief Override per-regime lambda values. */
+void  gpu_bpf_set_jump_lambdas(GpuBpfState* s, float calm, float alert, float panic);
+
+/** @brief Set all three regime lambdas to the same value (for sweep tests). */
+void  gpu_bpf_set_jump_lambda_fixed(GpuBpfState* s, float lambda);
+
+/** @brief Return current tick's jump probability (0 if disabled). */
+float gpu_bpf_get_jump_lambda(const GpuBpfState* s);
 
 /** @brief Return current jump sigma (0 if disabled). */
 float gpu_bpf_get_sigma_J(const GpuBpfState* s);

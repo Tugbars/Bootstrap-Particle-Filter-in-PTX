@@ -195,7 +195,6 @@ add_library(gpu_bpf_ptx_full STATIC gpu_bpf/gpu_bpf_ptx_full.cu)
 
 target_link_libraries(gpu_bpf_ptx_full
     PRIVATE CUDA::cuda_driver CUDA::cudart CUDA::curand
-    PUBLIC  bpf_jump
 )
 
 target_include_directories(gpu_bpf_ptx_full PUBLIC
@@ -205,30 +204,6 @@ target_include_directories(gpu_bpf_ptx_full PUBLIC
 )
 
 set_target_properties(gpu_bpf_ptx_full PROPERTIES
-    CUDA_SEPARABLE_COMPILATION OFF
-)
-
-# ==============================================================================
-# Library: bpf_jump (Merton jump-diffusion perturbation for BPF)
-#
-# Minimal jump-diffusion extension: fixed lambda/sigma_J, single CUDA kernel
-# that perturbs particle h values between propagation and weighting.
-# No learning — just the perturbation. Learning comes in v2.
-# ==============================================================================
-
-add_library(bpf_jump STATIC gpu_bpf/bpf_jump_diffusion.cu)
-
-target_link_libraries(bpf_jump PUBLIC
-    CUDA::cudart
-)
-
-target_include_directories(bpf_jump PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/gpu_bpf
-    ${CUDAToolkit_INCLUDE_DIRS}
-)
-
-set_target_properties(bpf_jump PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF
 )
 
@@ -464,7 +439,6 @@ target_include_directories(test_jump_stress PRIVATE
 
 target_link_libraries(test_jump_stress PRIVATE
     gpu_bpf_ptx_full
-    bpf_jump
     smc2_rbpf
     CUDA::cuda_driver
     CUDA::cudart

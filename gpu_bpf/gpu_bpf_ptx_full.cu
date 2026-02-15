@@ -30,7 +30,6 @@
  */
 
 #include "gpu_bpf_full.cuh"
-#include "bpf_jump_diffusion.cuh"       // [JUMP] edit 1/5
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -102,7 +101,8 @@ typedef struct {
     CUfunction compute_var;
     CUfunction gen_noise;
     CUfunction silverman_jitter;
-    CUfunction grad_alpha;              // [NEW] kernel 14
+    CUfunction grad_alpha;              // kernel 14
+    CUfunction jump_perturb;            // kernel 15: Bernoulli MIM jump
 } PtxFunctions;
 
 static PtxFunctions g_ptx;
@@ -197,7 +197,8 @@ extract:
     cuModuleGetFunction(&g_ptx.compute_var,       g_ptx_module, "bpf_compute_var");
     cuModuleGetFunction(&g_ptx.gen_noise,         g_ptx_module, "bpf_gen_noise");
     cuModuleGetFunction(&g_ptx.silverman_jitter,  g_ptx_module, "bpf_silverman_jitter");
-    cuModuleGetFunction(&g_ptx.grad_alpha,        g_ptx_module, "bpf_grad_alpha");  // [NEW]
+    cuModuleGetFunction(&g_ptx.grad_alpha,        g_ptx_module, "bpf_grad_alpha");
+    cuModuleGetFunction(&g_ptx.jump_perturb,      g_ptx_module, "bpf_jump_perturb");
 
     g_ptx_loaded = 1;
     fprintf(stderr, "[PTX-FULL] 14 kernels loaded\n");
@@ -371,7 +372,12 @@ GpuBpfState* gpu_bpf_create(int n_particles, float rho, float sigma_z, float mu,
     s->rm_t0      = 10.0f;
     s->rm_gamma   = 0.667f;
 
-    s->jump = NULL;                      // [JUMP] edit 2/5
+    s->jump_enabled      = 0;              // [JUMP] PTX kernel 15
+    s->jump_sigma_J      = 0.0f;
+    s->jump_lambda_calm  = 0.01f;
+    s->jump_lambda_alert = 0.03f;
+    s->jump_lambda_panic = 0.08f;
+    s->jump_lambda       = 0.01f;
 
     cudaStreamCreate(&s->stream);
 
@@ -446,7 +452,6 @@ GpuBpfState* gpu_bpf_create(int n_particles, float rho, float sigma_z, float mu,
 
 void gpu_bpf_destroy(GpuBpfState* s) {
     if (!s) return;
-    if (s->jump) jump_destroy(s->jump);  // [JUMP] edit 3/5
     cudaStreamDestroy(s->stream);
     cudaFree(s->d_h);
     cudaFree(s->d_h2);
@@ -602,13 +607,19 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
         ptx_launch(g_ptx.propagate_weight, st, g, b, 0, params);
     }
 
-    // [JUMP] edit 4/5 — Bernoulli perturbation AFTER propagation, BEFORE weight accumulation
-    // Each particle independently: Bernoulli(lambda) -> if jump, h[i] += sigma_J * N(0,1).
+    // [JUMP] Kernel 15: Bernoulli MIM perturbation via PTX
+    // Regime-adaptive lambda: calm=0.01, alert=0.03, panic=0.08 (default)
     // Jumpers uniformly distributed across all indices = natural overlap with adaptive bands.
-    // During calm: jumped particles get low obs weight, resampled away. No harm.
-    // During spikes: jumped particles land near truth, get high weight. Instant tracking.
-    if (s->jump) {
-        jump_perturb(s->jump, s->d_h, st);
+    if (s->jump_enabled) {
+        switch (h_current_regime) {
+            case MIX_CALM:  s->jump_lambda = s->jump_lambda_calm;  break;
+            case MIX_ALERT: s->jump_lambda = s->jump_lambda_alert; break;
+            case MIX_PANIC: s->jump_lambda = s->jump_lambda_panic; break;
+        }
+        void* jp_params[] = {
+            &dh, &drng, &s->jump_lambda, &s->jump_sigma_J, &n
+        };
+        ptx_launch(g_ptx.jump_perturb, st, g, b, 0, jp_params);
     }
 
     // 2b. Accumulate previous log-weights if we skipped resampling last tick
@@ -841,31 +852,42 @@ void gpu_bpf_set_rho(GpuBpfState* s, float rho) {
 }
 
 // =============================================================================
-// [JUMP] edit 5/5 — Jump diffusion API (Bernoulli MIM)
+// [JUMP] Kernel 15 — Jump diffusion API (Bernoulli MIM, regime-adaptive)
 // =============================================================================
 
-void gpu_bpf_enable_jump_diffusion(GpuBpfState* s, float lambda,
-                                    float sigma_J, int seed) {
-    if (s->jump) {
-        jump_destroy(s->jump);
-        s->jump = NULL;
-    }
-    s->jump = jump_create(s->n_particles, lambda, sigma_J, seed, s->stream);
+void gpu_bpf_enable_jump_diffusion(GpuBpfState* s, float sigma_J) {
+    s->jump_enabled      = 1;
+    s->jump_sigma_J      = sigma_J;
+    s->jump_lambda_calm  = 0.01f;
+    s->jump_lambda_alert = 0.03f;
+    s->jump_lambda_panic = 0.08f;
+    s->jump_lambda       = 0.01f;
 }
 
 void gpu_bpf_disable_jump_diffusion(GpuBpfState* s) {
-    if (s->jump) {
-        jump_destroy(s->jump);
-        s->jump = NULL;
-    }
+    s->jump_enabled = 0;
 }
 
-float gpu_bpf_get_lambda(const GpuBpfState* s) {
-    return s->jump ? s->jump->lambda : 0.0f;
+void gpu_bpf_set_jump_lambdas(GpuBpfState* s,
+                               float calm, float alert, float panic) {
+    s->jump_lambda_calm  = calm;
+    s->jump_lambda_alert = alert;
+    s->jump_lambda_panic = panic;
+}
+
+void gpu_bpf_set_jump_lambda_fixed(GpuBpfState* s, float lambda) {
+    s->jump_lambda_calm  = lambda;
+    s->jump_lambda_alert = lambda;
+    s->jump_lambda_panic = lambda;
+    s->jump_lambda       = lambda;
+}
+
+float gpu_bpf_get_jump_lambda(const GpuBpfState* s) {
+    return s->jump_enabled ? s->jump_lambda : 0.0f;
 }
 
 float gpu_bpf_get_sigma_J(const GpuBpfState* s) {
-    return s->jump ? s->jump->sigma_J : 0.0f;
+    return s->jump_enabled ? s->jump_sigma_J : 0.0f;
 }
 
 // =============================================================================

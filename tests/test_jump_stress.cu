@@ -1,13 +1,14 @@
 // =============================================================================
-// STRESS TEST: Combined BPF vs Combined + Jump Diffusion (Bernoulli MIM)
+// STRESS TEST: Combined BPF vs Combined + Jump Diffusion (PTX Kernel 15)
 //
 // Phase 1:  sigma_J sweep (fixed lambda=0.02)
 // Phase 1b: lambda sweep at best sigma_J
-// Phase 2:  Full stress test at best (lambda, sigma_J)
+// Phase 2:  Full stress test at best fixed (lambda, sigma_J)
+// Phase 3:  Regime-adaptive lambda vs fixed lambda
+// Phase 4:  Lambda triple sweep (calm × alert × panic)
 //
-// Jump model: each particle draws J_t ~ Bernoulli(lambda) independently.
-// If jump: h[i] += sigma_J * N(0,1). Jumpers uniformly distributed across
-// all indices = natural overlap with adaptive sigma_z bands.
+// Jump model: PTX kernel 15, Bernoulli MIM with Acklam ICDF.
+// Regime-adaptive lambda: calm=0.01, alert=0.03, panic=0.08 (default).
 // =============================================================================
 
 #include "gpu_bpf_full.cuh"
@@ -189,13 +190,19 @@ struct Metrics {
 
 // =============================================================================
 // Run BPF (combined = adaptive bands + NatGrad)
-// enable_jump: if true, calls gpu_bpf_enable_jump_diffusion
+//
+// Jump modes:
+//   enable_jump=false           → no jump
+//   enable_jump=true, lambda>0  → fixed lambda (all regimes same)
+//   enable_jump=true, lambda<=0 → per-regime lambdas from lam_calm/alert/panic
 // =============================================================================
 
 static Metrics run_bpf(const ScenarioData& sc,
                        float f_rho, float f_sigma_z, float f_mu,
                        float nu_obs, int n_particles, int seed,
-                       bool enable_jump, float lambda, float sigma_J) {
+                       bool enable_jump, float lambda, float sigma_J,
+                       float lam_calm = -1.f, float lam_alert = -1.f,
+                       float lam_panic = -1.f) {
     Metrics m = {};
     m.final_mu = f_mu; m.final_rho = f_rho;
     int n = (int)sc.returns.size();
@@ -218,9 +225,15 @@ static Metrics run_bpf(const ScenarioData& sc,
     gpu_bpf_enable_rho_learning(state, 1);
     gpu_bpf_set_ess_threshold(state, 0.5f);
 
-    /* Bernoulli jump diffusion */
+    /* Jump diffusion via PTX kernel 15 */
     if (enable_jump) {
-        gpu_bpf_enable_jump_diffusion(state, lambda, sigma_J, seed + 9999);
+        gpu_bpf_enable_jump_diffusion(state, sigma_J);
+        if (lam_calm > 0 && lam_alert > 0 && lam_panic > 0) {
+            gpu_bpf_set_jump_lambdas(state, lam_calm, lam_alert, lam_panic);
+        } else if (lambda > 0) {
+            gpu_bpf_set_jump_lambda_fixed(state, lambda);
+        }
+        /* else: default regime-adaptive (0.01/0.03/0.08) */
     }
 
     int skip = 20;
@@ -282,7 +295,7 @@ int main(int argc, char** argv) {
 
     printf("\n");
     printf("══════════════════════════════════════════════════════════════════════════════════\n");
-    printf("  Combined BPF vs Combined + Bernoulli Jump Diffusion (MIM)\n");
+    printf("  Combined BPF vs Combined + Jump (PTX Kernel 15, Bernoulli MIM)\n");
     printf("──────────────────────────────────────────────────────────────────────────────────\n");
     printf("  Particles: %dK   nu_obs=%.0f   True DGP: rho=%.2f sigma_z=%.2f mu=%.1f\n",
            N/1000, bnu, true_rho, true_sz, true_mu);
@@ -290,17 +303,13 @@ int main(int argc, char** argv) {
 
     // =========================================================================
     // PHASE 1: sigma_J sweep on Spike Gauntlet + Regime Teleport (oracle)
-    //
-    // Fix lambda=0.02. Sweep sigma_J from 0.3 to 3.0.
-    // Find the sigma_J that minimizes spike RMSE without hurting calm RMSE.
     // =========================================================================
 
-    printf("\n  ─── PHASE 1: sigma_J sweep (lambda=0.02, oracle misspec) ───\n\n");
+    printf("\n  ─── PHASE 1: sigma_J sweep (fixed lambda=0.02, oracle misspec) ───\n\n");
 
     ScenarioData spike_sc = make_spike_gauntlet(dgp, 42);
     ScenarioData regime_sc = make_regime_teleport(dgp, 43);
 
-    /* Combined baseline (no jump) */
     Metrics cb_spike = run_bpf(spike_sc, 0.98f, 0.15f, -4.5f, bnu, N, seed,
                                false, 0, 0);
     Metrics cb_regime = run_bpf(regime_sc, 0.98f, 0.15f, -4.5f, bnu, N, seed,
@@ -337,7 +346,6 @@ int main(int argc, char** argv) {
                jd_s.rmse, jd_s.spike_rmse, spk_delta,
                jd_r.rmse, jd_r.spike_rmse, reg_delta);
 
-        /* Best = lowest average spike RMSE across both scenarios */
         double avg_spike = (jd_s.spike_rmse + jd_r.spike_rmse) / 2.0;
         if (avg_spike < best_combined_spike) {
             best_combined_spike = avg_spike;
@@ -389,12 +397,12 @@ int main(int argc, char** argv) {
     printf("\n  Best lambda = %.3f (avg spike RMSE = %.4f)\n", best_lam, best_combined_spike2);
 
     // =========================================================================
-    // PHASE 2: Full stress test at best (lambda, sigma_J)
+    // PHASE 2: Full stress test at best fixed (lambda, sigma_J)
     // =========================================================================
 
     printf("\n");
     printf("══════════════════════════════════════════════════════════════════════════════════\n");
-    printf("  PHASE 2: Full stress test  lambda=%.3f  sigma_J=%.2f\n", best_lam, best_sJ);
+    printf("  PHASE 2: Full stress test  fixed lambda=%.3f  sigma_J=%.2f\n", best_lam, best_sJ);
     printf("══════════════════════════════════════════════════════════════════════════════════\n");
 
     MisspecConfig mc[] = {
@@ -465,11 +473,10 @@ int main(int argc, char** argv) {
         }
     }
 
-    /* Grand summary */
     printf("\n");
     printf("══════════════════════════════════════════════════════════════════════════════════\n");
-    printf("  GRAND SUMMARY (%d scenarios x %d misspec = %d runs)\n", n_sc, n_mc, total);
-    printf("  Jump params: lambda=%.3f  sigma_J=%.2f\n", best_lam, best_sJ);
+    printf("  PHASE 2 SUMMARY (%d scenarios x %d misspec = %d runs)\n", n_sc, n_mc, total);
+    printf("  Fixed: lambda=%.3f  sigma_J=%.2f\n", best_lam, best_sJ);
     printf("──────────────────────────────────────────────────────────────────────────────────\n");
     printf("  %-22s %14s %14s\n",     "", "Combined", "Combined+Jump");
     printf("  %-22s %14.4f %14.4f\n", "Avg RMSE",
@@ -477,14 +484,146 @@ int main(int argc, char** argv) {
     printf("  %-22s %14.4f %14.4f\n", "Avg Spike RMSE",
            cb_spike_sum/total, jd_spike_sum/total);
     printf("  %-22s %14d %14d\n",     "Wins", cb_wins, jd_wins);
-
     printf("──────────────────────────────────────────────────────────────────────────────────\n");
     if (cb_rmse_sum > 0) {
-        printf("  Jump vs Combined RMSE:  %+.1f%%\n",
+        printf("  Fixed Jump vs Combined RMSE:  %+.1f%%\n",
                100.0 * (jd_rmse_sum / cb_rmse_sum - 1.0));
-        printf("  Jump vs Combined Spike: %+.1f%%\n",
+        printf("  Fixed Jump vs Combined Spike: %+.1f%%\n",
                100.0 * (jd_spike_sum / cb_spike_sum - 1.0));
     }
+    printf("══════════════════════════════════════════════════════════════════════════════════\n");
+
+    // =========================================================================
+    // PHASE 3: Regime-adaptive lambda vs fixed lambda
+    // =========================================================================
+
+    printf("\n");
+    printf("══════════════════════════════════════════════════════════════════════════════════\n");
+    printf("  PHASE 3: Regime-adaptive lambda  sigma_J=%.2f\n", best_sJ);
+    printf("  Calm=0.01  Alert=0.03  Panic=0.08\n");
+    printf("══════════════════════════════════════════════════════════════════════════════════\n");
+
+    double ad_rmse_sum = 0, ad_spike_sum = 0;
+    int ad_wins_vs_cb = 0, ad_wins_vs_fix = 0;
+    int fix_wins_vs_ad = 0, total3 = 0;
+
+    for (int s = 0; s < n_sc; s++) {
+        const ScenarioData& sc = scenarios[s];
+        printf("\n  ═══ %s ", sc.name.c_str());
+        for (int p = 0; p < (int)(65 - sc.name.size()); p++) printf("═");
+        printf("\n\n");
+
+        printf("  %-12s | %8s %8s | %8s %8s | %8s %8s | Best\n",
+               "Misspec", "CbRMSE", "CbSpike", "FixRMSE", "FixSpike",
+                          "AdpRMSE", "AdpSpike");
+        printf("  ──────────── | ──────── ──────── | ──────── ──────── | ──────── ──────── | ────\n");
+
+        for (int mi = 0; mi < n_mc; mi++) {
+            Metrics cb  = run_bpf(sc, mc[mi].rho, mc[mi].sigma_z, mc[mi].mu,
+                                  bnu, N, seed, false, 0, 0);
+            Metrics fix = run_bpf(sc, mc[mi].rho, mc[mi].sigma_z, mc[mi].mu,
+                                  bnu, N, seed, true, best_lam, best_sJ);
+            Metrics adp = run_bpf(sc, mc[mi].rho, mc[mi].sigma_z, mc[mi].mu,
+                                  bnu, N, seed, true, -1.0f, best_sJ,
+                                  0.01f, 0.03f, 0.08f);
+
+            const char* best = "???";
+            if (!cb.had_nan && !fix.had_nan && !adp.had_nan) {
+                if (cb.rmse <= fix.rmse && cb.rmse <= adp.rmse) best = "Cb";
+                else if (fix.rmse <= adp.rmse) best = "Fix";
+                else best = "Adp";
+
+                if (adp.rmse < cb.rmse)  ad_wins_vs_cb++;
+                if (adp.rmse < fix.rmse) ad_wins_vs_fix++;
+                if (fix.rmse < adp.rmse) fix_wins_vs_ad++;
+            }
+
+            printf("  %-12s | %8.4f %8.4f | %8.4f %8.4f | %8.4f %8.4f | %s\n",
+                   mc[mi].label,
+                   cb.had_nan  ? 0.0 : cb.rmse,  cb.had_nan  ? 0.0 : cb.spike_rmse,
+                   fix.had_nan ? 0.0 : fix.rmse, fix.had_nan ? 0.0 : fix.spike_rmse,
+                   adp.had_nan ? 0.0 : adp.rmse, adp.had_nan ? 0.0 : adp.spike_rmse,
+                   best);
+
+            if (!adp.had_nan) { ad_rmse_sum += adp.rmse; ad_spike_sum += adp.spike_rmse; }
+            total3++;
+        }
+    }
+
+    printf("\n");
+    printf("──────────────────────────────────────────────────────────────────────────────────\n");
+    printf("  PHASE 3 SUMMARY (%d runs)\n", total3);
+    printf("  %-22s %14s %14s %14s\n", "", "Combined", "Fixed Jump", "Adaptive Jump");
+    printf("  %-22s %14.4f %14.4f %14.4f\n", "Avg RMSE",
+           cb_rmse_sum/total, jd_rmse_sum/total, ad_rmse_sum/total3);
+    printf("  %-22s %14.4f %14.4f %14.4f\n", "Avg Spike RMSE",
+           cb_spike_sum/total, jd_spike_sum/total, ad_spike_sum/total3);
+    printf("  Adaptive wins vs Combined: %d/%d\n", ad_wins_vs_cb, total3);
+    printf("  Adaptive wins vs Fixed:    %d/%d\n", ad_wins_vs_fix, total3);
+    printf("  Fixed wins vs Adaptive:    %d/%d\n", fix_wins_vs_ad, total3);
+    if (ad_rmse_sum > 0 && jd_rmse_sum > 0) {
+        printf("  Adaptive vs Fixed RMSE:  %+.1f%%\n",
+               100.0 * (ad_rmse_sum / jd_rmse_sum - 1.0));
+        printf("  Adaptive vs Combined RMSE: %+.1f%%\n",
+               100.0 * (ad_rmse_sum / cb_rmse_sum - 1.0));
+    }
+    printf("══════════════════════════════════════════════════════════════════════════════════\n");
+
+    // =========================================================================
+    // PHASE 4: Lambda triple sweep (calm × alert × panic)
+    // =========================================================================
+
+    printf("\n");
+    printf("══════════════════════════════════════════════════════════════════════════════════\n");
+    printf("  PHASE 4: Lambda triple sweep  sigma_J=%.2f\n", best_sJ);
+    printf("══════════════════════════════════════════════════════════════════════════════════\n\n");
+
+    float lam_c[] = {0.005f, 0.01f, 0.02f};
+    float lam_a[] = {0.02f,  0.03f, 0.05f};
+    float lam_p[] = {0.05f,  0.08f, 0.12f, 0.15f};
+    int nc = 3, na = 3, np = 4;
+
+    printf("  %6s %6s %6s | %8s %8s | %8s %8s | %8s\n",
+           "Calm", "Alert", "Panic",
+           "SpkRMSE", "SpkSpike", "RegRMSE", "RegSpike", "AvgSpike");
+    printf("  ────── ────── ────── | ──────── ──────── | ──────── ──────── | ────────\n");
+
+    float  best_tc = 0.01f, best_ta = 0.03f, best_tp = 0.08f;
+    double best_triple_spike = 1e9;
+
+    for (int ic = 0; ic < nc; ic++) {
+        for (int ia = 0; ia < na; ia++) {
+            for (int ip = 0; ip < np; ip++) {
+                float c = lam_c[ic], a = lam_a[ia], p = lam_p[ip];
+
+                if (c >= a || a >= p) continue;
+
+                Metrics js = run_bpf(spike_sc, 0.98f, 0.15f, -4.5f, bnu, N, seed,
+                                     true, -1.0f, best_sJ, c, a, p);
+                Metrics jr = run_bpf(regime_sc, 0.98f, 0.15f, -4.5f, bnu, N, seed,
+                                     true, -1.0f, best_sJ, c, a, p);
+
+                double avg_spike = (js.spike_rmse + jr.spike_rmse) / 2.0;
+
+                printf("  %6.3f %6.3f %6.3f | %8.4f %8.4f | %8.4f %8.4f | %8.4f",
+                       c, a, p,
+                       js.rmse, js.spike_rmse,
+                       jr.rmse, jr.spike_rmse,
+                       avg_spike);
+
+                if (avg_spike < best_triple_spike) {
+                    best_triple_spike = avg_spike;
+                    best_tc = c; best_ta = a; best_tp = p;
+                    printf(" *");
+                }
+                printf("\n");
+            }
+        }
+    }
+
+    printf("\n  Best triple: calm=%.3f  alert=%.3f  panic=%.3f\n",
+           best_tc, best_ta, best_tp);
+    printf("  Avg spike RMSE: %.4f\n", best_triple_spike);
     printf("══════════════════════════════════════════════════════════════════════════════════\n\n");
 
     return 0;
