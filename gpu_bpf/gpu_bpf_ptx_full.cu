@@ -30,6 +30,7 @@
  */
 
 #include "gpu_bpf_full.cuh"
+#include "bpf_jump_diffusion.cuh"       // [JUMP] edit 1/5
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -370,6 +371,8 @@ GpuBpfState* gpu_bpf_create(int n_particles, float rho, float sigma_z, float mu,
     s->rm_t0      = 10.0f;
     s->rm_gamma   = 0.667f;
 
+    s->jump = NULL;                      // [JUMP] edit 2/5
+
     cudaStreamCreate(&s->stream);
 
     cudaMalloc(&s->d_h,       n_particles * sizeof(float));
@@ -443,6 +446,7 @@ GpuBpfState* gpu_bpf_create(int n_particles, float rho, float sigma_z, float mu,
 
 void gpu_bpf_destroy(GpuBpfState* s) {
     if (!s) return;
+    if (s->jump) jump_destroy(s->jump);  // [JUMP] edit 3/5
     cudaStreamDestroy(s->stream);
     cudaFree(s->d_h);
     cudaFree(s->d_h2);
@@ -596,6 +600,14 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
             &s->C_obs, &y_t, &n, &do_prop
         };
         ptx_launch(g_ptx.propagate_weight, st, g, b, 0, params);
+    }
+
+    // [JUMP] edit 4/5 — perturbation AFTER propagation, BEFORE weight accumulation
+    // Each particle independently: Bernoulli(lambda) -> if jump, h[i] += sigma_J * N(0,1)
+    // During calm: jumped particles get low obs weight, resampled away. No harm.
+    // During spikes: jumped particles land near truth, get high weight. Instant tracking.
+    if (s->jump) {
+        jump_perturb(s->jump, s->d_h, st);
     }
 
     // 2b. Accumulate previous log-weights if we skipped resampling last tick
@@ -825,6 +837,34 @@ void gpu_bpf_set_rho(GpuBpfState* s, float rho) {
 
     float zeros[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     cudaMemcpy(s->d_scalars + 5, zeros, 4 * sizeof(float), cudaMemcpyHostToDevice);
+}
+
+// =============================================================================
+// [JUMP] edit 5/5 — Jump diffusion API (fixed params, no learning)
+// =============================================================================
+
+void gpu_bpf_enable_jump_diffusion(GpuBpfState* s, float lambda,
+                                    float sigma_J, int seed) {
+    if (s->jump) {
+        jump_destroy(s->jump);
+        s->jump = NULL;
+    }
+    s->jump = jump_create(s->n_particles, lambda, sigma_J, seed, s->stream);
+}
+
+void gpu_bpf_disable_jump_diffusion(GpuBpfState* s) {
+    if (s->jump) {
+        jump_destroy(s->jump);
+        s->jump = NULL;
+    }
+}
+
+float gpu_bpf_get_lambda(const GpuBpfState* s) {
+    return s->jump ? s->jump->lambda : 0.0f;
+}
+
+float gpu_bpf_get_sigma_J(const GpuBpfState* s) {
+    return s->jump ? s->jump->sigma_J : 0.0f;
 }
 
 // =============================================================================

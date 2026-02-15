@@ -66,6 +66,8 @@ typedef enum {
 // Bootstrap Particle Filter — Pure PTX (PCG32 RNG)
 // =============================================================================
 
+struct JumpState;  // before the struct definition
+
 /**
  * @brief Opaque state for the GPU Bootstrap Particle Filter.
  *
@@ -123,6 +125,8 @@ typedef struct {
     float     rm_c;             /**< RM step: η = c / (step + t0)^gamma           */
     float     rm_t0;            /**< RM offset (prevents huge initial steps)       */
     float     rm_gamma;         /**< RM exponent (2/3 for nat grad, 1/2 vanilla)  */
+
+    struct JumpState* jump;
 } GpuBpfState;
 
 /**
@@ -357,5 +361,10 @@ double gpu_apf_run_rmse(
     int n_particles, float rho, float sigma_z, float mu,
     float nu_state, float nu_obs, int seed
 );
+
+void  gpu_bpf_enable_jump_diffusion(GpuBpfState* s, float lambda, float sigma_J, int seed);
+void  gpu_bpf_disable_jump_diffusion(GpuBpfState* s);
+float gpu_bpf_get_lambda(const GpuBpfState* s);
+float gpu_bpf_get_sigma_J(const GpuBpfState* s);
 
 #endif // GPU_BPF_FULL_CUH
