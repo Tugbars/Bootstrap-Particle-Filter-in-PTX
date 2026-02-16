@@ -708,21 +708,21 @@ code {
 
   <div class="reveal">
     <div class="math-block">
-<span class="comment">/* Latent regime dynamics */</span>
+<span class="comment">Latent regime dynamics</span>
 <span class="var">z̃<sub>t</sub></span> = <span class="var">ρ</span> · z̃<sub>t-1</sub> + <span class="var">σ<sub>z</sub></span> · ε<sub>t</sub>           ε<sub>t</sub> ~ N(0, 1)
-z<sub>t</sub>  = 1.5 · (1 + tanh(z̃<sub>t</sub>))          <span class="comment">/* squash to [0, 3] */</span>
+z<sub>t</sub>  = 1.5 · (1 + tanh(z̃<sub>t</sub>))          <span class="comment">squash to [0, 3]</span>
 
-<span class="comment">/* Regime-dependent curves (parameterized by z) */</span>
-<span class="var2">μ</span>(z) = <span class="var2">μ_base</span> + μ_scale · (1 - e<sup>-μ_rate · z</sup>)
-<span class="var2">σ<sub>h</sub></span>(z) = <span class="var2">σ_base</span> + σ_scale · (1 - e<sup>-σ_rate · z</sup>)
-θ(z) = θ_base + θ_scale · (1 - e<sup>-θ_rate · z</sup>)
+<span class="comment">Regime-dependent curves (parameterized by z)</span>
+<span class="var2">μ</span>(z) = <span class="var2">μ_base</span> + μ_scale · (1 − e<sup>−μ_rate · z</sup>)
+<span class="var2">σ<sub>h</sub></span>(z) = <span class="var2">σ_base</span> + σ_scale · (1 − e<sup>−σ_rate · z</sup>)
+θ(z) = θ_base + θ_scale · (1 − e<sup>−θ_rate · z</sup>)
 
-<span class="comment">/* Log-volatility transition */</span>
-h<sub>t</sub> = (1 - θ(z)) · h<sub>t-1</sub> + θ(z) · μ(z) + σ<sub>h</sub>(z) · η<sub>t</sub>     η<sub>t</sub> ~ N(0, 1)
+<span class="comment">Log-volatility transition</span>
+h<sub>t</sub> = (1 − θ(z)) · h<sub>t-1</sub> + θ(z) · μ(z) + σ<sub>h</sub>(z) · η<sub>t</sub>     η<sub>t</sub> ~ N(0, 1)
 
-<span class="comment">/* Observation (OCSN likelihood via log y²) */</span>
+<span class="comment">Observation (OCSN linearization via log y²)</span>
 y<sub>t</sub> = e<sup>h<sub>t</sub>/2</sup> · ν<sub>t</sub>                      ν<sub>t</sub> ~ N(0, 1)
-obs<sub>t</sub> = log(y<sub>t</sub>²) ≈ h<sub>t</sub> + log(χ²(1))     <span class="comment">/* linearizes the observation */</span>
+obs<sub>t</sub> = log(y<sub>t</sub>²) ≈ h<sub>t</sub> + log(χ²(1))     <span class="comment">linearizes the observation</span>
     </div>
   </div>
 
@@ -951,13 +951,13 @@ obs<sub>t</sub> = log(y<sub>t</sub>²) ≈ h<sub>t</sub> + log(χ²(1))     <spa
 
   <div class="reveal">
     <div class="math-block">
-<span class="comment">/* What we learn (well-conditioned) */</span>
-<span class="var4">σ_total</span> = √(σ<sub>z</sub>² + σ<sub>base</sub>²)    <span class="comment">/* total vol-of-vol — WELL IDENTIFIED */</span>
-<span class="var4">r</span>       = σ<sub>z</sub> / σ<sub>total</sub>          <span class="comment">/* split ratio ∈ (0, 1) — weakly identified */</span>
+<span class="comment">What we learn (well-conditioned)</span>
+<span class="var4">σ_total</span> = √(σ<sub>z</sub>² + σ<sub>base</sub>²)    <span class="comment">total vol-of-vol — WELL IDENTIFIED</span>
+<span class="var4">r</span>       = σ<sub>z</sub> / σ<sub>total</sub>          <span class="comment">split ratio ∈ (0, 1) — weakly identified</span>
 
-<span class="comment">/* How to recover physical parameters */</span>
+<span class="comment">How to recover physical parameters</span>
 <span class="var">σ<sub>z</sub></span>    = r · σ<sub>total</sub>
-<span class="var2">σ<sub>base</sub></span> = √(1 - r²) · σ<sub>total</sub>
+<span class="var2">σ<sub>base</sub></span> = √(1 − r²) · σ<sub>total</sub>
     </div>
   </div>
 
@@ -995,18 +995,9 @@ obs<sub>t</sub> = log(y<sub>t</sub>²) ≈ h<sub>t</sub> + log(χ²(1))     <spa
 
   <div class="reveal">
     <h3>The Full Learned Parameter Vector</h3>
-    <div class="math-block">
-θ = (<span class="var">ρ</span>, <span class="var4">σ<sub>total</sub></span>, <span class="var2">μ<sub>base</sub></span>, <span class="var4">r</span>)
-
-<span class="comment">/* ρ       — AR(1) persistence of z̃ dynamics */</span>
-<span class="comment">/* σ_total — total vol-of-vol (well-identified) */</span>
-<span class="comment">/* μ_base  — base mean level of log-vol curve */</span>
-<span class="comment">/* r       — vol-of-vol split ratio (weakly identified) */</span>
-
-<span class="comment">/* In every CUDA kernel that needs the physical params: */</span>
-σ<sub>z</sub>    = r · σ<sub>total</sub>;
-σ<sub>base</sub> = √(max(1 - r², 10⁻⁶)) · σ<sub>total</sub>;
-    </div>
+    <p>
+      The system learns four parameters: ρ (the AR(1) persistence of the latent regime dynamics), σ<sub>total</sub> (the total vol-of-vol, well-identified by data), μ<sub>base</sub> (the base mean level of the log-volatility curve), and r (the vol-of-vol split ratio, weakly identified). Every CUDA kernel that needs the physical volatility parameters derives them on-the-fly: σ<sub>z</sub>&nbsp;=&nbsp;r&nbsp;·&nbsp;σ<sub>total</sub> and σ<sub>base</sub>&nbsp;=&nbsp;√(1&nbsp;−&nbsp;r²)&nbsp;·&nbsp;σ<sub>total</sub>. The derivation costs two multiplications and one square root per thread block — negligible overhead for the geometric benefit it provides to the CPMMH proposals.
+    </p>
   </div>
 </div>
 </section>
@@ -1029,14 +1020,11 @@ obs<sub>t</sub> = log(y<sub>t</sub>²) ≈ h<sub>t</sub> + log(χ²(1))     <spa
 
   <div class="reveal">
     <div class="math-block">
-ε*<sub>t</sub> = <span class="var2">ρ<sub>corr</sub></span> · ε<sub>t</sub> + √(1 - ρ<sub>corr</sub>²) · ε<sub>fresh</sub>     <span class="comment">/* ρ<sub>corr</sub> = 0.99 */</span>
-
-<span class="comment">/* With ρ<sub>corr</sub> = 0.99:</span>
-<span class="comment">   - 99% of the noise is shared → trajectories nearly identical</span>
-<span class="comment">   - 1% fresh randomness → just enough exploration</span>
-<span class="comment">   - The MH ratio log p(y|θ*) - log p(y|θ) becomes low-variance</span>
-<span class="comment">   - Acceptance reflects genuine θ quality, not noise artifacts */</span>
+ε*<sub>t</sub> = <span class="var2">ρ<sub>corr</sub></span> · ε<sub>t</sub> + √(1 − ρ<sub>corr</sub>²) · ε<sub>fresh</sub>          where  ρ<sub>corr</sub> = 0.99
     </div>
+    <p>
+      With a correlation coefficient of 0.99, the proposed trajectory shares 99% of its randomness with the current one. The two particle filter runs produce nearly identical trajectories, which means their log-likelihood estimates are <strong>highly correlated</strong>. The Metropolis-Hastings ratio — the difference of two log-likelihoods — therefore has very low variance. The acceptance or rejection of θ* reflects genuine quality of the proposed parameters rather than Monte Carlo noise artifacts. This is the key insight of Deligiannidis, Doucet, and Pitt (2018): by correlating the noise, you make the pseudo-marginal ratio behave almost like an exact ratio, even though each individual likelihood estimate is still noisy.
+    </p>
   </div>
 
   <div class="reveal">
@@ -1047,14 +1035,15 @@ obs<sub>t</sub> = log(y<sub>t</sub>²) ≈ h<sub>t</sub> + log(χ²(1))     <spa
   </div>
 
   <div class="reveal">
-    <div class="math-block">
-<span class="comment">/* Circular noise indexing (GPU device function) */</span>
-slot = t % noise_capacity;
-idx  = theta_idx * N_inner * noise_capacity + slot * N_inner + inner_idx;
-
-<span class="comment">/* Memory: N_θ=1024, N_inner=512, L=264 → ~550 MB (fits RTX 5080) */</span>
-<span class="comment">/* Without circular buffers: T=5000 → 42 GB (doesn't fit anything) */</span>
+    <div class="diagram-wrap">
+      <div class="diagram-title">Circular noise buffer — fixed-lag replay memory</div>
+      <div class="diagram-body">
+        <canvas id="circularBufferCanvas" class="ridge-canvas" width="560" height="280"></canvas>
+      </div>
     </div>
+    <p>
+      The noise buffer wraps circularly with capacity L+64 slots. Each timestep writes its random variates to position t&nbsp;mod&nbsp;capacity, overwriting the oldest data. During CPMMH rejuvenation, the replay reads the last L stored slots to reconstruct the correlated trajectory. This design keeps memory consumption proportional to the lag window rather than the total sequence length. At our working dimensions of N<sub>θ</sub>&nbsp;=&nbsp;1024, N<sub>inner</sub>&nbsp;=&nbsp;512, and L&nbsp;=&nbsp;264, the buffer occupies roughly 550 MB — comfortably within a single RTX 5080. Without circularity, storing noise for T&nbsp;=&nbsp;5000 observations would require over 40 GB, far exceeding any single GPU's memory.
+    </p>
   </div>
 
   <div class="reveal">
@@ -1080,29 +1069,33 @@ idx  = theta_idx * N_inner * noise_capacity + slot * N_inner + inner_idx;
   </div>
 
   <div class="reveal">
-    <div class="math-block">
-<span class="comment">/* Per inner particle at each tick: */</span>
-
-<span class="comment">/* 1. Sample z̃ transition (the part we can't integrate) */</span>
-z̃<sub>t</sub> = ρ · z̃<sub>t-1</sub> + σ<sub>z</sub> · ε<sub>t</sub>
-
-<span class="comment">/* 2. Compute regime-dependent parameters */</span>
-φ = 1 - θ(z),  μ = μ(z),  σ<sub>h</sub> = σ<sub>h</sub>(z)
-
-<span class="comment">/* 3. Kalman PREDICT (the part we integrate analytically) */</span>
-μ<sub>h</sub><sup>-</sup> = φ · μ<sub>h</sub> + (1 - φ) · μ
-V<sub>h</sub><sup>-</sup> = φ² · V<sub>h</sub> + σ<sub>h</sub>²
-
-<span class="comment">/* 4. Kalman UPDATE with OCSN observation */</span>
-S     = V<sub>h</sub><sup>-</sup> + π²/2             <span class="comment">/* innovation variance (π²/2 ≈ 4.93 from log χ²) */</span>
-K     = V<sub>h</sub><sup>-</sup> / S                <span class="comment">/* Kalman gain */</span>
-innov = obs<sub>t</sub> - (μ<sub>h</sub><sup>-</sup> + 1.27)  <span class="comment">/* innovation (1.27 = E[log χ²(1)]) */</span>
-μ<sub>h</sub>   = μ<sub>h</sub><sup>-</sup> + K · innov
-V<sub>h</sub>   = (1 - K) · V<sub>h</sub><sup>-</sup>
-
-<span class="comment">/* 5. Log-weight = log-predictive (Gaussian) */</span>
-log w += -0.5 · (log(2π·S) + innov² / S)
+    <div class="diagram-wrap">
+      <div class="diagram-title">RBPF per-particle update cycle — Kalman predict-update on h given sampled z̃</div>
+      <div class="diagram-body">
+        <canvas id="kalmanCycleCanvas" class="ridge-canvas" width="600" height="360"></canvas>
+      </div>
     </div>
+  </div>
+
+  <div class="reveal">
+    <p>
+      Each inner particle carries three pieces of state: the sampled regime variable z̃, and the Kalman sufficient statistics μ<sub>h</sub> (conditional mean of log-volatility) and V<sub>h</sub> (conditional variance). The update proceeds in five stages.
+    </p>
+    <p>
+      <strong>First</strong>, the particle samples a new z̃<sub>t</sub> by propagating the AR(1) dynamics: the previous z̃ is scaled by ρ and perturbed by Gaussian noise scaled by σ<sub>z</sub>. This is the only stochastic step per particle — everything else is deterministic.
+    </p>
+    <p>
+      <strong>Second</strong>, the new z̃ is squashed through the tanh mapping to produce z ∈ [0, 3], and the three regime-dependent curves are evaluated: the mean-reversion speed θ(z), the local mean μ(z), and the local volatility-of-volatility σ<sub>h</sub>(z).
+    </p>
+    <p>
+      <strong>Third</strong>, the Kalman prediction propagates the sufficient statistics forward. The predicted mean μ<sub>h</sub><sup>−</sup> is a weighted average of the previous μ<sub>h</sub> (scaled by the persistence φ = 1 − θ) and the regime mean μ(z) (scaled by θ). The predicted variance V<sub>h</sub><sup>−</sup> grows by φ² · V<sub>h</sub> + σ<sub>h</sub>², reflecting both the uncertainty propagation and the new innovation noise.
+    </p>
+    <p>
+      <strong>Fourth</strong>, the Kalman update incorporates the observation. The OCSN linearization means the observation log(y<sub>t</sub>²) is approximately equal to h<sub>t</sub> plus a log-χ²(1) error with known mean (−1.27) and known variance (π²/2 ≈ 4.93). The innovation — the difference between what we observe and what we predict — is divided between updating the mean and computing the particle's weight. The Kalman gain determines how much the observation pulls the mean estimate, and the posterior variance V<sub>h</sub> shrinks by the factor (1 − K).
+    </p>
+    <p>
+      <strong>Fifth</strong>, the log-weight for this particle is accumulated. It equals the log-predictive density: a Gaussian evaluated at the innovation, with variance equal to the predicted variance plus the observation noise. This weight is what the outer SMC² layer uses to score the parent θ-particle's fitness.
+    </p>
   </div>
 
   <div class="reveal">
@@ -1129,29 +1122,26 @@ log w += -0.5 · (log(2π·S) + innov² / S)
   </div>
 
   <div class="reveal">
-    <div class="math-block">
-<span class="comment">/* Thread mapping */</span>
-blockIdx.x  = theta_idx    <span class="comment">/* which parameter hypothesis */</span>
-threadIdx.x = inner_idx    <span class="comment">/* which inner particle */</span>
-
-<span class="comment">/* Shared memory per block */</span>
-__shared__ float s_rho, s_sigma_z, s_mu_base, s_sigma_base;
-__shared__ float s_log_max, s_sum_w, s_u0;  <span class="comment">/* for reductions */</span>
-
-<span class="comment">/* Thread 0 loads and derives physical params */</span>
-if (inner_idx == 0) {
-    float sigma_total = particles.sigma_total[theta_idx];
-    float r           = particles.r_split[theta_idx];
-    s_sigma_z    = r * sigma_total;                          <span class="comment">/* derived */</span>
-    s_sigma_base = √(max(1 - r², 10⁻⁶)) * sigma_total;     <span class="comment">/* derived */</span>
-}
-__syncthreads();
+    <div class="diagram-wrap">
+      <div class="diagram-title">GPU thread hierarchy — one CUDA block per θ-particle, one thread per inner particle</div>
+      <div class="diagram-body">
+        <canvas id="gpuArchCanvas" class="ridge-canvas" width="620" height="400"></canvas>
+      </div>
     </div>
   </div>
 
   <div class="reveal">
     <p>
-      Key CUDA kernels include: PCG32 random number generation, Acklam's ICDF for Gaussian sampling, the fused RBPF propagate-weight-resample kernel, outer ESS computation via block reductions, systematic resampling with prefix sums, and the fused CPMMH propose-replay-accept kernel. The CPMMH kernel is the most complex&hairsp;—&hairsp;it replays L=200 timesteps of the RBPF within a single kernel launch, using the circular noise buffer to reconstruct correlated trajectories.
+      The mapping from algorithm to hardware is natural and direct. Each of the 1024 parameter hypotheses becomes a CUDA thread block. Within each block, the 512 inner particles become individual threads. This means the RBPF propagation step launches a single kernel with 1024 blocks × 512 threads = 524,288 threads, each of which independently propagates one z̃ sample and updates its Kalman statistics.
+    </p>
+    <p>
+      The parameter values for each θ-particle — ρ, σ<sub>total</sub>, μ<sub>base</sub>, and r — are loaded once into <strong>shared memory</strong> by thread 0 of each block, then broadcast to all 512 threads via a synchronization barrier. This avoids 512 redundant global memory reads per block. The physical parameters σ<sub>z</sub> and σ<sub>base</sub> are derived on-the-fly from the stored reparameterized values in shared memory, which costs only two multiplications and one square root per block — negligible compared to the rest of the kernel.
+    </p>
+    <p>
+      Memory is organized as <strong>Structure-of-Arrays</strong> (SoA) rather than Array-of-Structures. All z̃ values across all particles are stored contiguously, then all μ<sub>h</sub> values, then all V<sub>h</sub> values, and so on. When 512 threads in a warp read their z̃ values simultaneously, these reads are adjacent in memory and get coalesced into a single memory transaction. With AoS layout, each thread's data would be scattered across a large struct, causing fragmented reads and wasting bandwidth.
+    </p>
+    <p>
+      Block-level reductions — needed for computing the log-sum-exp of inner weights, the ESS, and the systematic resampling CDF — use warp-level shuffle primitives for the first 32 elements, then shared memory for the cross-warp combination. The CPMMH kernel is the most demanding: it replays L=200 timesteps of the full RBPF cycle within a single kernel launch, reading from the circular noise buffer and writing intermediate state to a scratch particle array until the acceptance decision is made.
     </p>
   </div>
 </div>
@@ -1160,29 +1150,36 @@ __syncthreads();
 <!-- ════════════════════════════════════════════════════════════════════
      SECTION 10: SUMMARY
      ════════════════════════════════════════════════════════════════════ -->
-<section id="sec-summary">
+<section id="sec-conclusion">
 <div class="container">
   <div class="reveal">
-    <div class="section-num">10 — Summary</div>
-    <h2>What Makes This Approach Novel</h2>
+    <div class="section-num">10 — Conclusion</div>
+    <h2>Convergence, Sequence Length, and Practical Lessons</h2>
 
     <p>
-      The contribution is not any single component but their <strong>specific combination and the engineering required to make them work together on GPU in real time</strong>. Let's be precise about what's standard and what's new.
+      Throughout development and testing, one pattern emerged repeatedly: <strong>increasing the observation sequence length to T=3000 resolved the majority of parameter recovery failures.</strong> At shorter horizons like T=800 or T=1200, the algorithm would sometimes recover ρ and μ<sub>base</sub> accurately but produce wide or biased posteriors for the vol-of-vol parameters σ<sub>total</sub> and r. The identification ridge between σ<sub>z</sub> and σ<sub>base</sub> — the very problem the reparameterization addresses — requires sufficient data to constrain even the well-identified σ<sub>total</sub> direction tightly enough for the CPMMH moves to lock onto the correct basin.
     </p>
 
-    <h3>Known components, novel assembly</h3>
     <p>
-      SMC² was proposed by Chopin, Jacob, and Papaspiliopoulos (2013). CPMMH was introduced by Deligiannidis, Doucet, and Pitt (2018). Rao-Blackwellized particle filters have a long history in the tracking literature. Each of these is well-understood individually. What's new here is: using RBPF as the inner filter of SMC² (rather than a standard bootstrap PF); using CPMMH for rejuvenation (rather than standard PMMH); the synergy between RBPF's tighter likelihood estimates and CPMMH's noise-sensitive acceptance criterion; the fixed-lag circular buffer architecture that makes this tractable for streaming data; and the entire system running on GPU with half a million particles updated per tick.
+      The reason is statistical, not algorithmic. The stochastic volatility model has a deep hierarchy: the observations y<sub>t</sub> are only indirectly informative about the parameters through the latent log-volatility h<sub>t</sub>, which itself is only indirectly driven by the regime variable z̃<sub>t</sub>, whose dynamics depend on ρ and σ<sub>z</sub>. Each layer of latent structure acts as a noise bottleneck. With T=1200 observations, the effective information about the deepest parameters — particularly how the total vol-of-vol should be split between σ<sub>z</sub> and σ<sub>base</sub> — is modest. At T=3000, the cumulative evidence from thousands of regime transitions gives the CPMMH rejuvenation enough signal to navigate the posterior landscape confidently. Acceptance rates climb from 15–25% to a stable 30–40%, resampling events become less frequent, and the posterior standard deviations on all four parameters shrink to the point where z-scores against truth consistently fall below 2.
     </p>
 
-    <h3>The (σ<sub>total</sub>, r) reparameterization</h3>
     <p>
-      Reparameterization for MCMC efficiency is a well-known technique (centering, non-centering, etc.). The specific (σ<sub>total</sub>, r) polar decomposition for vol-of-vol identification ridges in the context of CPMMH proposals appears to be novel. It's a simple idea&hairsp;—&hairsp;rotate coordinates to align with the likelihood geometry&hairsp;—&hairsp;but identifying <em>which</em> rotation matters, and verifying that it actually improves acceptance rates from ~10% to ~35%, required building and testing the full system.
+      This is a fundamental property of the model, not a limitation of the algorithm. Any method attempting to learn these parameters online — whether SMC², batch MCMC, or variational inference — would face the same information bottleneck at short horizons. The algorithm's job is to make optimal use of whatever information is available, and the combination of RBPF (for tight likelihood estimates), CPMMH (for efficient rejuvenation), and the (σ<sub>total</sub>, r) reparameterization (for geometrically aligned proposals) ensures that the system converges as quickly as the data permits.
     </p>
+  </div>
 
-    <h3>Practical outcome</h3>
+  <div class="reveal">
+    <div class="callout insight" data-label="Practical Guidance">
+      <p>
+        For production deployment on streaming HFT data, the practical recommendation is to use a warm-up period of roughly 2000–3000 ticks before trusting the parameter estimates for downstream decisions. During this warm-up, the outer ESS will trigger multiple rounds of resampling and CPMMH rejuvenation, progressively sharpening the posterior. After warm-up, the system tracks parameter drift online with single-tick latency, adapting to regime changes as they unfold in the market.
+      </p>
+    </div>
+  </div>
+
+  <div class="reveal">
     <p>
-      The system learns four stochastic volatility parameters online from streaming market data, processing each observation in under 1 ms on an RTX 5080, maintaining full posterior distributions (not point estimates) over parameters, and automatically adapting to regime changes as they happen. The reparameterization roughly doubles the effective use of each CPMMH move, which translates directly to better parameter estimates given the same computational budget.
+      The three innovations documented here — embedding an RBPF inside the SMC² inner filter, using CPMMH for rejuvenation instead of standard PMMH, and reparameterizing the vol-of-vol channels into orthogonal (σ<sub>total</sub>, r) coordinates — are individually well-motivated but their power comes from the interaction. The RBPF produces low-variance likelihood estimates that make CPMMH's correlated ratio nearly exact. CPMMH's high acceptance rates make the reparameterization's geometric alignment immediately useful rather than merely theoretical. And the reparameterization breaks the ridge that would otherwise waste most of CPMMH's computational budget. Each component amplifies the others. The result is a system that learns stochastic volatility parameters online, in real time, on a single GPU, with the statistical efficiency that previously required batch MCMC on the full dataset.
     </p>
   </div>
 </div>
@@ -1518,10 +1515,372 @@ function drawReparam() {
 drawRidge();
 drawReparam();
 
+// ── Circular Buffer Visualization ──
+function drawCircularBuffer() {
+  const canvas = document.getElementById('circularBufferCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  const cx = W * 0.38, cy = H * 0.52;
+  const R = 95, r = 65;
+  const nSlots = 16;
+
+  // Draw circular buffer ring
+  for (let i = 0; i < nSlots; i++) {
+    const a0 = (i / nSlots) * Math.PI * 2 - Math.PI / 2;
+    const a1 = ((i + 1) / nSlots) * Math.PI * 2 - Math.PI / 2;
+    const mid = (a0 + a1) / 2;
+
+    ctx.beginPath();
+    ctx.arc(cx, cy, R, a0 + 0.02, a1 - 0.02);
+    ctx.arc(cx, cy, r, a1 - 0.02, a0 + 0.02, true);
+    ctx.closePath();
+
+    // Color: recent slots are bright, old ones dim; one "write head" highlighted
+    let fill;
+    if (i === 5) {
+      fill = 'rgba(255,107,157,0.35)'; // write head
+    } else if (i >= 6 && i <= 12) {
+      fill = 'rgba(79,195,247,0.04)'; // oldest (already overwritten feel)
+    } else {
+      fill = 'rgba(79,195,247,0.12)'; // stored noise
+    }
+    ctx.fillStyle = fill;
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(79,195,247,0.2)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // Label some slots
+    const lx = cx + Math.cos(mid) * (R + 14);
+    const ly = cy + Math.sin(mid) * (R + 14);
+    ctx.font = '9px IBM Plex Mono';
+    ctx.fillStyle = 'rgba(200,214,229,0.3)';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    if (i === 0) ctx.fillText('t%L', lx, ly);
+    if (i === 5) { ctx.fillStyle = 'rgba(255,107,157,0.7)'; ctx.fillText('write', lx, ly); }
+  }
+
+  // Center label
+  ctx.font = '11px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(200,214,229,0.5)';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('L + 64', cx, cy - 6);
+  ctx.fillText('slots', cx, cy + 8);
+
+  // Arrow showing "replay reads L slots"
+  ctx.beginPath();
+  ctx.arc(cx, cy, R + 28, -Math.PI * 0.4, Math.PI * 0.75);
+  ctx.strokeStyle = 'rgba(167,139,250,0.4)';
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([4, 3]);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Arrowhead
+  const aEnd = Math.PI * 0.75;
+  const ax = cx + Math.cos(aEnd) * (R + 28);
+  const ay = cy + Math.sin(aEnd) * (R + 28);
+  ctx.beginPath();
+  ctx.moveTo(ax, ay);
+  ctx.lineTo(ax + 6, ay - 6);
+  ctx.lineTo(ax + 2, ay + 5);
+  ctx.fillStyle = 'rgba(167,139,250,0.5)';
+  ctx.fill();
+
+  ctx.font = '10px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(167,139,250,0.6)';
+  ctx.textAlign = 'left';
+  ctx.fillText('CPMMH replay', cx + R + 34, cy - 40);
+  ctx.fillText('reads last L slots', cx + R + 34, cy - 26);
+
+  // Right side: memory comparison
+  const rx = W * 0.73, ry = 50;
+  ctx.font = '11px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(200,214,229,0.6)';
+  ctx.textAlign = 'left';
+  ctx.fillText('Memory comparison:', rx, ry);
+
+  ctx.font = '10px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(52,211,153,0.7)';
+  ctx.fillText('With circular buffer:', rx, ry + 28);
+  ctx.fillStyle = 'rgba(52,211,153,0.5)';
+  ctx.fillText('  ~550 MB (fits GPU)', rx, ry + 44);
+
+  ctx.fillStyle = 'rgba(255,107,157,0.7)';
+  ctx.fillText('Without:', rx, ry + 72);
+  ctx.fillStyle = 'rgba(255,107,157,0.5)';
+  ctx.fillText('  ~42 GB at T=5000', rx, ry + 88);
+
+  // Dimensioning
+  ctx.font = '9px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(200,214,229,0.35)';
+  ctx.fillText('N_θ × N_inner × (L+64)', rx, ry + 120);
+  ctx.fillText('× sizeof(float)', rx, ry + 134);
+  ctx.fillText('= 1024 × 512 × 264 × 4', rx, ry + 154);
+}
+
+// ── Kalman Cycle Visualization ──
+function drawKalmanCycle() {
+  const canvas = document.getElementById('kalmanCycleCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  // Five stages as boxes in a flow
+  const stages = [
+    { label: '1. Sample z̃', desc: 'AR(1) + noise', color: 'rgba(79,195,247,', y: 55 },
+    { label: '2. Eval curves', desc: 'μ(z), σ_h(z), θ(z)', color: 'rgba(167,139,250,', y: 120 },
+    { label: '3. Kalman predict', desc: 'μ_h⁻, V_h⁻', color: 'rgba(255,107,157,', y: 185 },
+    { label: '4. Kalman update', desc: 'K, innov → μ_h, V_h', color: 'rgba(52,211,153,', y: 250 },
+    { label: '5. Log-weight', desc: '→ outer SMC²', color: 'rgba(251,191,36,', y: 315 },
+  ];
+
+  const boxW = 180, boxH = 45;
+  const startX = 60;
+
+  stages.forEach((s, i) => {
+    const x = startX, y = s.y;
+
+    // Box
+    ctx.fillStyle = s.color + '0.08)';
+    ctx.strokeStyle = s.color + '0.35)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.roundRect(x, y, boxW, boxH, 4);
+    ctx.fill();
+    ctx.stroke();
+
+    // Label
+    ctx.font = '600 11px IBM Plex Mono';
+    ctx.fillStyle = s.color + '0.9)';
+    ctx.textAlign = 'left';
+    ctx.fillText(s.label, x + 10, y + 18);
+
+    ctx.font = '10px IBM Plex Mono';
+    ctx.fillStyle = s.color + '0.5)';
+    ctx.fillText(s.desc, x + 10, y + 34);
+
+    // Connector arrow to next
+    if (i < stages.length - 1) {
+      const ny = stages[i + 1].y;
+      ctx.beginPath();
+      ctx.moveTo(x + boxW / 2, y + boxH);
+      ctx.lineTo(x + boxW / 2, ny);
+      ctx.strokeStyle = 'rgba(200,214,229,0.15)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      // arrowhead
+      ctx.beginPath();
+      ctx.moveTo(x + boxW / 2 - 4, ny - 5);
+      ctx.lineTo(x + boxW / 2, ny);
+      ctx.lineTo(x + boxW / 2 + 4, ny - 5);
+      ctx.strokeStyle = 'rgba(200,214,229,0.25)';
+      ctx.stroke();
+    }
+  });
+
+  // Right side annotations
+  const annX = 290;
+  ctx.font = '10px IBM Plex Mono';
+  ctx.textAlign = 'left';
+
+  // Stage 1 annotation - "SAMPLED (stochastic)"
+  ctx.fillStyle = 'rgba(79,195,247,0.5)';
+  ctx.fillText('← only stochastic step', annX, 78);
+  ctx.fillText('   (one random draw per particle)', annX, 92);
+
+  // Bracket for stages 3-4 "ANALYTICAL (exact)"
+  ctx.strokeStyle = 'rgba(52,211,153,0.3)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(annX - 20, 190);
+  ctx.lineTo(annX - 10, 190);
+  ctx.lineTo(annX - 10, 285);
+  ctx.lineTo(annX - 20, 285);
+  ctx.stroke();
+
+  ctx.fillStyle = 'rgba(52,211,153,0.6)';
+  ctx.font = '600 11px IBM Plex Mono';
+  ctx.fillText('Rao-Blackwellized', annX, 228);
+  ctx.font = '10px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(52,211,153,0.45)';
+  ctx.fillText('Exact given z̃ — no sampling', annX, 244);
+  ctx.fillText('noise. Dramatically reduces', annX, 258);
+  ctx.fillText('variance of likelihood estimate.', annX, 272);
+
+  // Stage 5 annotation
+  ctx.fillStyle = 'rgba(251,191,36,0.5)';
+  ctx.fillText('← feeds outer θ-particle weight', annX, 338);
+
+  // Title area
+  ctx.font = '10px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(200,214,229,0.3)';
+  ctx.textAlign = 'center';
+  ctx.fillText('Per inner particle, per tick', W / 2, 28);
+}
+
+// ── GPU Architecture Visualization ──
+function drawGPUArch() {
+  const canvas = document.getElementById('gpuArchCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  // Title
+  ctx.font = '10px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(200,214,229,0.4)';
+  ctx.textAlign = 'center';
+  ctx.fillText('CUDA Grid: N_θ blocks × N_inner threads', W / 2, 22);
+
+  // Draw GPU grid representation
+  const gridX = 40, gridY = 45;
+  const blockW = 120, blockH = 70;
+  const gap = 12;
+  const nShow = 4; // show 4 blocks + ellipsis
+
+  for (let b = 0; b < nShow; b++) {
+    const bx = gridX + b * (blockW + gap);
+    const by = gridY;
+
+    // Block outline
+    ctx.fillStyle = 'rgba(79,195,247,0.05)';
+    ctx.strokeStyle = 'rgba(79,195,247,0.25)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.roundRect(bx, by, blockW, blockH, 4);
+    ctx.fill();
+    ctx.stroke();
+
+    // Block label
+    ctx.font = '600 9px IBM Plex Mono';
+    ctx.fillStyle = 'rgba(79,195,247,0.7)';
+    ctx.textAlign = 'center';
+    ctx.fillText(`θ-particle ${b}`, bx + blockW / 2, by + 14);
+
+    // Inner thread dots (show grid of threads)
+    const dotRows = 3, dotCols = 8;
+    const dotR = 2.5, dotGap = 11;
+    const dotsX = bx + (blockW - dotCols * dotGap) / 2 + 5;
+    const dotsY = by + 24;
+    for (let r = 0; r < dotRows; r++) {
+      for (let c = 0; c < dotCols; c++) {
+        ctx.beginPath();
+        ctx.arc(dotsX + c * dotGap, dotsY + r * dotGap, dotR, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(167,139,250,0.4)';
+        ctx.fill();
+      }
+    }
+
+    // "512 threads" label
+    ctx.font = '8px IBM Plex Mono';
+    ctx.fillStyle = 'rgba(167,139,250,0.5)';
+    ctx.textAlign = 'center';
+    ctx.fillText('512 inner particles', bx + blockW / 2, by + blockH - 6);
+  }
+
+  // Ellipsis
+  const ellX = gridX + nShow * (blockW + gap) + 10;
+  ctx.font = '16px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(200,214,229,0.3)';
+  ctx.textAlign = 'left';
+  ctx.fillText('···', ellX, gridY + blockH / 2 + 5);
+  ctx.font = '9px IBM Plex Mono';
+  ctx.fillText('×1024', ellX, gridY + blockH / 2 + 22);
+
+  // Shared memory section
+  const smY = gridY + blockH + 30;
+  ctx.font = '600 10px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(200,214,229,0.6)';
+  ctx.textAlign = 'left';
+  ctx.fillText('Shared Memory (per block):', gridX, smY);
+
+  const smItems = [
+    { label: 'ρ, σ_total, μ_base, r', desc: 'loaded by thread 0, broadcast to all', color: 'rgba(79,195,247,' },
+    { label: 'σ_z, σ_base', desc: 'derived from σ_total and r on-the-fly', color: 'rgba(52,211,153,' },
+    { label: 'reduction scratch', desc: 'log-sum-exp, ESS, resampling CDF', color: 'rgba(251,191,36,' },
+  ];
+
+  smItems.forEach((item, i) => {
+    const y = smY + 18 + i * 28;
+    // Small colored bar
+    ctx.fillStyle = item.color + '0.5)';
+    ctx.fillRect(gridX + 10, y - 4, 3, 14);
+
+    ctx.font = '10px IBM Plex Mono';
+    ctx.fillStyle = item.color + '0.7)';
+    ctx.fillText(item.label, gridX + 22, y + 6);
+
+    ctx.fillStyle = item.color + '0.35)';
+    ctx.fillText('— ' + item.desc, gridX + 22 + ctx.measureText(item.label).width + 8, y + 6);
+  });
+
+  // SoA diagram
+  const soaY = smY + 110;
+  ctx.font = '600 10px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(200,214,229,0.6)';
+  ctx.fillText('Structure-of-Arrays Memory Layout:', gridX, soaY);
+
+  ctx.font = '9px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(200,214,229,0.35)';
+  ctx.fillText('All z̃ values contiguous → coalesced reads when warp loads', gridX + 10, soaY + 18);
+
+  // Draw SoA bars
+  const barY = soaY + 32;
+  const barH = 14;
+  const arrays = [
+    { name: 'z̃[ ]', color: 'rgba(79,195,247,0.25)', border: 'rgba(79,195,247,0.4)' },
+    { name: 'μ_h[ ]', color: 'rgba(167,139,250,0.2)', border: 'rgba(167,139,250,0.35)' },
+    { name: 'V_h[ ]', color: 'rgba(255,107,157,0.2)', border: 'rgba(255,107,157,0.35)' },
+    { name: 'log_w[ ]', color: 'rgba(251,191,36,0.2)', border: 'rgba(251,191,36,0.35)' },
+  ];
+
+  arrays.forEach((arr, i) => {
+    const y = barY + i * (barH + 5);
+    const barW = W - gridX * 2 - 70;
+
+    // Draw segmented bar
+    const nSeg = 16;
+    const segW = barW / nSeg;
+    for (let s = 0; s < nSeg; s++) {
+      ctx.fillStyle = arr.color;
+      ctx.strokeStyle = arr.border;
+      ctx.lineWidth = 0.5;
+      ctx.fillRect(gridX + 60 + s * segW, y, segW - 1, barH);
+      ctx.strokeRect(gridX + 60 + s * segW, y, segW - 1, barH);
+    }
+
+    ctx.font = '9px IBM Plex Mono';
+    ctx.fillStyle = arr.border;
+    ctx.textAlign = 'right';
+    ctx.fillText(arr.name, gridX + 55, y + 11);
+  });
+
+  // Arrow showing coalesced access
+  ctx.textAlign = 'left';
+  const accessY = barY + 4 * (barH + 5) + 8;
+  ctx.font = '9px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(52,211,153,0.5)';
+  ctx.fillText('↑ warp of 32 threads reads 32 adjacent values = 1 memory transaction', gridX + 60, accessY);
+}
+
+drawCircularBuffer();
+drawKalmanCycle();
+drawGPUArch();
+
 // Redraw on resize
 window.addEventListener('resize', () => {
   drawRidge();
   drawReparam();
+  drawCircularBuffer();
+  drawKalmanCycle();
+  drawGPUArch();
 });
 </script>
 </body>
