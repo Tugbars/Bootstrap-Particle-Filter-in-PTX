@@ -1,0 +1,1528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SMC² + RBPF + CPMMH: Online Parameter Learning for Stochastic Volatility</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Source+Serif+4:ital,wght@0,400;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0e17;
+  --bg2: #0f1520;
+  --bg3: #141c2b;
+  --surface: #1a2332;
+  --border: #1e2d42;
+  --text: #c8d6e5;
+  --text-dim: #6b7f99;
+  --text-bright: #e8f0fa;
+  --accent: #4fc3f7;
+  --accent2: #ff6b9d;
+  --accent3: #a78bfa;
+  --accent4: #34d399;
+  --warn: #fbbf24;
+  --serif: 'Source Serif 4', Georgia, serif;
+  --mono: 'IBM Plex Mono', 'JetBrains Mono', monospace;
+  --code: 'JetBrains Mono', monospace;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html { scroll-behavior: smooth; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--serif);
+  font-size: 17px;
+  line-height: 1.75;
+  overflow-x: hidden;
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* ── Grain overlay ── */
+body::before {
+  content: '';
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.03'/%3E%3C/svg%3E");
+  pointer-events: none;
+  z-index: 9999;
+}
+
+/* ── Layout ── */
+.container {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 0 2rem;
+}
+
+/* ── Hero ── */
+.hero {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  overflow: hidden;
+}
+
+.hero-bg {
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background:
+    radial-gradient(ellipse at 20% 50%, rgba(79,195,247,0.06) 0%, transparent 60%),
+    radial-gradient(ellipse at 80% 30%, rgba(167,139,250,0.05) 0%, transparent 50%),
+    radial-gradient(ellipse at 50% 80%, rgba(255,107,157,0.04) 0%, transparent 50%);
+}
+
+.hero-content {
+  text-align: center;
+  position: relative;
+  z-index: 1;
+  animation: fadeUp 1.2s ease-out;
+}
+
+.hero-label {
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 1.5rem;
+  opacity: 0.8;
+}
+
+h1 {
+  font-family: var(--serif);
+  font-size: clamp(2.2rem, 5vw, 3.5rem);
+  font-weight: 700;
+  color: var(--text-bright);
+  line-height: 1.2;
+  margin-bottom: 1.5rem;
+  letter-spacing: -0.02em;
+}
+
+h1 .accent { color: var(--accent); }
+h1 .accent2 { color: var(--accent2); }
+h1 .accent3 { color: var(--accent3); }
+
+.hero-sub {
+  font-size: 1.15rem;
+  color: var(--text-dim);
+  max-width: 620px;
+  margin: 0 auto 3rem;
+  line-height: 1.7;
+}
+
+.hero-meta {
+  display: flex;
+  gap: 2rem;
+  justify-content: center;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  letter-spacing: 0.05em;
+}
+
+.hero-meta span { opacity: 0.7; }
+.hero-meta .val { color: var(--accent); opacity: 1; }
+
+/* ── Scroll indicator ── */
+.scroll-hint {
+  position: absolute;
+  bottom: 2rem;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  color: var(--text-dim);
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  animation: float 3s ease-in-out infinite;
+}
+
+.scroll-hint::after {
+  content: '';
+  width: 1px;
+  height: 30px;
+  background: linear-gradient(to bottom, var(--accent), transparent);
+}
+
+/* ── Section styling ── */
+section {
+  padding: 6rem 0;
+  position: relative;
+}
+
+section + section {
+  border-top: 1px solid var(--border);
+}
+
+.section-num {
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 1rem;
+  opacity: 0.7;
+}
+
+h2 {
+  font-family: var(--serif);
+  font-size: clamp(1.6rem, 3.5vw, 2.2rem);
+  font-weight: 700;
+  color: var(--text-bright);
+  margin-bottom: 1.5rem;
+  letter-spacing: -0.01em;
+  line-height: 1.3;
+}
+
+h3 {
+  font-family: var(--serif);
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: var(--text-bright);
+  margin: 2.5rem 0 1rem;
+}
+
+p { margin-bottom: 1.25rem; }
+
+strong { color: var(--text-bright); font-weight: 600; }
+
+/* ── Math blocks ── */
+.math-block {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  padding: 1.25rem 1.5rem;
+  margin: 1.5rem 0;
+  font-family: var(--mono);
+  font-size: 0.9rem;
+  line-height: 1.8;
+  overflow-x: auto;
+  border-radius: 0 4px 4px 0;
+}
+
+.math-block .comment {
+  color: var(--text-dim);
+  font-style: italic;
+}
+
+.math-block .var { color: var(--accent); }
+.math-block .var2 { color: var(--accent2); }
+.math-block .var3 { color: var(--accent3); }
+.math-block .var4 { color: var(--accent4); }
+
+/* ── Diagrams ── */
+.diagram-wrap {
+  margin: 2.5rem 0;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.diagram-title {
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  padding: 0.75rem 1.25rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg3);
+}
+
+.diagram-body {
+  padding: 2rem;
+  display: flex;
+  justify-content: center;
+}
+
+.diagram-body svg {
+  max-width: 100%;
+  height: auto;
+}
+
+/* ── Architecture tower ── */
+.arch-tower {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  width: 100%;
+  max-width: 700px;
+  margin: 2rem auto;
+}
+
+.arch-layer {
+  border: 1px solid var(--border);
+  padding: 1.5rem 1.75rem;
+  position: relative;
+  opacity: 0;
+  transform: translateY(20px);
+  transition: all 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.arch-layer.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.arch-layer:first-child {
+  border-radius: 6px 6px 0 0;
+}
+
+.arch-layer:last-child {
+  border-radius: 0 0 6px 6px;
+}
+
+.arch-layer + .arch-layer {
+  border-top: none;
+}
+
+.arch-layer-outer {
+  background: linear-gradient(135deg, rgba(79,195,247,0.08), rgba(79,195,247,0.02));
+  border-left: 3px solid var(--accent);
+}
+
+.arch-layer-inner {
+  background: linear-gradient(135deg, rgba(167,139,250,0.08), rgba(167,139,250,0.02));
+  border-left: 3px solid var(--accent3);
+}
+
+.arch-layer-rejuv {
+  background: linear-gradient(135deg, rgba(255,107,157,0.08), rgba(255,107,157,0.02));
+  border-left: 3px solid var(--accent2);
+}
+
+.arch-layer-reparam {
+  background: linear-gradient(135deg, rgba(52,211,153,0.08), rgba(52,211,153,0.02));
+  border-left: 3px solid var(--accent4);
+}
+
+.arch-layer-tag {
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  margin-bottom: 0.5rem;
+}
+
+.arch-layer-outer .arch-layer-tag { color: var(--accent); }
+.arch-layer-inner .arch-layer-tag { color: var(--accent3); }
+.arch-layer-rejuv .arch-layer-tag { color: var(--accent2); }
+.arch-layer-reparam .arch-layer-tag { color: var(--accent4); }
+
+.arch-layer-name {
+  font-family: var(--serif);
+  font-weight: 600;
+  font-size: 1.1rem;
+  color: var(--text-bright);
+  margin-bottom: 0.35rem;
+}
+
+.arch-layer-desc {
+  font-size: 0.92rem;
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+
+/* ── Connector arrows between layers ── */
+.arch-connector {
+  display: flex;
+  justify-content: center;
+  padding: 0;
+  height: 0;
+  position: relative;
+}
+
+.arch-connector::after {
+  content: '▼';
+  position: absolute;
+  top: -8px;
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  opacity: 0.4;
+}
+
+/* ── Ridge visualization ── */
+.ridge-canvas-wrap {
+  position: relative;
+  width: 100%;
+  max-width: 600px;
+  margin: 0 auto;
+}
+
+canvas.ridge-canvas {
+  width: 100%;
+  border-radius: 4px;
+  display: block;
+}
+
+/* ── Particle animation ── */
+.particle-sim {
+  position: relative;
+  width: 100%;
+  height: 300px;
+  background: var(--bg);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.particle {
+  position: absolute;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  opacity: 0.7;
+}
+
+/* ── Callout boxes ── */
+.callout {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1.25rem 1.5rem;
+  margin: 1.5rem 0;
+  position: relative;
+}
+
+.callout::before {
+  content: attr(data-label);
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--accent);
+  position: absolute;
+  top: -0.5rem;
+  left: 1rem;
+  background: var(--surface);
+  padding: 0 0.5rem;
+}
+
+.callout.insight::before { color: var(--accent4); }
+.callout.insight { border-color: rgba(52,211,153,0.3); }
+.callout.problem::before { color: var(--accent2); }
+.callout.problem { border-color: rgba(255,107,157,0.3); }
+
+/* ── Algorithm steps ── */
+.algo-steps {
+  counter-reset: algo-step;
+  margin: 1.5rem 0;
+}
+
+.algo-step {
+  counter-increment: algo-step;
+  padding: 1rem 1.25rem 1rem 3.5rem;
+  position: relative;
+  border-left: 1px solid var(--border);
+  margin-left: 1rem;
+}
+
+.algo-step::before {
+  content: counter(algo-step);
+  position: absolute;
+  left: -1rem;
+  top: 1rem;
+  width: 2rem;
+  height: 2rem;
+  background: var(--bg2);
+  border: 1px solid var(--accent);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.algo-step-title {
+  font-family: var(--mono);
+  font-weight: 600;
+  font-size: 0.85rem;
+  color: var(--text-bright);
+  margin-bottom: 0.35rem;
+}
+
+.algo-step-body {
+  font-size: 0.92rem;
+  color: var(--text);
+  line-height: 1.65;
+}
+
+/* ── Comparison table ── */
+.compare-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+  margin: 2rem 0;
+}
+
+.compare-card {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1.5rem;
+}
+
+.compare-card.bad { border-top: 3px solid var(--accent2); }
+.compare-card.good { border-top: 3px solid var(--accent4); }
+
+.compare-card h4 {
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  margin-bottom: 0.75rem;
+}
+
+.compare-card.bad h4 { color: var(--accent2); }
+.compare-card.good h4 { color: var(--accent4); }
+
+.compare-card p {
+  font-size: 0.88rem;
+  color: var(--text-dim);
+  line-height: 1.6;
+  margin-bottom: 0;
+}
+
+/* ── TOC nav ── */
+.toc {
+  position: fixed;
+  right: 1.5rem;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.toc a {
+  display: block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  opacity: 0.3;
+  transition: all 0.3s;
+  text-decoration: none;
+}
+
+.toc a.active {
+  opacity: 1;
+  background: var(--accent);
+  box-shadow: 0 0 8px rgba(79,195,247,0.4);
+}
+
+/* ── Flow animation ── */
+.flow-wrap {
+  width: 100%;
+  overflow: hidden;
+  padding: 1rem 0;
+}
+
+.flow-track {
+  display: flex;
+  gap: 1.5rem;
+  align-items: center;
+  animation: flowScroll 20s linear infinite;
+  width: max-content;
+}
+
+.flow-item {
+  flex-shrink: 0;
+  padding: 0.5rem 1rem;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.flow-arrow {
+  flex-shrink: 0;
+  color: var(--accent);
+  font-size: 0.8rem;
+  opacity: 0.5;
+}
+
+/* ── Animations ── */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(30px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes float {
+  0%, 100% { transform: translateX(-50%) translateY(0); }
+  50% { transform: translateX(-50%) translateY(-8px); }
+}
+
+@keyframes flowScroll {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(-50%); }
+}
+
+@keyframes pulse-ring {
+  0% { opacity: 0.6; transform: scale(1); }
+  100% { opacity: 0; transform: scale(2.5); }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* ── Responsive ── */
+@media (max-width: 768px) {
+  .container { padding: 0 1.25rem; }
+  section { padding: 4rem 0; }
+  .compare-grid { grid-template-columns: 1fr; }
+  .toc { display: none; }
+  .hero-meta { flex-direction: column; gap: 0.5rem; }
+  .arch-layer { padding: 1.25rem; }
+}
+
+/* ── Inline code ── */
+code {
+  font-family: var(--code);
+  font-size: 0.85em;
+  background: var(--bg3);
+  padding: 0.15em 0.4em;
+  border-radius: 3px;
+  color: var(--accent);
+}
+
+/* ── Horizontal rule ── */
+.sep {
+  border: none;
+  height: 1px;
+  background: var(--border);
+  margin: 3rem 0;
+}
+
+/* ── Reveal on scroll ── */
+.reveal {
+  opacity: 0;
+  transform: translateY(24px);
+  transition: opacity 0.7s ease, transform 0.7s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.reveal.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* ── SVG diagram styles ── */
+.svg-diagram text {
+  font-family: 'IBM Plex Mono', monospace;
+}
+</style>
+</head>
+<body>
+
+<!-- ════ TOC dots ════ -->
+<nav class="toc" id="toc"></nav>
+
+<!-- ════════════════════════════════════════════════════════════════════
+     HERO
+     ════════════════════════════════════════════════════════════════════ -->
+<header class="hero" id="sec-hero">
+  <div class="hero-bg"></div>
+  <div class="hero-content">
+    <div class="hero-label">Technical Documentation</div>
+    <h1>
+      <span class="accent">SMC²</span> + <span class="accent3">RBPF</span> + <span class="accent2">CPMMH</span><br>
+      Online Parameter Learning<br>for Stochastic Volatility
+    </h1>
+    <p class="hero-sub">
+      A GPU-accelerated algorithm for real-time joint estimation of latent volatility states and model parameters, featuring a novel (σ<sub>total</sub>,&nbsp;r) reparameterization that breaks the identification ridge inherent in multi-channel vol-of-vol models.
+    </p>
+    <div class="hero-meta">
+      <span>Architecture: <span class="val">3-Layer Nested SMC</span></span>
+      <span>Params: <span class="val">ρ, σ_total, μ_base, r</span></span>
+      <span>Target: <span class="val">CUDA / RTX 5080</span></span>
+    </div>
+  </div>
+  <div class="scroll-hint">Scroll</div>
+</header>
+
+<!-- ════════════════════════════════════════════════════════════════════
+     SECTION 1: THE PROBLEM
+     ════════════════════════════════════════════════════════════════════ -->
+<section id="sec-problem">
+<div class="container">
+  <div class="reveal">
+    <div class="section-num">01 — The Problem</div>
+    <h2>Why Online Parameter Learning Is Hard</h2>
+    <p>
+      Stochastic volatility (SV) models describe how an asset's return variance evolves over time through a latent process. The standard formulation introduces a hidden log-variance <code>h<sub>t</sub></code> that follows an autoregressive process governed by static parameters&hairsp;—&hairsp;persistence <strong>ρ</strong>, volatility-of-volatility <strong>σ<sub>z</sub></strong>, mean level <strong>μ</strong>, and baseline noise <strong>σ<sub>base</sub></strong>.
+    </p>
+    <p>
+      The core challenge: <strong>both the latent states and the parameters that govern their dynamics are unknown.</strong> A particle filter can track latent states given known parameters, and MCMC can sample parameters given the full state trajectory. But doing both simultaneously and <em>online</em>&hairsp;—&hairsp;updating after every single observation without revisiting old data&hairsp;—&hairsp;requires a fundamentally different approach.
+    </p>
+  </div>
+
+  <div class="reveal">
+    <div class="callout problem" data-label="The Degeneracy Problem">
+      <p>
+        Naïvely adding parameters to the particle filter state vector leads to rapid degeneracy. Parameters are static&hairsp;—&hairsp;they don't have process noise to rejuvenate diversity. After a few resampling steps, all particles collapse onto a single parameter value. The filter becomes overconfident and wrong. This is the well-known <em>particle depletion</em> problem for static parameters in sequential Monte Carlo.
+      </p>
+    </div>
+  </div>
+
+  <div class="reveal">
+    <p>
+      The solution is <strong>SMC²</strong> (Sequential Monte Carlo Squared)&hairsp;—&hairsp;a particle filter <em>within</em> a particle filter. The outer layer maintains a population of parameter hypotheses. Each hypothesis runs its own inner particle filter to estimate the latent states. When the outer population degenerates, a Metropolis-Hastings rejuvenation move proposes fresh parameters and verifies them by replaying the inner filter. Our implementation combines three specific innovations that, together, create a system significantly more capable than any of these components alone.
+    </p>
+  </div>
+</div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════
+     SECTION 2: THE MODEL
+     ════════════════════════════════════════════════════════════════════ -->
+<section id="sec-model">
+<div class="container">
+  <div class="reveal">
+    <div class="section-num">02 — The Generative Model</div>
+    <h2>Regime-Switching Stochastic Volatility</h2>
+    <p>
+      The model uses a transformed latent regime variable <strong>z̃<sub>t</sub></strong> that drives nonlinear curves for the mean, variance, and mean-reversion speed of log-volatility. This creates rich regime-switching dynamics from a single latent AR(1) process.
+    </p>
+  </div>
+
+  <div class="reveal">
+    <div class="math-block">
+<span class="comment">/* Latent regime dynamics */</span>
+<span class="var">z̃<sub>t</sub></span> = <span class="var">ρ</span> · z̃<sub>t-1</sub> + <span class="var">σ<sub>z</sub></span> · ε<sub>t</sub>           ε<sub>t</sub> ~ N(0, 1)
+z<sub>t</sub>  = 1.5 · (1 + tanh(z̃<sub>t</sub>))          <span class="comment">/* squash to [0, 3] */</span>
+
+<span class="comment">/* Regime-dependent curves (parameterized by z) */</span>
+<span class="var2">μ</span>(z) = <span class="var2">μ_base</span> + μ_scale · (1 - e<sup>-μ_rate · z</sup>)
+<span class="var2">σ<sub>h</sub></span>(z) = <span class="var2">σ_base</span> + σ_scale · (1 - e<sup>-σ_rate · z</sup>)
+θ(z) = θ_base + θ_scale · (1 - e<sup>-θ_rate · z</sup>)
+
+<span class="comment">/* Log-volatility transition */</span>
+h<sub>t</sub> = (1 - θ(z)) · h<sub>t-1</sub> + θ(z) · μ(z) + σ<sub>h</sub>(z) · η<sub>t</sub>     η<sub>t</sub> ~ N(0, 1)
+
+<span class="comment">/* Observation (OCSN likelihood via log y²) */</span>
+y<sub>t</sub> = e<sup>h<sub>t</sub>/2</sup> · ν<sub>t</sub>                      ν<sub>t</sub> ~ N(0, 1)
+obs<sub>t</sub> = log(y<sub>t</sub>²) ≈ h<sub>t</sub> + log(χ²(1))     <span class="comment">/* linearizes the observation */</span>
+    </div>
+  </div>
+
+  <div class="reveal">
+    <p>
+      The <strong>four learned parameters</strong> are θ&nbsp;=&nbsp;(ρ,&nbsp;σ<sub>z</sub>,&nbsp;μ<sub>base</sub>,&nbsp;σ<sub>base</sub>), while the curve shapes (scale, rate terms) and the θ(z) speed curve are fixed offline. The log-squared transform converts the nonlinear observation model into an approximately linear-Gaussian one, enabling Kalman-like sufficient statistics inside the inner filter&hairsp;—&hairsp;this is the <em>OCSN</em> (Omori-Chib-Shephard-Nakajima) linearization.
+    </p>
+  </div>
+</div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════
+     SECTION 3: THE ARCHITECTURE
+     ════════════════════════════════════════════════════════════════════ -->
+<section id="sec-arch">
+<div class="container">
+  <div class="reveal">
+    <div class="section-num">03 — The Three-Layer Architecture</div>
+    <h2>SMC² with RBPF Inner Filter and CPMMH Rejuvenation</h2>
+    <p>
+      The algorithm operates as three nested layers, each solving a distinct inference problem. The outer layer tracks <em>what the parameters are</em>. The inner layer tracks <em>what the latent states are</em> given those parameters. The rejuvenation layer <em>refreshes</em> parameter diversity when it collapses.
+    </p>
+  </div>
+
+  <!-- Architecture tower -->
+  <div class="arch-tower" id="arch-tower">
+    <div class="arch-layer arch-layer-outer">
+      <div class="arch-layer-tag">Layer 1 — Outer</div>
+      <div class="arch-layer-name">SMC² Particle Filter over θ</div>
+      <div class="arch-layer-desc">
+        Maintains <strong>N<sub>θ</sub></strong> = 1024 parameter particles, each a hypothesis about (ρ, σ<sub>total</sub>, μ<sub>base</sub>, r). Each particle carries a weight proportional to how well its inner filter predicted the data so far. When the Effective Sample Size (ESS) drops below 50%, trigger systematic resampling followed by CPMMH rejuvenation.
+      </div>
+    </div>
+
+    <div class="arch-layer arch-layer-inner">
+      <div class="arch-layer-tag">Layer 2 — Inner</div>
+      <div class="arch-layer-name">Rao-Blackwellized Particle Filter</div>
+      <div class="arch-layer-desc">
+        For each θ-particle, runs <strong>N<sub>inner</sub></strong> = 512 inner particles tracking the latent regime z̃<sub>t</sub>. Given z̃, the log-volatility h<sub>t</sub> is conditionally linear-Gaussian, so Kalman sufficient statistics (μ<sub>h</sub>, V<sub>h</sub>) are propagated analytically instead of sampled. This <em>Rao-Blackwellization</em> dramatically reduces variance compared to a full bootstrap filter.
+      </div>
+    </div>
+
+    <div class="arch-layer arch-layer-rejuv">
+      <div class="arch-layer-tag">Layer 3 — Rejuvenation</div>
+      <div class="arch-layer-name">Correlated Pseudo-Marginal MH (CPMMH)</div>
+      <div class="arch-layer-desc">
+        When the outer filter resamples, duplicate θ-particles need diversification. CPMMH proposes θ* near the current θ, then <em>replays</em> the inner RBPF from a fixed-lag checkpoint using <strong>correlated noise</strong> (ρ<sub>corr</sub> = 0.99). The high correlation ensures the proposed and current log-likelihoods are similar, yielding acceptance rates of 25–40% — far higher than uncorrelated PMMH.
+      </div>
+    </div>
+
+    <div class="arch-layer arch-layer-reparam">
+      <div class="arch-layer-tag">Innovation</div>
+      <div class="arch-layer-name">(σ<sub>total</sub>, r) Reparameterization</div>
+      <div class="arch-layer-desc">
+        Instead of learning σ<sub>z</sub> and σ<sub>base</sub> directly, learns their polar decomposition: σ<sub>total</sub> = √(σ<sub>z</sub>² + σ<sub>base</sub>²) and r = σ<sub>z</sub>/σ<sub>total</sub>. This aligns CPMMH proposals with the likelihood geometry, breaking the identification ridge between the two volatility channels.
+      </div>
+    </div>
+  </div>
+
+  <div class="reveal">
+    <div class="callout insight" data-label="Key Insight">
+      <p>
+        Standard SMC² uses a bootstrap particle filter as the inner filter and standard PMMH for rejuvenation. Our implementation replaces the inner filter with an <strong>RBPF</strong> (exploiting the conditional Gaussianity of h<sub>t</sub> | z̃<sub>t</sub>) and replaces PMMH with <strong>CPMMH</strong> (using correlated noise to keep acceptance rates high). These aren't independent improvements&hairsp;—&hairsp;they compound. The RBPF provides tighter likelihood estimates, which makes the CPMMH log-likelihood ratio less noisy, which further improves acceptance rates.
+      </p>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════
+     SECTION 4: HOW THE ALGORITHM WORKS
+     ════════════════════════════════════════════════════════════════════ -->
+<section id="sec-algo">
+<div class="container">
+  <div class="reveal">
+    <div class="section-num">04 — The Algorithm, Step by Step</div>
+    <h2>Per-Tick Update Cycle</h2>
+    <p>
+      Every time a new observation y<sub>t</sub> arrives, the following sequence executes. The entire pipeline runs on a single CUDA stream with minimal host synchronization.
+    </p>
+  </div>
+
+  <div class="reveal">
+    <div class="algo-steps">
+      <div class="algo-step">
+        <div class="algo-step-title">Store noise for CPMMH replay</div>
+        <div class="algo-step-body">
+          Draw and store the random variates (z-noise for regime transitions, u-noise for resampling) in a circular buffer. These will be needed if rejuvenation replays this timestep later. The buffer wraps at <code>L + 64</code> slots where L is the fixed lag.
+        </div>
+      </div>
+
+      <div class="algo-step">
+        <div class="algo-step-title">Inner RBPF propagation (all N<sub>θ</sub> × N<sub>inner</sub> particles)</div>
+        <div class="algo-step-body">
+          For each inner particle: propagate z̃ via the OU transition, compute regime-dependent curves μ(z), σ<sub>h</sub>(z), θ(z), then run the Kalman predict-update for (μ<sub>h</sub>, V<sub>h</sub>). Compute the observation log-likelihood ℓ<sub>t</sub> = log p(y<sub>t</sub> | z̃<sub>t</sub>, θ) under the OCSN Gaussian approximation. Update inner particle weights.
+        </div>
+      </div>
+
+      <div class="algo-step">
+        <div class="algo-step-title">Inner conditional resampling</div>
+        <div class="algo-step-body">
+          Within each θ-particle's inner cloud: compute ESS. If ESS/N<sub>inner</sub> drops below threshold, resample inner particles via systematic resampling and reset weights. This maintains diversity in the latent state estimates.
+        </div>
+      </div>
+
+      <div class="algo-step">
+        <div class="algo-step-title">Accumulate outer log-likelihood</div>
+        <div class="algo-step-body">
+          Each θ-particle's outer weight is updated by the log-marginal-likelihood increment: the log of the normalizing constant from step 2. This is simply log(Σ<sub>i</sub> w<sub>i</sub>) summed across inner particles&hairsp;—&hairsp;the particle filter's unbiased estimate of p(y<sub>t</sub> | y<sub>1:t-1</sub>, θ).
+        </div>
+      </div>
+
+      <div class="algo-step">
+        <div class="algo-step-title">Outer ESS check and resampling</div>
+        <div class="algo-step-body">
+          Compute outer ESS over the N<sub>θ</sub> parameter particles. If ESS < 0.5 · N<sub>θ</sub>, trigger systematic resampling of θ-particles (duplicating good ones, dropping poor ones), then immediately run K<sub>rejuv</sub>&nbsp;=&nbsp;5 rounds of CPMMH to diversify the duplicates.
+        </div>
+      </div>
+
+      <div class="algo-step">
+        <div class="algo-step-title">CPMMH rejuvenation (if triggered)</div>
+        <div class="algo-step-body">
+          For each θ-particle in parallel: propose θ* via a random walk (95% adaptive covariance, 5% fixed for ergodicity). Derive physical σ<sub>z</sub>* and σ<sub>base</sub>* from the proposed (σ<sub>total</sub>*, r*). Replay the inner RBPF from the checkpoint at t&nbsp;-&nbsp;L using <em>correlated noise</em>: ε* = ρ<sub>corr</sub> · ε<sub>current</sub> + √(1 - ρ<sub>corr</sub>²) · ε<sub>fresh</sub>. Accept or reject via the standard MH ratio using the replayed vs. current log-likelihoods.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tick flow animation -->
+  <div class="reveal">
+    <div class="diagram-wrap">
+      <div class="diagram-title">Per-tick data flow</div>
+      <div class="diagram-body">
+        <div class="flow-wrap">
+          <div class="flow-track">
+            <div class="flow-item" style="color:var(--warn)">y<sub>t</sub> arrives</div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-item">Store noise</div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-item" style="color:var(--accent3)">RBPF propagate</div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-item" style="color:var(--accent3)">Inner resample</div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-item" style="color:var(--accent)">Outer weight ⊕</div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-item" style="color:var(--accent)">ESS check</div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-item" style="color:var(--accent2)">CPMMH × 5</div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-item" style="color:var(--accent4)">θ̂<sub>t</sub> output</div>
+            <div class="flow-arrow">→</div>
+            <!-- duplicate for seamless loop -->
+            <div class="flow-item" style="color:var(--warn)">y<sub>t</sub> arrives</div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-item">Store noise</div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-item" style="color:var(--accent3)">RBPF propagate</div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-item" style="color:var(--accent3)">Inner resample</div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-item" style="color:var(--accent)">Outer weight ⊕</div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-item" style="color:var(--accent)">ESS check</div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-item" style="color:var(--accent2)">CPMMH × 5</div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-item" style="color:var(--accent4)">θ̂<sub>t</sub> output</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════
+     SECTION 5: THE IDENTIFICATION RIDGE
+     ════════════════════════════════════════════════════════════════════ -->
+<section id="sec-ridge">
+<div class="container">
+  <div class="reveal">
+    <div class="section-num">05 — The Identification Ridge</div>
+    <h2>Why σ<sub>z</sub> and σ<sub>base</sub> Are Unidentifiable</h2>
+    <p>
+      The stochastic volatility model has two channels through which randomness enters the log-volatility h<sub>t</sub>: the regime innovation σ<sub>z</sub> (which drives z̃ transitions) and the direct volatility noise σ<sub>base</sub> (which enters the h transition directly). The data constrains their <strong>combined effect</strong>&hairsp;—&hairsp;the total vol-of-vol&hairsp;—&hairsp;but cannot distinguish <em>which channel</em> delivers it.
+    </p>
+  </div>
+
+  <div class="reveal">
+    <div class="diagram-wrap">
+      <div class="diagram-title">Likelihood surface in (σ<sub>z</sub>, σ<sub>base</sub>) space</div>
+      <div class="diagram-body">
+        <canvas id="ridgeCanvas" class="ridge-canvas" width="560" height="360"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <div class="reveal">
+    <p>
+      The likelihood surface forms a <strong>narrow valley</strong> (ridge) along the curve σ<sub>z</sub>² + σ<sub>base</sub>² ≈ constant. Moving along this valley barely changes the likelihood. Moving perpendicular to it changes it dramatically. But MCMC proposals in the original (σ<sub>z</sub>, σ<sub>base</sub>) coordinate system don't know the valley exists.
+    </p>
+  </div>
+
+  <div class="reveal">
+    <div class="callout problem" data-label="The Failure Mode">
+      <p>
+        A random perturbation like (+0.02 to σ<sub>z</sub>, +0.01 to σ<sub>base</sub>) moves mostly <em>perpendicular</em> to the valley. The likelihood drops. Rejected. A perturbation like (+0.02 to σ<sub>z</sub>, −0.015 to σ<sub>base</sub>) happens to move <em>along</em> the valley. Accepted. But that specific combination is rare in a random 4D walk — the proposal doesn't know the valley exists. Out of 5 CPMMH moves, maybe 0–1 align with the valley by accident. Most proposals are wasted fighting the geometry.
+      </p>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════
+     SECTION 6: THE REPARAMETERIZATION
+     ════════════════════════════════════════════════════════════════════ -->
+<section id="sec-reparam">
+<div class="container">
+  <div class="reveal">
+    <div class="section-num">06 — The Reparameterization</div>
+    <h2>Breaking the Ridge with (σ<sub>total</sub>, r)</h2>
+    <p>
+      Instead of learning the raw parameters (σ<sub>z</sub>, σ<sub>base</sub>), we learn their <strong>polar decomposition</strong>:
+    </p>
+  </div>
+
+  <div class="reveal">
+    <div class="math-block">
+<span class="comment">/* What we learn (well-conditioned) */</span>
+<span class="var4">σ_total</span> = √(σ<sub>z</sub>² + σ<sub>base</sub>²)    <span class="comment">/* total vol-of-vol — WELL IDENTIFIED */</span>
+<span class="var4">r</span>       = σ<sub>z</sub> / σ<sub>total</sub>          <span class="comment">/* split ratio ∈ (0, 1) — weakly identified */</span>
+
+<span class="comment">/* How to recover physical parameters */</span>
+<span class="var">σ<sub>z</sub></span>    = r · σ<sub>total</sub>
+<span class="var2">σ<sub>base</sub></span> = √(1 - r²) · σ<sub>total</sub>
+    </div>
+  </div>
+
+  <div class="reveal">
+    <p>
+      This is a coordinate rotation. <code>σ<sub>total</sub></code> points <em>perpendicular</em> to the ridge&hairsp;—&hairsp;it's the well-constrained direction the data pins down tightly. <code>r</code> points <em>along</em> the ridge&hairsp;—&hairsp;it's the weakly-constrained direction the data barely cares about. After reparameterization, every MCMC proposal naturally decomposes into these two orthogonal directions.
+    </p>
+  </div>
+
+  <div class="reveal">
+    <div class="diagram-wrap">
+      <div class="diagram-title">Proposal geometry: before vs after reparameterization</div>
+      <div class="diagram-body">
+        <canvas id="reparamCanvas" class="ridge-canvas" width="560" height="340"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <div class="reveal">
+    <div class="compare-grid">
+      <div class="compare-card bad">
+        <h4>Before: (σ<sub>z</sub>, σ<sub>base</sub>)</h4>
+        <p>
+          Proposal axes aligned with coordinate grid. Most moves cross the ridge perpendicular → rejected. Chain wastes most of its K=5 rejuvenation moves fighting geometry. Acceptance ≈ 5–15%. Marginal estimates smeared along the ridge.
+        </p>
+      </div>
+      <div class="compare-card good">
+        <h4>After: (σ<sub>total</sub>, r)</h4>
+        <p>
+          Proposal axes aligned with the likelihood geometry. σ<sub>total</sub> perturbations test real signal (accepted/rejected on merit). r perturbations explore freely (data doesn't care). Every move is useful. Acceptance ≈ 25–40%. Tight, accurate posteriors.
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <div class="reveal">
+    <h3>The Full Learned Parameter Vector</h3>
+    <div class="math-block">
+θ = (<span class="var">ρ</span>, <span class="var4">σ<sub>total</sub></span>, <span class="var2">μ<sub>base</sub></span>, <span class="var4">r</span>)
+
+<span class="comment">/* ρ       — AR(1) persistence of z̃ dynamics */</span>
+<span class="comment">/* σ_total — total vol-of-vol (well-identified) */</span>
+<span class="comment">/* μ_base  — base mean level of log-vol curve */</span>
+<span class="comment">/* r       — vol-of-vol split ratio (weakly identified) */</span>
+
+<span class="comment">/* In every CUDA kernel that needs the physical params: */</span>
+σ<sub>z</sub>    = r · σ<sub>total</sub>;
+σ<sub>base</sub> = √(max(1 - r², 10⁻⁶)) · σ<sub>total</sub>;
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════
+     SECTION 7: CPMMH DEEP DIVE
+     ════════════════════════════════════════════════════════════════════ -->
+<section id="sec-cpmmh">
+<div class="container">
+  <div class="reveal">
+    <div class="section-num">07 — CPMMH Rejuvenation</div>
+    <h2>Correlated Noise Makes Replay Cheap</h2>
+    <p>
+      Standard PMMH (Particle Marginal Metropolis-Hastings) proposes a new θ* and runs a completely fresh particle filter to estimate its log-likelihood. The problem: two independent particle filter runs produce noisy likelihood estimates, and the noise in the MH ratio causes excessive rejections&hairsp;—&hairsp;even when θ* is close to θ.
+    </p>
+    <p>
+      <strong>CPMMH</strong> (Correlated PMMH) solves this by reusing <em>most of the same random numbers</em>. If the current filter used noise ε<sub>t</sub> at each step, the proposed filter uses:
+    </p>
+  </div>
+
+  <div class="reveal">
+    <div class="math-block">
+ε*<sub>t</sub> = <span class="var2">ρ<sub>corr</sub></span> · ε<sub>t</sub> + √(1 - ρ<sub>corr</sub>²) · ε<sub>fresh</sub>     <span class="comment">/* ρ<sub>corr</sub> = 0.99 */</span>
+
+<span class="comment">/* With ρ<sub>corr</sub> = 0.99:</span>
+<span class="comment">   - 99% of the noise is shared → trajectories nearly identical</span>
+<span class="comment">   - 1% fresh randomness → just enough exploration</span>
+<span class="comment">   - The MH ratio log p(y|θ*) - log p(y|θ) becomes low-variance</span>
+<span class="comment">   - Acceptance reflects genuine θ quality, not noise artifacts */</span>
+    </div>
+  </div>
+
+  <div class="reveal">
+    <h3>Fixed-Lag Replay with Circular Buffers</h3>
+    <p>
+      Full replay from t=0 would be O(T) per rejuvenation&hairsp;—&hairsp;impossibly expensive. Instead, we checkpoint the inner filter state every L=200 ticks and only replay the last L observations. The stored noise lives in a <strong>circular buffer</strong> of size L+64, wrapping via modular arithmetic. This keeps both memory O(N<sub>θ</sub> × N<sub>inner</sub> × L) and compute O(L) per rejuvenation, independent of total time T.
+    </p>
+  </div>
+
+  <div class="reveal">
+    <div class="math-block">
+<span class="comment">/* Circular noise indexing (GPU device function) */</span>
+slot = t % noise_capacity;
+idx  = theta_idx * N_inner * noise_capacity + slot * N_inner + inner_idx;
+
+<span class="comment">/* Memory: N_θ=1024, N_inner=512, L=264 → ~550 MB (fits RTX 5080) */</span>
+<span class="comment">/* Without circular buffers: T=5000 → 42 GB (doesn't fit anything) */</span>
+    </div>
+  </div>
+
+  <div class="reveal">
+    <h3>Adaptive Proposals via Empirical Cholesky</h3>
+    <p>
+      The CPMMH proposal uses a <strong>95/5 mixture</strong>: 95% of the time, it draws from an adaptive multivariate Gaussian whose covariance is the empirical covariance of the current θ-particles (scaled by 2.38²/d, the optimal Haario-Bardenet factor), decomposed via Cholesky. The remaining 5% uses a fixed diagonal proposal to maintain ergodicity. This lets the proposal automatically discover and exploit correlations between parameters.
+    </p>
+  </div>
+</div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════
+     SECTION 8: RBPF INNER FILTER
+     ════════════════════════════════════════════════════════════════════ -->
+<section id="sec-rbpf">
+<div class="container">
+  <div class="reveal">
+    <div class="section-num">08 — The RBPF Inner Filter</div>
+    <h2>Rao-Blackwellization: Analytically Integrate What You Can</h2>
+    <p>
+      The inner filter doesn't sample h<sub>t</sub> directly. Since h<sub>t</sub> | z̃<sub>t</sub>, θ is conditionally linear-Gaussian (after the OCSN transformation), we can propagate <strong>Kalman sufficient statistics</strong> (μ<sub>h</sub>, V<sub>h</sub>) in closed form. Each inner particle only samples the nonlinear z̃<sub>t</sub> regime variable. This is the Rao-Blackwell trick: replacing sampling with exact computation wherever the model structure permits.
+    </p>
+  </div>
+
+  <div class="reveal">
+    <div class="math-block">
+<span class="comment">/* Per inner particle at each tick: */</span>
+
+<span class="comment">/* 1. Sample z̃ transition (the part we can't integrate) */</span>
+z̃<sub>t</sub> = ρ · z̃<sub>t-1</sub> + σ<sub>z</sub> · ε<sub>t</sub>
+
+<span class="comment">/* 2. Compute regime-dependent parameters */</span>
+φ = 1 - θ(z),  μ = μ(z),  σ<sub>h</sub> = σ<sub>h</sub>(z)
+
+<span class="comment">/* 3. Kalman PREDICT (the part we integrate analytically) */</span>
+μ<sub>h</sub><sup>-</sup> = φ · μ<sub>h</sub> + (1 - φ) · μ
+V<sub>h</sub><sup>-</sup> = φ² · V<sub>h</sub> + σ<sub>h</sub>²
+
+<span class="comment">/* 4. Kalman UPDATE with OCSN observation */</span>
+S     = V<sub>h</sub><sup>-</sup> + π²/2             <span class="comment">/* innovation variance (π²/2 ≈ 4.93 from log χ²) */</span>
+K     = V<sub>h</sub><sup>-</sup> / S                <span class="comment">/* Kalman gain */</span>
+innov = obs<sub>t</sub> - (μ<sub>h</sub><sup>-</sup> + 1.27)  <span class="comment">/* innovation (1.27 = E[log χ²(1)]) */</span>
+μ<sub>h</sub>   = μ<sub>h</sub><sup>-</sup> + K · innov
+V<sub>h</sub>   = (1 - K) · V<sub>h</sub><sup>-</sup>
+
+<span class="comment">/* 5. Log-weight = log-predictive (Gaussian) */</span>
+log w += -0.5 · (log(2π·S) + innov² / S)
+    </div>
+  </div>
+
+  <div class="reveal">
+    <div class="callout insight" data-label="Why This Matters">
+      <p>
+        Without Rao-Blackwellization, the inner filter would need to sample <em>both</em> z̃<sub>t</sub> and h<sub>t</sub>, doubling the state dimension and dramatically increasing variance. The Kalman update is exact given z̃&hairsp;—&hairsp;no sampling noise. This means the per-particle log-likelihood estimates fed to the outer SMC² layer and to CPMMH are <strong>much tighter</strong>, which directly translates to better outer weight estimates and higher CPMMH acceptance rates. The RBPF and CPMMH improvements are synergistic: each makes the other work better.
+      </p>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════
+     SECTION 9: GPU ARCHITECTURE
+     ════════════════════════════════════════════════════════════════════ -->
+<section id="sec-gpu">
+<div class="container">
+  <div class="reveal">
+    <div class="section-num">09 — GPU Implementation</div>
+    <h2>CUDA Architecture and Memory Layout</h2>
+    <p>
+      The entire algorithm runs on GPU with a <strong>Structure-of-Arrays (SoA)</strong> memory layout for coalesced access. The N<sub>θ</sub>&nbsp;×&nbsp;N<sub>inner</sub>&nbsp;=&nbsp;524,288 particles are organized so that the RBPF step launches N<sub>θ</sub> thread blocks of N<sub>inner</sub> threads each. Shared memory holds per-θ-particle data (parameters, reductions), while each thread manages one inner particle.
+    </p>
+  </div>
+
+  <div class="reveal">
+    <div class="math-block">
+<span class="comment">/* Thread mapping */</span>
+blockIdx.x  = theta_idx    <span class="comment">/* which parameter hypothesis */</span>
+threadIdx.x = inner_idx    <span class="comment">/* which inner particle */</span>
+
+<span class="comment">/* Shared memory per block */</span>
+__shared__ float s_rho, s_sigma_z, s_mu_base, s_sigma_base;
+__shared__ float s_log_max, s_sum_w, s_u0;  <span class="comment">/* for reductions */</span>
+
+<span class="comment">/* Thread 0 loads and derives physical params */</span>
+if (inner_idx == 0) {
+    float sigma_total = particles.sigma_total[theta_idx];
+    float r           = particles.r_split[theta_idx];
+    s_sigma_z    = r * sigma_total;                          <span class="comment">/* derived */</span>
+    s_sigma_base = √(max(1 - r², 10⁻⁶)) * sigma_total;     <span class="comment">/* derived */</span>
+}
+__syncthreads();
+    </div>
+  </div>
+
+  <div class="reveal">
+    <p>
+      Key CUDA kernels include: PCG32 random number generation, Acklam's ICDF for Gaussian sampling, the fused RBPF propagate-weight-resample kernel, outer ESS computation via block reductions, systematic resampling with prefix sums, and the fused CPMMH propose-replay-accept kernel. The CPMMH kernel is the most complex&hairsp;—&hairsp;it replays L=200 timesteps of the RBPF within a single kernel launch, using the circular noise buffer to reconstruct correlated trajectories.
+    </p>
+  </div>
+</div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════
+     SECTION 10: SUMMARY
+     ════════════════════════════════════════════════════════════════════ -->
+<section id="sec-summary">
+<div class="container">
+  <div class="reveal">
+    <div class="section-num">10 — Summary</div>
+    <h2>What Makes This Approach Novel</h2>
+
+    <p>
+      The contribution is not any single component but their <strong>specific combination and the engineering required to make them work together on GPU in real time</strong>. Let's be precise about what's standard and what's new.
+    </p>
+
+    <h3>Known components, novel assembly</h3>
+    <p>
+      SMC² was proposed by Chopin, Jacob, and Papaspiliopoulos (2013). CPMMH was introduced by Deligiannidis, Doucet, and Pitt (2018). Rao-Blackwellized particle filters have a long history in the tracking literature. Each of these is well-understood individually. What's new here is: using RBPF as the inner filter of SMC² (rather than a standard bootstrap PF); using CPMMH for rejuvenation (rather than standard PMMH); the synergy between RBPF's tighter likelihood estimates and CPMMH's noise-sensitive acceptance criterion; the fixed-lag circular buffer architecture that makes this tractable for streaming data; and the entire system running on GPU with half a million particles updated per tick.
+    </p>
+
+    <h3>The (σ<sub>total</sub>, r) reparameterization</h3>
+    <p>
+      Reparameterization for MCMC efficiency is a well-known technique (centering, non-centering, etc.). The specific (σ<sub>total</sub>, r) polar decomposition for vol-of-vol identification ridges in the context of CPMMH proposals appears to be novel. It's a simple idea&hairsp;—&hairsp;rotate coordinates to align with the likelihood geometry&hairsp;—&hairsp;but identifying <em>which</em> rotation matters, and verifying that it actually improves acceptance rates from ~10% to ~35%, required building and testing the full system.
+    </p>
+
+    <h3>Practical outcome</h3>
+    <p>
+      The system learns four stochastic volatility parameters online from streaming market data, processing each observation in under 1 ms on an RTX 5080, maintaining full posterior distributions (not point estimates) over parameters, and automatically adapting to regime changes as they happen. The reparameterization roughly doubles the effective use of each CPMMH move, which translates directly to better parameter estimates given the same computational budget.
+    </p>
+  </div>
+</div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════ -->
+<footer style="padding:4rem 0; text-align:center; border-top:1px solid var(--border);">
+  <div class="container">
+    <p style="font-family:var(--mono); font-size:0.7rem; color:var(--text-dim); letter-spacing:0.1em;">
+      SMC² + RBPF + CPMMH WITH (σ<sub>TOTAL</sub>, r) REPARAMETERIZATION — CUDA IMPLEMENTATION
+    </p>
+  </div>
+</footer>
+
+<!-- ════════════════════════════════════════════════════════════════════
+     SCRIPTS
+     ════════════════════════════════════════════════════════════════════ -->
+<script>
+// ── Scroll reveal ──
+const revealEls = document.querySelectorAll('.reveal');
+const archLayers = document.querySelectorAll('.arch-layer');
+
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(e => {
+    if (e.isIntersecting) {
+      e.target.classList.add('visible');
+    }
+  });
+}, { threshold: 0.15, rootMargin: '0px 0px -50px 0px' });
+
+revealEls.forEach(el => observer.observe(el));
+archLayers.forEach((el, i) => {
+  el.style.transitionDelay = `${i * 0.12}s`;
+  observer.observe(el);
+});
+
+// ── TOC dots ──
+const sections = document.querySelectorAll('section[id]');
+const toc = document.getElementById('toc');
+sections.forEach(sec => {
+  const a = document.createElement('a');
+  a.href = '#' + sec.id;
+  toc.appendChild(a);
+});
+
+function updateTOC() {
+  const scrollY = window.scrollY + window.innerHeight / 2;
+  const tocLinks = toc.querySelectorAll('a');
+  let activeIdx = 0;
+  sections.forEach((sec, i) => {
+    if (scrollY >= sec.offsetTop) activeIdx = i;
+  });
+  tocLinks.forEach((a, i) => a.classList.toggle('active', i === activeIdx));
+}
+window.addEventListener('scroll', updateTOC, { passive: true });
+updateTOC();
+
+// ── Ridge / Reparameterization Canvas ──
+function drawRidge() {
+  const canvas = document.getElementById('ridgeCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  // Draw likelihood contours in (σ_z, σ_base) space
+  const cx = W * 0.5, cy = H * 0.5;
+  const scaleX = W * 0.35, scaleY = H * 0.35;
+
+  // Elliptical contours (tilted to show ridge)
+  const angle = -Math.PI / 4; // ridge along σ_z + σ_base = const
+  const levels = [0.15, 0.3, 0.5, 0.7, 0.9];
+  const colors = ['rgba(79,195,247,0.08)', 'rgba(79,195,247,0.12)', 'rgba(79,195,247,0.18)', 'rgba(79,195,247,0.25)', 'rgba(79,195,247,0.35)'];
+
+  levels.forEach((lev, i) => {
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(angle);
+    ctx.beginPath();
+    ctx.ellipse(0, 0, scaleX * lev * 2.8, scaleY * lev * 0.35, 0, 0, Math.PI * 2);
+    ctx.fillStyle = colors[i];
+    ctx.fill();
+    ctx.restore();
+  });
+
+  // Ridge line
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(angle);
+  ctx.beginPath();
+  ctx.moveTo(-scaleX * 1.2, 0);
+  ctx.lineTo(scaleX * 1.2, 0);
+  ctx.strokeStyle = 'rgba(79,195,247,0.4)';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  ctx.stroke();
+  ctx.restore();
+
+  // Axes
+  ctx.strokeStyle = 'rgba(200,214,229,0.15)';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.moveTo(40, H - 30);
+  ctx.lineTo(W - 20, H - 30);
+  ctx.moveTo(40, H - 30);
+  ctx.lineTo(40, 20);
+  ctx.stroke();
+
+  // Labels
+  ctx.font = '12px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(200,214,229,0.5)';
+  ctx.fillText('σ_z →', W - 70, H - 12);
+  ctx.save();
+  ctx.translate(15, 80);
+  ctx.rotate(-Math.PI / 2);
+  ctx.fillText('σ_base →', 0, 0);
+  ctx.restore();
+
+  // Ridge annotation
+  ctx.fillStyle = 'rgba(79,195,247,0.6)';
+  ctx.font = '11px IBM Plex Mono';
+  ctx.fillText('σ_z² + σ_base² ≈ const', cx + 60, cy - 80);
+  ctx.fillText('(identification ridge)', cx + 60, cy - 65);
+
+  // Truth point
+  const truthX = cx + 15, truthY = cy - 10;
+  ctx.beginPath();
+  ctx.arc(truthX, truthY, 4, 0, Math.PI * 2);
+  ctx.fillStyle = '#ff6b9d';
+  ctx.fill();
+  ctx.fillStyle = '#ff6b9d';
+  ctx.font = '11px IBM Plex Mono';
+  ctx.fillText('truth', truthX + 10, truthY + 4);
+
+  // Draw some rejected proposals
+  const proposals = [
+    [30, 25], [-20, 30], [15, 20], [-25, -15], [30, -10]
+  ];
+  proposals.forEach(([dx, dy]) => {
+    const px = truthX + dx, py = truthY + dy;
+    ctx.beginPath();
+    ctx.moveTo(truthX, truthY);
+    ctx.lineTo(px, py);
+    ctx.strokeStyle = 'rgba(255,107,157,0.3)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(px, py, 2.5, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,107,157,0.5)';
+    ctx.fill();
+
+    // X mark
+    ctx.strokeStyle = 'rgba(255,107,157,0.6)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(px - 4, py - 4);
+    ctx.lineTo(px + 4, py + 4);
+    ctx.moveTo(px + 4, py - 4);
+    ctx.lineTo(px - 4, py + 4);
+    ctx.stroke();
+  });
+
+  // One accepted (along ridge)
+  const ax = truthX - 30, ay = truthY + 30;
+  ctx.beginPath();
+  ctx.moveTo(truthX, truthY);
+  ctx.lineTo(ax, ay);
+  ctx.strokeStyle = 'rgba(52,211,153,0.5)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(ax, ay, 3, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(52,211,153,0.7)';
+  ctx.fill();
+  ctx.fillStyle = 'rgba(52,211,153,0.7)';
+  ctx.font = '10px IBM Plex Mono';
+  ctx.fillText('✓ along ridge', ax + 8, ay + 3);
+}
+
+function drawReparam() {
+  const canvas = document.getElementById('reparamCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  const midX = W / 2;
+
+  // LEFT: (σ_z, σ_base) — bad
+  const lx = midX * 0.5, ly = H * 0.5;
+  ctx.font = '11px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(255,107,157,0.7)';
+  ctx.textAlign = 'center';
+  ctx.fillText('BEFORE: (σ_z, σ_base)', lx, 25);
+
+  // Ridge ellipse
+  ctx.save();
+  ctx.translate(lx, ly);
+  ctx.rotate(-Math.PI / 4);
+  ctx.beginPath();
+  ctx.ellipse(0, 0, 100, 18, 0, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(255,107,157,0.08)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,107,157,0.2)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.restore();
+
+  // Grid-aligned proposals (mostly rejected)
+  const badProposals = [
+    [25, 0], [-20, 0], [0, 25], [0, -20], [20, 15], [-15, 20]
+  ];
+  badProposals.forEach(([dx, dy]) => {
+    ctx.beginPath();
+    ctx.moveTo(lx, ly);
+    ctx.lineTo(lx + dx, ly + dy);
+    ctx.strokeStyle = 'rgba(255,107,157,0.25)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.arc(lx + dx, ly + dy, 2, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,107,157,0.5)';
+    ctx.fill();
+  });
+
+  // Center
+  ctx.beginPath();
+  ctx.arc(lx, ly, 4, 0, Math.PI * 2);
+  ctx.fillStyle = '#c8d6e5';
+  ctx.fill();
+
+  // Axes
+  ctx.strokeStyle = 'rgba(200,214,229,0.15)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(lx - 90, ly);
+  ctx.lineTo(lx + 90, ly);
+  ctx.moveTo(lx, ly + 90);
+  ctx.lineTo(lx, ly - 90);
+  ctx.stroke();
+
+  ctx.fillStyle = 'rgba(200,214,229,0.3)';
+  ctx.textAlign = 'left';
+  ctx.fillText('σ_z', lx + 75, ly - 8);
+  ctx.fillText('σ_base', lx + 8, ly - 78);
+
+  // Rejection label
+  ctx.fillStyle = 'rgba(255,107,157,0.5)';
+  ctx.textAlign = 'center';
+  ctx.fillText('~85% rejected', lx, ly + 110);
+
+  // Divider
+  ctx.strokeStyle = 'rgba(200,214,229,0.1)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(midX, 40);
+  ctx.lineTo(midX, H - 20);
+  ctx.stroke();
+
+  // RIGHT: (σ_total, r) — good
+  const rx = midX + midX * 0.5, ry = H * 0.5;
+  ctx.fillStyle = 'rgba(52,211,153,0.7)';
+  ctx.textAlign = 'center';
+  ctx.fillText('AFTER: (σ_total, r)', rx, 25);
+
+  // Axis-aligned ellipse (wider in r direction)
+  ctx.beginPath();
+  ctx.ellipse(rx, ry, 90, 20, 0, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(52,211,153,0.08)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(52,211,153,0.2)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // Aligned proposals
+  const goodProposals = [
+    [30, 0], [-25, 0], [40, 0], [-40, 0], [20, 8], [-30, -5], [0, 10], [0, -12]
+  ];
+  goodProposals.forEach(([dx, dy]) => {
+    const inRidge = Math.abs(dy) < 15;
+    ctx.beginPath();
+    ctx.moveTo(rx, ry);
+    ctx.lineTo(rx + dx, ry + dy);
+    ctx.strokeStyle = inRidge ? 'rgba(52,211,153,0.35)' : 'rgba(255,107,157,0.25)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    ctx.arc(rx + dx, ry + dy, 2, 0, Math.PI * 2);
+    ctx.fillStyle = inRidge ? 'rgba(52,211,153,0.7)' : 'rgba(255,107,157,0.5)';
+    ctx.fill();
+  });
+
+  // Center
+  ctx.beginPath();
+  ctx.arc(rx, ry, 4, 0, Math.PI * 2);
+  ctx.fillStyle = '#c8d6e5';
+  ctx.fill();
+
+  // Axes
+  ctx.strokeStyle = 'rgba(200,214,229,0.15)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(rx - 90, ry);
+  ctx.lineTo(rx + 90, ry);
+  ctx.moveTo(rx, ry + 90);
+  ctx.lineTo(rx, ry - 90);
+  ctx.stroke();
+
+  ctx.fillStyle = 'rgba(200,214,229,0.3)';
+  ctx.textAlign = 'left';
+  ctx.fillText('r', rx + 80, ry - 8);
+  ctx.fillText('σ_total', rx + 8, ry - 78);
+
+  // Annotations
+  ctx.font = '10px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(52,211,153,0.5)';
+  ctx.textAlign = 'right';
+  ctx.fillText('← free (data doesn\'t care)', rx + 100, ry + 35);
+  ctx.textAlign = 'left';
+  ctx.fillStyle = 'rgba(79,195,247,0.5)';
+  ctx.fillText('↑ constrained', rx + 8, ry - 55);
+
+  ctx.fillStyle = 'rgba(52,211,153,0.5)';
+  ctx.textAlign = 'center';
+  ctx.fillText('~65% accepted', rx, ry + 110);
+}
+
+drawRidge();
+drawReparam();
+
+// Redraw on resize
+window.addEventListener('resize', () => {
+  drawRidge();
+  drawReparam();
+});
+</script>
+</body>
+</html>
