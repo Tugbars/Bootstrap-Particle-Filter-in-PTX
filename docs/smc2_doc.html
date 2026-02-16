@@ -702,34 +702,71 @@ code {
     <div class="section-num">02 — The Generative Model</div>
     <h2>Regime-Switching Stochastic Volatility</h2>
     <p>
-      The model uses a transformed latent regime variable <strong>z̃<sub>t</sub></strong> that drives nonlinear curves for the mean, variance, and mean-reversion speed of log-volatility. This creates rich regime-switching dynamics from a single latent AR(1) process.
+      The model captures a fundamental reality of financial markets: volatility is not constant, and it is not even a single-regime process. Markets alternate between calm periods of low, stable volatility and turbulent periods of high, erratic volatility. The transitions between these regimes are themselves stochastic and gradual — not abrupt switches but smooth drifts driven by a hidden state variable.
     </p>
   </div>
 
   <div class="reveal">
-    <div class="math-block">
-<span class="comment">Latent regime dynamics</span>
-<span class="var">z̃<sub>t</sub></span> = <span class="var">ρ</span> · z̃<sub>t-1</sub> + <span class="var">σ<sub>z</sub></span> · ε<sub>t</sub>           ε<sub>t</sub> ~ N(0, 1)
-z<sub>t</sub>  = 1.5 · (1 + tanh(z̃<sub>t</sub>))          <span class="comment">squash to [0, 3]</span>
-
-<span class="comment">Regime-dependent curves (parameterized by z)</span>
-<span class="var2">μ</span>(z) = <span class="var2">μ_base</span> + μ_scale · (1 − e<sup>−μ_rate · z</sup>)
-<span class="var2">σ<sub>h</sub></span>(z) = <span class="var2">σ_base</span> + σ_scale · (1 − e<sup>−σ_rate · z</sup>)
-θ(z) = θ_base + θ_scale · (1 − e<sup>−θ_rate · z</sup>)
-
-<span class="comment">Log-volatility transition</span>
-h<sub>t</sub> = (1 − θ(z)) · h<sub>t-1</sub> + θ(z) · μ(z) + σ<sub>h</sub>(z) · η<sub>t</sub>     η<sub>t</sub> ~ N(0, 1)
-
-<span class="comment">Observation (OCSN linearization via log y²)</span>
-y<sub>t</sub> = e<sup>h<sub>t</sub>/2</sup> · ν<sub>t</sub>                      ν<sub>t</sub> ~ N(0, 1)
-obs<sub>t</sub> = log(y<sub>t</sub>²) ≈ h<sub>t</sub> + log(χ²(1))     <span class="comment">linearizes the observation</span>
+    <div class="diagram-wrap">
+      <div class="diagram-title">Generative model signal flow — from latent regime to observed returns</div>
+      <div class="diagram-body">
+        <canvas id="modelFlowCanvas" class="ridge-canvas" width="620" height="420"></canvas>
+      </div>
     </div>
   </div>
 
   <div class="reveal">
+    <h3>The latent regime variable z̃</h3>
     <p>
-      The <strong>four learned parameters</strong> are θ&nbsp;=&nbsp;(ρ,&nbsp;σ<sub>z</sub>,&nbsp;μ<sub>base</sub>,&nbsp;σ<sub>base</sub>), while the curve shapes (scale, rate terms) and the θ(z) speed curve are fixed offline. The log-squared transform converts the nonlinear observation model into an approximately linear-Gaussian one, enabling Kalman-like sufficient statistics inside the inner filter&hairsp;—&hairsp;this is the <em>OCSN</em> (Omori-Chib-Shephard-Nakajima) linearization.
+      At the deepest level sits a latent regime variable z̃<sub>t</sub> that follows a simple first-order autoregressive (AR(1)) process. At each tick, the previous z̃ is scaled by the persistence parameter <strong>ρ</strong> and perturbed by Gaussian noise scaled by <strong>σ<sub>z</sub></strong>. When ρ is high (say 0.95–0.98), the regime variable moves slowly, meaning the market stays in one volatility regime for extended periods before drifting into another. When σ<sub>z</sub> is larger, the transitions between regimes are more abrupt and frequent.
     </p>
+    <p>
+      The raw z̃ lives on the real line, but the model needs a bounded regime indicator. A tanh squashing function maps z̃ into the interval [0, 3]. Values near 0 correspond to calm, low-volatility regimes; values near 3 correspond to turbulent, high-volatility regimes. The intermediate range captures the gradual transition zone. This smooth mapping is crucial — it means the regime isn't a discrete switch but a continuous spectrum, which better reflects how real markets behave.
+    </p>
+  </div>
+
+  <div class="reveal">
+    <h3>Regime-dependent curves</h3>
+    <p>
+      The regime value z doesn't affect log-volatility directly. Instead, it modulates three curves that together control the dynamics of h<sub>t</sub>. Each curve has the same saturating exponential shape: base + scale · (1 − e<sup>−rate·z</sup>). At z = 0 (calm regime), each curve equals its base value. As z increases toward 3 (turbulent regime), each curve saturates toward base + scale.
+    </p>
+    <p>
+      The <strong>mean curve μ(z)</strong> determines where log-volatility is attracted to. In the calm regime, μ might be around −1 (low volatility). In the turbulent regime, μ shifts up to perhaps +1 or +2 (high volatility). This is the mechanism by which regime transitions actually change the level of volatility.
+    </p>
+    <p>
+      The <strong>volatility-of-volatility curve σ<sub>h</sub>(z)</strong> determines how noisy the h<sub>t</sub> dynamics are. In calm regimes, σ<sub>h</sub> is small — volatility is stable and predictable. In turbulent regimes, σ<sub>h</sub> is larger — volatility itself becomes volatile, leading to the wild swings observed during market crises.
+    </p>
+    <p>
+      The <strong>mean-reversion speed curve θ(z)</strong> determines how quickly h<sub>t</sub> snaps back to its local mean. In calm regimes, mean-reversion is slow — vol drifts gently. In turbulent regimes, mean-reversion can be faster — spikes in vol are pulled back more aggressively, though the target they revert to is itself higher.
+    </p>
+    <p>
+      The base values of the μ and σ<sub>h</sub> curves — <strong>μ<sub>base</sub></strong> and <strong>σ<sub>base</sub></strong> — are learned parameters. The scale and rate terms for all three curves, plus the entire θ(z) speed curve, are fixed offline. This division is deliberate: the base levels have the strongest influence on the observable data and are worth spending computational budget to learn online, while the curve shapes are stable enough to calibrate once from historical data.
+    </p>
+  </div>
+
+  <div class="reveal">
+    <h3>The log-volatility transition</h3>
+    <p>
+      Given the three curves evaluated at the current regime z, log-volatility h<sub>t</sub> follows a conditional Gaussian transition. The previous h is pulled toward the local mean μ(z) by the speed θ(z), and fresh noise enters scaled by σ<sub>h</sub>(z). Written out, h<sub>t</sub> = (1 − θ) · h<sub>t-1</sub> + θ · μ(z) + σ<sub>h</sub>(z) · η<sub>t</sub>, where η is standard Gaussian. This is a local-level model whose parameters vary smoothly with the regime — a conditionally linear-Gaussian structure that the RBPF inner filter exploits for analytical tractability.
+    </p>
+  </div>
+
+  <div class="reveal">
+    <h3>From log-volatility to observed returns</h3>
+    <p>
+      The observed return y<sub>t</sub> is simply a standard Gaussian scaled by the instantaneous volatility: y<sub>t</sub> = e<sup>h<sub>t</sub>/2</sup> · ν<sub>t</sub>. This is the classical stochastic volatility observation equation. The exponential link makes the observation model nonlinear in h — you can't directly apply Kalman filtering to learn h from y.
+    </p>
+    <p>
+      The <strong>OCSN linearization</strong> (Omori, Chib, Shephard, Nakajima) resolves this by working with log(y<sub>t</sub>²) instead of y<sub>t</sub> directly. Squaring the return eliminates the sign, and taking the log yields log(y<sub>t</sub>²) = h<sub>t</sub> + log(ν<sub>t</sub>²). Since ν<sub>t</sub> is standard Gaussian, ν<sub>t</sub>² is χ²(1), and log(χ²(1)) has a known distribution with mean approximately −1.27 and variance approximately π²/2 ≈ 4.93. The observation is now <em>linear</em> in h<sub>t</sub> with additive noise of known moments. This is what enables the Kalman sufficient statistics inside the RBPF: given z̃, the entire h dynamics plus the linearized observation form a conditionally Gaussian state-space model that the Kalman filter handles exactly.
+    </p>
+  </div>
+
+  <div class="reveal">
+    <div class="callout insight" data-label="The Four Learned Parameters">
+      <p>
+        The algorithm learns θ = (ρ, σ<sub>z</sub>, μ<sub>base</sub>, σ<sub>base</sub>) — or more precisely, their reparameterized equivalents (ρ, σ<sub>total</sub>, μ<sub>base</sub>, r). The persistence ρ controls how long regimes last. The innovation scale σ<sub>z</sub> controls how quickly the market transitions between regimes. The base mean μ<sub>base</sub> anchors the overall volatility level. And σ<sub>base</sub> controls the baseline noise in log-volatility dynamics. Together these four parameters, combined with the fixed curve shapes, fully specify the joint dynamics of regimes, volatility, and returns.
+      </p>
+    </div>
   </div>
 </div>
 </section>
@@ -1109,12 +1146,117 @@ obs<sub>t</sub> = log(y<sub>t</sub>²) ≈ h<sub>t</sub> + log(χ²(1))     <spa
 </section>
 
 <!-- ════════════════════════════════════════════════════════════════════
-     SECTION 9: GPU ARCHITECTURE
+     SECTION 9: BPF vs RBPF — WHY σ_z NEEDS RAO-BLACKWELLIZATION
+     ════════════════════════════════════════════════════════════════════ -->
+<section id="sec-bpf-vs-rbpf">
+<div class="container">
+  <div class="reveal">
+    <div class="section-num">09 — BPF vs RBPF</div>
+    <h2>Why a Bootstrap Inner Filter Cannot Learn σ<sub>z</sub></h2>
+    <p>
+      This is perhaps the most subtle and important point in the entire architecture. It explains why the choice of inner filter isn't just an optimization — it determines whether the outer SMC² layer can identify certain parameters at all. Specifically, a standard Bootstrap Particle Filter (BPF) as the inner filter produces likelihood estimates too noisy to distinguish between different values of σ<sub>z</sub>. The Rao-Blackwellized filter fixes this by eliminating an entire dimension of sampling noise.
+    </p>
+  </div>
+
+  <div class="reveal">
+    <h3>The signal chain from σ<sub>z</sub> to the observation</h3>
+    <p>
+      To understand the problem, trace how σ<sub>z</sub> influences the data. σ<sub>z</sub> is the innovation scale of the latent regime process z̃. It controls how quickly and how far z̃ moves between ticks. A larger σ<sub>z</sub> means more volatile regime transitions — the market flips between calm and turbulent states more rapidly. A smaller σ<sub>z</sub> means smoother, slower transitions.
+    </p>
+    <p>
+      But σ<sub>z</sub> doesn't touch the observation directly. Its influence passes through <em>four layers of indirection</em>. First, σ<sub>z</sub> scales the noise that drives z̃. Then z̃ is squashed through tanh to produce z. Then z modulates the three regime curves μ(z), σ<sub>h</sub>(z), θ(z). Then these curves determine how h<sub>t</sub> evolves. And finally, h<sub>t</sub> determines the variance of the observed return y<sub>t</sub>. Each layer dilutes the signal. By the time σ<sub>z</sub>'s influence reaches y<sub>t</sub>, it's a faint signature buried in the dynamics of everything else.
+    </p>
+  </div>
+
+  <div class="reveal">
+    <div class="diagram-wrap">
+      <div class="diagram-title">Signal attenuation — how σ<sub>z</sub> reaches the observation through four layers</div>
+      <div class="diagram-body">
+        <canvas id="signalChainCanvas" class="ridge-canvas" width="620" height="180"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <div class="reveal">
+    <h3>What the BPF does wrong</h3>
+    <p>
+      A standard Bootstrap Particle Filter samples <em>both</em> latent variables at every tick: it draws a z̃<sub>t</sub> from the regime transition, and it draws an h<sub>t</sub> from the log-volatility transition. Each inner particle carries a concrete sampled pair (z̃, h). The particle's weight is then computed by evaluating how well the sampled h explains the observation y<sub>t</sub> through the OCSN likelihood.
+    </p>
+    <p>
+      The problem is that sampling h introduces <strong>enormous variance</strong> into the per-particle weights. The h transition depends on three regime curves evaluated at the sampled z, plus its own Gaussian noise η<sub>t</sub>. A particle that happens to draw an h close to the true value gets a high weight; a particle that draws an h far away gets a low weight. But whether a particle gets lucky or unlucky in its h sample has <em>nothing to do with the quality of θ</em> — it's pure Monte Carlo noise.
+    </p>
+    <p>
+      Now consider what the outer SMC² layer sees. It scores each θ-particle by the <strong>log-marginal-likelihood</strong>: the log of the average inner particle weight. If those weights have high variance due to noisy h samples, the log-marginal-likelihood estimate is itself noisy. Two θ-particles with σ<sub>z</sub> = 0.05 and σ<sub>z</sub> = 0.10 produce <em>indistinguishable</em> outer scores — not because they're equally good, but because the sampling noise in each score overwhelms the genuine difference between them. The outer layer cannot tell them apart.
+    </p>
+  </div>
+
+  <div class="reveal">
+    <div class="diagram-wrap">
+      <div class="diagram-title">Animated: BPF inner particles — sampling both z̃ and h</div>
+      <div class="diagram-body">
+        <canvas id="bpfAnimCanvas" class="ridge-canvas" width="600" height="320"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <div class="reveal">
+    <h3>What the RBPF does differently</h3>
+    <p>
+      The Rao-Blackwellized filter exploits a structural property of the model: <strong>given z̃, h is conditionally linear-Gaussian</strong>. This means that instead of sampling h, we can compute its conditional distribution <em>exactly</em> using a Kalman filter. Each RBPF particle samples only z̃ and carries Kalman sufficient statistics (μ<sub>h</sub>, V<sub>h</sub>) that represent the exact posterior distribution of h given all observations and the sampled z̃ trajectory.
+    </p>
+    <p>
+      The particle weight in the RBPF is the <strong>exact conditional likelihood</strong> p(y<sub>t</sub> | z̃<sub>t</sub>, θ), integrated analytically over all possible values of h. This is a single number computed from the Kalman innovation and innovation variance — no sampling involved. Contrast this with the BPF weight, which is p(y<sub>t</sub> | z̃<sub>t</sub>, h<sub>t</sub>, θ) evaluated at one randomly drawn h. The RBPF weight has strictly lower variance because it integrates out the randomness that the BPF samples.
+    </p>
+    <p>
+      This is the <strong>Rao-Blackwell theorem</strong> in action: for any quantity you want to estimate, the variance of the conditional expectation is always less than or equal to the variance of the full joint sample. Here, the "quantity" is the per-particle likelihood contribution, and the "conditioning" is on z̃. By computing E[p(y|z̃, h, θ) | z̃, θ] analytically instead of sampling one h, we strictly reduce variance. In practice, the reduction is not just marginal — it's often <strong>orders of magnitude</strong>, because the h dimension is where most of the sampling noise lives.
+    </p>
+  </div>
+
+  <div class="reveal">
+    <div class="diagram-wrap">
+      <div class="diagram-title">Animated: RBPF inner particles — sampling z̃ only, h integrated analytically</div>
+      <div class="diagram-body">
+        <canvas id="rbpfAnimCanvas" class="ridge-canvas" width="600" height="320"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <div class="reveal">
+    <h3>The consequence for σ<sub>z</sub> identification</h3>
+    <p>
+      With the RBPF's tight likelihood estimates, the outer SMC² layer can finally detect σ<sub>z</sub>'s faint signal. When the outer layer compares θ-particles with σ<sub>z</sub> = 0.05 vs σ<sub>z</sub> = 0.10, the difference in their log-marginal-likelihoods is small but <em>consistent</em>. Over hundreds of observations, these small differences accumulate and the outer weights diverge — the correct σ<sub>z</sub> wins. With BPF inner weights, the same small genuine differences are drowned by the large random fluctuations from h sampling, and the accumulation never overcomes the noise.
+    </p>
+    <p>
+      This also explains why CPMMH acceptance rates improve with the RBPF. During rejuvenation, CPMMH compares the log-likelihood under the current θ with the log-likelihood under a proposed θ*. If both estimates have high variance (BPF), the ratio is dominated by noise — you accept or reject based on luck, not quality. If both estimates are tight (RBPF), the ratio genuinely reflects whether θ* is better or worse. The RBPF doesn't just make inner filtering better; it makes the entire outer learning loop more efficient because every comparison, every weight update, and every MH decision is made with better information.
+    </p>
+  </div>
+
+  <div class="reveal">
+    <div class="diagram-wrap">
+      <div class="diagram-title">Animated: outer log-likelihood estimates — BPF (noisy) vs RBPF (tight)</div>
+      <div class="diagram-body">
+        <canvas id="likelihoodCompareCanvas" class="ridge-canvas" width="600" height="280"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <div class="reveal">
+    <div class="callout insight" data-label="The Core Argument">
+      <p>
+        The choice of inner filter is not an optimization detail — it's a <strong>statistical identifiability</strong> question. Parameters like σ<sub>z</sub> that influence the observation through multiple layers of latent structure imprint only a faint signature on the data. Detecting that signature requires likelihood estimates precise enough to resolve it. The BPF's joint (z̃, h) sampling introduces noise that exceeds the signal, making σ<sub>z</sub> effectively unidentifiable. The RBPF's analytical integration of h eliminates this noise floor, bringing the signal above the detection threshold. The Rao-Blackwellization doesn't change what information the data contains about σ<sub>z</sub> — it changes whether the algorithm can <em>extract</em> that information.
+      </p>
+    </div>
+  </div>
+</div>
+</section>
+
+<!-- ════════════════════════════════════════════════════════════════════
+     SECTION 10: GPU ARCHITECTURE
      ════════════════════════════════════════════════════════════════════ -->
 <section id="sec-gpu">
 <div class="container">
   <div class="reveal">
-    <div class="section-num">09 — GPU Implementation</div>
+    <div class="section-num">10 — GPU Implementation</div>
     <h2>CUDA Architecture and Memory Layout</h2>
     <p>
       The entire algorithm runs on GPU with a <strong>Structure-of-Arrays (SoA)</strong> memory layout for coalesced access. The N<sub>θ</sub>&nbsp;×&nbsp;N<sub>inner</sub>&nbsp;=&nbsp;524,288 particles are organized so that the RBPF step launches N<sub>θ</sub> thread blocks of N<sub>inner</sub> threads each. Shared memory holds per-θ-particle data (parameters, reductions), while each thread manages one inner particle.
@@ -1153,7 +1295,7 @@ obs<sub>t</sub> = log(y<sub>t</sub>²) ≈ h<sub>t</sub> + log(χ²(1))     <spa
 <section id="sec-conclusion">
 <div class="container">
   <div class="reveal">
-    <div class="section-num">10 — Conclusion</div>
+    <div class="section-num">11 — Conclusion</div>
     <h2>Convergence, Sequence Length, and Practical Lessons</h2>
 
     <p>
@@ -1198,6 +1340,23 @@ obs<sub>t</sub> = log(y<sub>t</sub>²) ≈ h<sub>t</sub> + log(χ²(1))     <spa
      SCRIPTS
      ════════════════════════════════════════════════════════════════════ -->
 <script>
+// roundRect polyfill
+if (!CanvasRenderingContext2D.prototype.roundRect) {
+  CanvasRenderingContext2D.prototype.roundRect = function(x, y, w, h, r) {
+    if (typeof r === 'number') r = [r, r, r, r];
+    this.moveTo(x + r[0], y);
+    this.lineTo(x + w - r[1], y);
+    this.quadraticCurveTo(x + w, y, x + w, y + r[1]);
+    this.lineTo(x + w, y + h - r[2]);
+    this.quadraticCurveTo(x + w, y + h, x + w - r[2], y + h);
+    this.lineTo(x + r[3], y + h);
+    this.quadraticCurveTo(x, y + h, x, y + h - r[3]);
+    this.lineTo(x, y + r[0]);
+    this.quadraticCurveTo(x, y, x + r[0], y);
+    this.closePath();
+  };
+}
+
 // ── Scroll reveal ──
 const revealEls = document.querySelectorAll('.reveal');
 const archLayers = document.querySelectorAll('.arch-layer');
@@ -1514,6 +1673,152 @@ function drawReparam() {
 
 drawRidge();
 drawReparam();
+
+// ── Model Signal Flow Visualization ──
+function drawModelFlow() {
+  const canvas = document.getElementById('modelFlowCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  // Layout: 4 layers flowing top to bottom with side annotations
+  const layers = [
+    { label: 'z̃ₜ', name: 'Latent Regime', desc: 'AR(1) process', color: 'rgba(79,195,247,', y: 40, params: 'ρ, σ_z' },
+    { label: 'z → curves', name: 'Regime Curves', desc: 'μ(z), σ_h(z), θ(z)', color: 'rgba(167,139,250,', y: 140, params: 'μ_base, σ_base' },
+    { label: 'hₜ', name: 'Log-Volatility', desc: 'Conditional Gaussian', color: 'rgba(255,107,157,', y: 240, params: '' },
+    { label: 'yₜ', name: 'Observed Returns', desc: 'via OCSN linearization', color: 'rgba(251,191,36,', y: 340, params: '' },
+  ];
+
+  const boxW = 220, boxH = 60;
+  const boxX = 70;
+
+  layers.forEach((layer, i) => {
+    const x = boxX, y = layer.y;
+
+    // Main box
+    ctx.beginPath();
+    ctx.roundRect(x, y, boxW, boxH, 5);
+    ctx.fillStyle = layer.color + '0.07)';
+    ctx.fill();
+    ctx.strokeStyle = layer.color + '0.35)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // Big symbol on left
+    ctx.font = '600 18px IBM Plex Mono';
+    ctx.fillStyle = layer.color + '0.85)';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(layer.label, x + 14, y + boxH / 2 - 2);
+
+    // Name + description on right of symbol
+    const textX = x + 90;
+    ctx.font = '600 12px IBM Plex Mono';
+    ctx.fillStyle = layer.color + '0.8)';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText(layer.name, textX, y + 24);
+
+    ctx.font = '10px IBM Plex Mono';
+    ctx.fillStyle = layer.color + '0.45)';
+    ctx.fillText(layer.desc, textX, y + 42);
+
+    // Learned parameters badge (right side)
+    if (layer.params) {
+      const badgeX = x + boxW + 20;
+      const badgeY = y + boxH / 2 - 12;
+
+      ctx.strokeStyle = layer.color + '0.25)';
+      ctx.fillStyle = layer.color + '0.04)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      ctx.roundRect(badgeX, badgeY, 120, 24, 3);
+      ctx.fill();
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      ctx.font = '9px IBM Plex Mono';
+      ctx.fillStyle = layer.color + '0.6)';
+      ctx.textAlign = 'left';
+      ctx.fillText('learned: ' + layer.params, badgeX + 8, badgeY + 15);
+    }
+
+    // Connector to next layer
+    if (i < layers.length - 1) {
+      const ny = layers[i + 1].y;
+      const midX = x + boxW / 2;
+
+      // Arrow shaft
+      ctx.beginPath();
+      ctx.moveTo(midX, y + boxH);
+      ctx.lineTo(midX, ny);
+      ctx.strokeStyle = 'rgba(200,214,229,0.15)';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([]);
+      ctx.stroke();
+
+      // Arrowhead
+      ctx.beginPath();
+      ctx.moveTo(midX - 5, ny - 6);
+      ctx.lineTo(midX, ny);
+      ctx.lineTo(midX + 5, ny - 6);
+      ctx.strokeStyle = 'rgba(200,214,229,0.3)';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+
+      // Midpoint annotation
+      const midY = (y + boxH + ny) / 2;
+      ctx.font = '9px IBM Plex Mono';
+      ctx.fillStyle = 'rgba(200,214,229,0.25)';
+      ctx.textAlign = 'left';
+      if (i === 0) {
+        ctx.fillText('tanh squash → z ∈ [0, 3]', midX + 12, midY + 2);
+      } else if (i === 1) {
+        ctx.fillText('μ, σ_h, θ modulate h dynamics', midX + 12, midY + 2);
+      } else if (i === 2) {
+        ctx.fillText('y = exp(h/2) · noise', midX + 12, midY - 4);
+        ctx.fillText('obs = log(y²) ≈ h + log χ²', midX + 12, midY + 10);
+      }
+    }
+  });
+
+  // OCSN callout on the right near bottom
+  const ocsX = boxX + boxW + 20, ocsY = layers[3].y + 8;
+  ctx.beginPath();
+  ctx.roundRect(ocsX, ocsY, 210, 50, 4);
+  ctx.fillStyle = 'rgba(251,191,36,0.04)';
+  ctx.strokeStyle = 'rgba(251,191,36,0.2)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.fill();
+
+  ctx.font = '600 9px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(251,191,36,0.7)';
+  ctx.textAlign = 'left';
+  ctx.fillText('OCSN LINEARIZATION', ocsX + 10, ocsY + 16);
+  ctx.font = '9px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(251,191,36,0.4)';
+  ctx.fillText('log(y²) is linear in h', ocsX + 10, ocsY + 30);
+  ctx.fillText('→ enables Kalman in RBPF', ocsX + 10, ocsY + 43);
+
+  // Left side: "what we observe" vs "what is hidden"
+  const divY = layers[2].y + boxH + 10;
+  ctx.setLineDash([4, 4]);
+  ctx.strokeStyle = 'rgba(200,214,229,0.15)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(20, divY);
+  ctx.lineTo(W - 20, divY);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  ctx.font = '9px IBM Plex Mono';
+  ctx.textAlign = 'right';
+  ctx.fillStyle = 'rgba(200,214,229,0.25)';
+  ctx.fillText('LATENT (hidden)', W - 25, divY - 6);
+  ctx.fillText('OBSERVED', W - 25, divY + 14);
+}
 
 // ── Circular Buffer Visualization ──
 function drawCircularBuffer() {
@@ -1870,14 +2175,451 @@ function drawGPUArch() {
   ctx.fillText('↑ warp of 32 threads reads 32 adjacent values = 1 memory transaction', gridX + 60, accessY);
 }
 
+// ── Signal Chain Attenuation Visualization ──
+function drawSignalChain() {
+  const canvas = document.getElementById('signalChainCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  const stages = [
+    { label: 'σ_z', desc: 'scales noise', color: 'rgba(79,195,247,' },
+    { label: 'z̃ₜ', desc: 'AR(1) regime', color: 'rgba(79,195,247,' },
+    { label: 'z = tanh', desc: 'squash', color: 'rgba(167,139,250,' },
+    { label: 'curves', desc: 'μ, σ_h, θ', color: 'rgba(167,139,250,' },
+    { label: 'hₜ', desc: 'log-vol', color: 'rgba(255,107,157,' },
+    { label: 'yₜ', desc: 'return', color: 'rgba(251,191,36,' },
+  ];
+
+  const startX = 30, endX = W - 30;
+  const totalW = endX - startX;
+  const boxW = 70, boxH = 40;
+  const spacing = (totalW - stages.length * boxW) / (stages.length - 1);
+  const cy = H * 0.45;
+
+  // Signal strength bar (fading from left to right)
+  const barY = cy + boxH / 2 + 20;
+  const grad = ctx.createLinearGradient(startX, 0, endX, 0);
+  grad.addColorStop(0, 'rgba(79,195,247,0.25)');
+  grad.addColorStop(0.5, 'rgba(167,139,250,0.12)');
+  grad.addColorStop(1, 'rgba(251,191,36,0.04)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(startX, barY, totalW, 8);
+
+  ctx.font = '8px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(200,214,229,0.3)';
+  ctx.textAlign = 'left';
+  ctx.fillText('STRONG signal', startX, barY + 22);
+  ctx.textAlign = 'right';
+  ctx.fillText('FAINT signal', endX, barY + 22);
+
+  stages.forEach((s, i) => {
+    const x = startX + i * (boxW + spacing);
+
+    // Box
+    ctx.beginPath();
+    ctx.roundRect(x, cy - boxH / 2, boxW, boxH, 3);
+    ctx.fillStyle = s.color + '0.06)';
+    ctx.strokeStyle = s.color + '0.3)';
+    ctx.lineWidth = 1;
+    ctx.fill();
+    ctx.stroke();
+
+    // Label
+    ctx.font = '600 10px IBM Plex Mono';
+    ctx.fillStyle = s.color + '0.8)';
+    ctx.textAlign = 'center';
+    ctx.fillText(s.label, x + boxW / 2, cy - 3);
+
+    ctx.font = '8px IBM Plex Mono';
+    ctx.fillStyle = s.color + '0.4)';
+    ctx.fillText(s.desc, x + boxW / 2, cy + 12);
+
+    // Arrow to next
+    if (i < stages.length - 1) {
+      const nx = startX + (i + 1) * (boxW + spacing);
+      const ax = x + boxW + 2, bx = nx - 2;
+      ctx.beginPath();
+      ctx.moveTo(ax, cy);
+      ctx.lineTo(bx, cy);
+      ctx.strokeStyle = 'rgba(200,214,229,0.15)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(bx - 4, cy - 3);
+      ctx.lineTo(bx, cy);
+      ctx.lineTo(bx - 4, cy + 3);
+      ctx.fillStyle = 'rgba(200,214,229,0.25)';
+      ctx.fill();
+    }
+  });
+
+  // Top label
+  ctx.font = '9px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(200,214,229,0.3)';
+  ctx.textAlign = 'center';
+  ctx.fillText('4 layers of indirection: each dilutes the σ_z signal', W / 2, 18);
+}
+
+// ── BPF Animation — noisy particles in (z̃, h) space ──
+let bpfAnimFrame = 0;
+function animateBPF() {
+  const canvas = document.getElementById('bpfAnimCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  bpfAnimFrame++;
+
+  const nParticles = 40;
+  const cx = W * 0.4, cy = H * 0.5;
+
+  // Axes
+  ctx.strokeStyle = 'rgba(200,214,229,0.12)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(60, H - 40);
+  ctx.lineTo(W * 0.65, H - 40);
+  ctx.moveTo(60, H - 40);
+  ctx.lineTo(60, 30);
+  ctx.stroke();
+
+  ctx.font = '9px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(200,214,229,0.3)';
+  ctx.textAlign = 'center';
+  ctx.fillText('z̃ (sampled)', cx, H - 22);
+  ctx.save();
+  ctx.translate(22, cy);
+  ctx.rotate(-Math.PI / 2);
+  ctx.fillText('h (sampled)', 0, 0);
+  ctx.restore();
+
+  // "True" trajectory line
+  const t = bpfAnimFrame * 0.015;
+  const trueZ = cx + Math.sin(t * 0.7) * 60;
+  const trueH = cy + Math.cos(t * 0.5) * 40;
+  ctx.beginPath();
+  ctx.arc(trueZ, trueH, 6, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(52,211,153,0.3)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(52,211,153,0.5)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // BPF particles — scattered widely in both dimensions
+  const seed = bpfAnimFrame * 7;
+  let totalW = 0;
+  const particles = [];
+  for (let i = 0; i < nParticles; i++) {
+    const hash = Math.sin(seed + i * 127.1) * 43758.5453;
+    const hash2 = Math.sin(seed + i * 269.5 + 3.17) * 43758.5453;
+    const pz = trueZ + (hash - Math.floor(hash) - 0.5) * 160;
+    const ph = trueH + (hash2 - Math.floor(hash2) - 0.5) * 140;
+    // Weight depends on distance from true h (observation mostly constrains h)
+    const dh = (ph - trueH) / 35;
+    const w = Math.exp(-0.5 * dh * dh);
+    totalW += w;
+    particles.push({ z: pz, h: ph, w });
+  }
+
+  // Draw particles with size proportional to weight
+  particles.forEach(p => {
+    const normW = p.w / totalW;
+    const r = 2 + normW * nParticles * 6;
+    const alpha = 0.15 + normW * nParticles * 0.6;
+    ctx.beginPath();
+    ctx.arc(p.z, p.h, Math.min(r, 8), 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(255,107,157,${Math.min(alpha, 0.8)})`;
+    ctx.fill();
+  });
+
+  // Right panel: weight variance visualization
+  const panelX = W * 0.7;
+  ctx.font = '600 10px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(255,107,157,0.7)';
+  ctx.textAlign = 'left';
+  ctx.fillText('BPF Weight Distribution', panelX, 40);
+
+  // Draw weight "histogram" — very spread out
+  const barX = panelX + 10, barMaxW = W - panelX - 30;
+  ctx.font = '8px IBM Plex Mono';
+  const sortedP = [...particles].sort((a, b) => b.w - a.w).slice(0, 12);
+  sortedP.forEach((p, i) => {
+    const y = 55 + i * 16;
+    const bw = (p.w / totalW) * nParticles * barMaxW * 0.4;
+    ctx.fillStyle = 'rgba(255,107,157,0.2)';
+    ctx.fillRect(barX, y, Math.min(bw, barMaxW), 10);
+    ctx.strokeStyle = 'rgba(255,107,157,0.3)';
+    ctx.strokeRect(barX, y, Math.min(bw, barMaxW), 10);
+  });
+
+  // Variance label
+  ctx.font = '9px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(255,107,157,0.5)';
+  ctx.fillText('High variance', panelX, 260);
+  ctx.fillText('→ few particles dominate', panelX, 275);
+  ctx.fillText('→ noisy LL estimate', panelX, 290);
+
+  // Truth label
+  ctx.font = '9px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(52,211,153,0.5)';
+  ctx.textAlign = 'center';
+  ctx.fillText('truth', trueZ, trueH - 14);
+
+  requestAnimationFrame(animateBPF);
+}
+
+// ── RBPF Animation — particles in z̃ only, with Kalman ribbons ──
+let rbpfAnimFrame = 0;
+function animateRBPF() {
+  const canvas = document.getElementById('rbpfAnimCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  rbpfAnimFrame++;
+
+  const nParticles = 40;
+  const cx = W * 0.35, cy = H * 0.5;
+  const t = rbpfAnimFrame * 0.015;
+
+  // Axes
+  ctx.strokeStyle = 'rgba(200,214,229,0.12)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(60, H - 40);
+  ctx.lineTo(W * 0.55, H - 40);
+  ctx.moveTo(60, H - 40);
+  ctx.lineTo(60, 30);
+  ctx.stroke();
+
+  ctx.font = '9px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(200,214,229,0.3)';
+  ctx.textAlign = 'center';
+  ctx.fillText('z̃ (sampled)', cx, H - 22);
+  ctx.save();
+  ctx.translate(22, cy);
+  ctx.rotate(-Math.PI / 2);
+  ctx.fillText('h (analytical)', 0, 0);
+  ctx.restore();
+
+  // True position
+  const trueZ = cx + Math.sin(t * 0.7) * 60;
+  const trueH = cy + Math.cos(t * 0.5) * 40;
+  ctx.beginPath();
+  ctx.arc(trueZ, trueH, 6, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(52,211,153,0.3)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(52,211,153,0.5)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.font = '9px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(52,211,153,0.5)';
+  ctx.textAlign = 'center';
+  ctx.fillText('truth', trueZ, trueH - 14);
+
+  // RBPF particles — scattered in z̃ only, with Kalman ribbons in h
+  const seed = rbpfAnimFrame * 7;
+  let totalW = 0;
+  const parts = [];
+  for (let i = 0; i < nParticles; i++) {
+    const hash = Math.sin(seed + i * 127.1) * 43758.5453;
+    const pz = trueZ + (hash - Math.floor(hash) - 0.5) * 130;
+    // Kalman mean/var for h depends on how close z̃ is to truth
+    const dz = (pz - trueZ) / 60;
+    const kalmanMean = trueH + dz * 15; // shifted by regime
+    const kalmanVar = 12 + Math.abs(dz) * 8; // some variance
+    // Weight is the predictive density — depends on z̃ quality
+    const w = Math.exp(-0.3 * dz * dz);
+    totalW += w;
+    parts.push({ z: pz, hMean: kalmanMean, hVar: kalmanVar, w });
+  }
+
+  // Draw Kalman ribbons (±1σ bands) for each particle
+  parts.forEach(p => {
+    const alpha = 0.05 + (p.w / totalW) * nParticles * 0.15;
+    ctx.fillStyle = `rgba(79,195,247,${Math.min(alpha, 0.2)})`;
+    ctx.fillRect(p.z - 1.5, p.hMean - p.hVar, 3, p.hVar * 2);
+
+    // Kalman mean dot
+    const r = 2 + (p.w / totalW) * nParticles * 4;
+    ctx.beginPath();
+    ctx.arc(p.z, p.hMean, Math.min(r, 6), 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(79,195,247,${Math.min(0.2 + (p.w / totalW) * nParticles * 0.5, 0.8)})`;
+    ctx.fill();
+  });
+
+  // Right panel: weight variance visualization — tight
+  const panelX = W * 0.6;
+  ctx.font = '600 10px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(79,195,247,0.7)';
+  ctx.textAlign = 'left';
+  ctx.fillText('RBPF Weight Distribution', panelX, 40);
+
+  const barX = panelX + 10, barMaxW = W - panelX - 30;
+  const sortedP = [...parts].sort((a, b) => b.w - a.w).slice(0, 12);
+  sortedP.forEach((p, i) => {
+    const y = 55 + i * 16;
+    const bw = (p.w / totalW) * nParticles * barMaxW * 0.35;
+    ctx.fillStyle = 'rgba(79,195,247,0.15)';
+    ctx.fillRect(barX, y, Math.min(bw, barMaxW), 10);
+    ctx.strokeStyle = 'rgba(79,195,247,0.25)';
+    ctx.strokeRect(barX, y, Math.min(bw, barMaxW), 10);
+  });
+
+  // Ribbons annotation
+  ctx.font = '8px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(79,195,247,0.35)';
+  ctx.fillText('vertical bars = Kalman ±1σ for h', panelX, 260);
+
+  ctx.font = '9px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(52,211,153,0.6)';
+  ctx.fillText('Low variance', panelX, 278);
+  ctx.fillText('→ weights spread evenly', panelX, 293);
+  ctx.fillText('→ tight LL estimate', panelX, 308);
+
+  requestAnimationFrame(animateRBPF);
+}
+
+// ── Outer Log-Likelihood Comparison Animation ──
+let llAnimFrame = 0;
+const llHistoryBPF = [];
+const llHistoryRBPF = [];
+function animateLLCompare() {
+  const canvas = document.getElementById('likelihoodCompareCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  llAnimFrame++;
+
+  const midY = H / 2;
+  const plotH = 90;
+  const plotX = 80, plotW = W - 110;
+  const maxPoints = 120;
+
+  // Generate noisy LL increments
+  const trueLL = -2.5 + 0.3 * Math.sin(llAnimFrame * 0.03);
+  const bpfNoise = (Math.sin(llAnimFrame * 1.7 + 0.5) * 0.3 + Math.sin(llAnimFrame * 3.1) * 0.2 +
+    Math.sin(llAnimFrame * 7.3) * 0.15) * 1.8;
+  const rbpfNoise = (Math.sin(llAnimFrame * 1.7 + 0.5) * 0.3 + Math.sin(llAnimFrame * 3.1) * 0.2) * 0.3;
+
+  if (llAnimFrame % 2 === 0) {
+    llHistoryBPF.push(trueLL + bpfNoise);
+    llHistoryRBPF.push(trueLL + rbpfNoise);
+    if (llHistoryBPF.length > maxPoints) {
+      llHistoryBPF.shift();
+      llHistoryRBPF.shift();
+    }
+  }
+
+  // Draw two panels
+  const panels = [
+    { data: llHistoryBPF, label: 'BPF inner filter → noisy outer LL', color: 'rgba(255,107,157,', y: 30, issue: 'σ_z signal buried in noise' },
+    { data: llHistoryRBPF, label: 'RBPF inner filter → tight outer LL', color: 'rgba(79,195,247,', y: midY + 10, good: 'σ_z signal visible' },
+  ];
+
+  panels.forEach((panel) => {
+    const baseY = panel.y + plotH / 2 + 15;
+
+    // Label
+    ctx.font = '600 10px IBM Plex Mono';
+    ctx.fillStyle = panel.color + '0.7)';
+    ctx.textAlign = 'left';
+    ctx.fillText(panel.label, plotX, panel.y + 8);
+
+    // Axes
+    ctx.strokeStyle = 'rgba(200,214,229,0.08)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(plotX, baseY);
+    ctx.lineTo(plotX + plotW, baseY);
+    ctx.stroke();
+
+    // True LL reference
+    ctx.setLineDash([3, 4]);
+    ctx.strokeStyle = 'rgba(52,211,153,0.2)';
+    ctx.beginPath();
+    ctx.moveTo(plotX, baseY);
+    ctx.lineTo(plotX + plotW, baseY);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Draw signal
+    if (panel.data.length > 1) {
+      ctx.beginPath();
+      panel.data.forEach((v, i) => {
+        const x = plotX + (i / maxPoints) * plotW;
+        const y = baseY - (v - trueLL) * (plotH * 0.4);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.strokeStyle = panel.color + '0.5)';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+
+      // Fill under
+      ctx.lineTo(plotX + ((panel.data.length - 1) / maxPoints) * plotW, baseY);
+      ctx.lineTo(plotX, baseY);
+      ctx.closePath();
+      ctx.fillStyle = panel.color + '0.04)';
+      ctx.fill();
+    }
+
+    // Annotation
+    ctx.font = '9px IBM Plex Mono';
+    if (panel.issue) {
+      ctx.fillStyle = 'rgba(255,107,157,0.4)';
+      ctx.textAlign = 'right';
+      ctx.fillText(panel.issue, plotX + plotW, panel.y + plotH + 22);
+    }
+    if (panel.good) {
+      ctx.fillStyle = 'rgba(52,211,153,0.5)';
+      ctx.textAlign = 'right';
+      ctx.fillText(panel.good, plotX + plotW, panel.y + plotH + 22);
+    }
+  });
+
+  // Axis labels
+  ctx.font = '8px IBM Plex Mono';
+  ctx.fillStyle = 'rgba(200,214,229,0.25)';
+  ctx.textAlign = 'right';
+  ctx.fillText('log p(y|θ)', plotX - 8, 30 + plotH / 2 + 18);
+  ctx.fillText('log p(y|θ)', plotX - 8, midY + 10 + plotH / 2 + 18);
+
+  requestAnimationFrame(animateLLCompare);
+}
+
 drawCircularBuffer();
+drawModelFlow();
+drawSignalChain();
 drawKalmanCycle();
 drawGPUArch();
+
+// Start animations when canvases become visible
+const animObserver = new IntersectionObserver((entries) => {
+  entries.forEach(e => {
+    if (e.isIntersecting) {
+      if (e.target.id === 'bpfAnimCanvas') animateBPF();
+      if (e.target.id === 'rbpfAnimCanvas') animateRBPF();
+      if (e.target.id === 'likelihoodCompareCanvas') animateLLCompare();
+      animObserver.unobserve(e.target);
+    }
+  });
+}, { threshold: 0.3 });
+
+['bpfAnimCanvas', 'rbpfAnimCanvas', 'likelihoodCompareCanvas'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) animObserver.observe(el);
+});
 
 // Redraw on resize
 window.addEventListener('resize', () => {
   drawRidge();
   drawReparam();
+  drawModelFlow();
+  drawSignalChain();
   drawCircularBuffer();
   drawKalmanCycle();
   drawGPUArch();
