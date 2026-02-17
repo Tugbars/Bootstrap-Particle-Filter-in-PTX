@@ -1,18 +1,21 @@
 // =============================================================================
-// STRESS TEST: Standard BPF vs Adaptive BPF vs BPF+NatGrad
+// STRESS TEST: Standard BPF vs Adaptive BPF vs BPF+NatGrad (Kalman)
 //
-// Reuses the brutal DGP scenarios from test_stress_compare.cu:
+// Scenarios scaled by TICK_SCALE to allow parameter learning to converge.
 //   A: Spike Gauntlet (20sig→50sig)
 //   B: Regime Teleport (vol 3%→78%)
 //   C: Pure Chaos (random walk + 10% +-2 jumps)
 //   D: Crypto Meltdown (t(3) state+obs, 2x sig_z)
-//   E: Periodic Regimes (8 teleports, 1200 ticks)
+//   E: Periodic Regimes (8 teleports)
 //   F: Sawtooth Ramp (4x ramp+crash cycles)
 //
-// Each scenario run with oracle → mild → moderate → severe → extreme misspec.
-//
 // Build: nvcc -O3 test_bpf_adaptive_stress.cu gpu_bpf_ptx_full.cu -o test_bpf_stress -lcuda -lcurand
+// Override scale: nvcc -DTICK_SCALE=20 ...
 // =============================================================================
+
+#ifndef TICK_SCALE
+#define TICK_SCALE 10   // Multiply all scenario durations by this
+#endif
 
 #include "gpu_bpf_full.cuh"
 #include <cstdio>
@@ -22,8 +25,11 @@
 #include <vector>
 #include <string>
 
+// Scaled tick count
+#define S(n) ((int)((n) * TICK_SCALE))
+
 // =============================================================================
-// PRNG (identical to test_stress_compare)
+// PRNG
 // =============================================================================
 
 static inline float randf(unsigned int* seed) {
@@ -49,7 +55,7 @@ static inline float rand_t(unsigned int* seed, float nu) {
 }
 
 // =============================================================================
-// DGP generation (identical to test_stress_compare)
+// DGP generation
 // =============================================================================
 
 struct SVDGPParams { float mu, rho, sigma; };
@@ -72,14 +78,6 @@ static void gen_calm(std::vector<float>& ret, std::vector<float>& th,
     gen_sv(ret, th, n, dgp.rho, dgp.sigma, dgp.mu, 0.0f, 0.0f, h, seed);
 }
 
-static void gen_spike(std::vector<float>& ret, std::vector<float>& th,
-                    float h_jump, float& h, float mu, unsigned int* seed) {
-    float elevated = mu + h_jump;
-    if (h < elevated) h = elevated; else h += h_jump * 0.3f;
-    th.push_back(h);
-    ret.push_back(expf(h * 0.5f) * randn(seed));
-}
-
 static void gen_recovery(std::vector<float>& ret, std::vector<float>& th,
                         int n, const SVDGPParams& dgp, float& h, unsigned int* seed) {
     gen_calm(ret, th, n, dgp, h, seed);
@@ -98,46 +96,46 @@ struct ScenarioData {
 };
 
 // =============================================================================
-// Scenario generators (identical to test_stress_compare)
+// Scenario generators — all durations use S() macro
 // =============================================================================
 
 static ScenarioData make_spike_gauntlet(const SVDGPParams& dgp, unsigned int sv) {
     ScenarioData sc; sc.name = "Spike Gauntlet";
     unsigned int seed = sv; float h = dgp.mu;
-    gen_calm(sc.returns, sc.true_h, 200, dgp, h, &seed);
-    sc.spike_t = (int)sc.returns.size(); sc.spike_window = 250;
+    gen_calm(sc.returns, sc.true_h, S(200), dgp, h, &seed);
+    sc.spike_t = (int)sc.returns.size(); sc.spike_window = S(250);
     float jumps[] = {1.0f, 1.5f, 2.0f, 2.5f};
     for (int s = 0; s < 4; s++) {
         h = dgp.mu + jumps[s];
         sc.true_h.push_back(h);
         sc.returns.push_back(expf(h * 0.5f) * randn(&seed));
-        gen_recovery(sc.returns, sc.true_h, 50, dgp, h, &seed);
+        gen_recovery(sc.returns, sc.true_h, S(50), dgp, h, &seed);
     }
-    gen_calm(sc.returns, sc.true_h, 200, dgp, h, &seed);
+    gen_calm(sc.returns, sc.true_h, S(200), dgp, h, &seed);
     return sc;
 }
 
 static ScenarioData make_regime_teleport(const SVDGPParams& dgp, unsigned int sv) {
     ScenarioData sc; sc.name = "Regime Teleport";
     unsigned int seed = sv; float h = dgp.mu;
-    gen_calm(sc.returns, sc.true_h, 200, dgp, h, &seed);
-    sc.spike_t = (int)sc.returns.size(); sc.spike_window = 450;
+    gen_calm(sc.returns, sc.true_h, S(200), dgp, h, &seed);
+    sc.spike_t = (int)sc.returns.size(); sc.spike_window = S(450);
     float mus[] = {-2.0f, -7.0f, -0.5f, -4.5f};
     for (int r = 0; r < 4; r++) {
         h = mus[r];
-        gen_sv(sc.returns, sc.true_h, 100, dgp.rho, dgp.sigma, mus[r],
+        gen_sv(sc.returns, sc.true_h, S(100), dgp.rho, dgp.sigma, mus[r],
             0.0f, 0.0f, h, &seed);
     }
-    gen_calm(sc.returns, sc.true_h, 200, dgp, h, &seed);
+    gen_calm(sc.returns, sc.true_h, S(200), dgp, h, &seed);
     return sc;
 }
 
 static ScenarioData make_pure_chaos(const SVDGPParams& dgp, unsigned int sv) {
     ScenarioData sc; sc.name = "Pure Chaos";
     unsigned int seed = sv; float h = dgp.mu;
-    gen_calm(sc.returns, sc.true_h, 100, dgp, h, &seed);
-    sc.spike_t = (int)sc.returns.size(); sc.spike_window = 200;
-    for (int i = 0; i < 200; i++) {
+    gen_calm(sc.returns, sc.true_h, S(100), dgp, h, &seed);
+    sc.spike_t = (int)sc.returns.size(); sc.spike_window = S(200);
+    for (int i = 0; i < S(200); i++) {
         if (randf(&seed) < 0.10f)
             h += (randf(&seed) - 0.5f) * 4.0f;
         float eps = randn(&seed);
@@ -146,29 +144,29 @@ static ScenarioData make_pure_chaos(const SVDGPParams& dgp, unsigned int sv) {
         sc.true_h.push_back(h);
         sc.returns.push_back(expf(h * 0.5f) * randn(&seed));
     }
-    gen_recovery(sc.returns, sc.true_h, 200, dgp, h, &seed);
+    gen_recovery(sc.returns, sc.true_h, S(200), dgp, h, &seed);
     return sc;
 }
 
 static ScenarioData make_crypto_meltdown(const SVDGPParams& dgp, unsigned int sv) {
     ScenarioData sc; sc.name = "Crypto Meltdown";
     unsigned int seed = sv; float h = dgp.mu;
-    gen_calm(sc.returns, sc.true_h, 100, dgp, h, &seed);
-    sc.spike_t = (int)sc.returns.size(); sc.spike_window = 200;
-    gen_sv(sc.returns, sc.true_h, 150, dgp.rho, dgp.sigma * 2.0f, dgp.mu,
+    gen_calm(sc.returns, sc.true_h, S(100), dgp, h, &seed);
+    sc.spike_t = (int)sc.returns.size(); sc.spike_window = S(200);
+    gen_sv(sc.returns, sc.true_h, S(150), dgp.rho, dgp.sigma * 2.0f, dgp.mu,
         3.0f, 3.0f, h, &seed);
-    gen_calm(sc.returns, sc.true_h, 250, dgp, h, &seed);
+    gen_calm(sc.returns, sc.true_h, S(250), dgp, h, &seed);
     return sc;
 }
 
 static ScenarioData make_periodic_regimes(const SVDGPParams& dgp, unsigned int sv) {
     ScenarioData sc; sc.name = "Periodic Regimes";
     unsigned int seed = sv; float h = dgp.mu;
-    sc.spike_t = 0; sc.spike_window = 600;
+    sc.spike_t = 0; sc.spike_window = S(600);
     float mus[] = {-6.0f, -3.0f, -5.0f, -1.5f, -4.5f, -2.0f, -6.5f, -3.5f};
     for (int r = 0; r < 8; r++) {
         h = mus[r];
-        gen_sv(sc.returns, sc.true_h, 150, dgp.rho, dgp.sigma, mus[r],
+        gen_sv(sc.returns, sc.true_h, S(150), dgp.rho, dgp.sigma, mus[r],
             0.0f, 0.0f, h, &seed);
     }
     return sc;
@@ -177,11 +175,11 @@ static ScenarioData make_periodic_regimes(const SVDGPParams& dgp, unsigned int s
 static ScenarioData make_sawtooth(const SVDGPParams& dgp, unsigned int sv) {
     ScenarioData sc; sc.name = "Sawtooth Ramp";
     unsigned int seed = sv; float h = dgp.mu;
-    gen_calm(sc.returns, sc.true_h, 50, dgp, h, &seed);
-    sc.spike_t = (int)sc.returns.size(); sc.spike_window = 400;
+    gen_calm(sc.returns, sc.true_h, S(50), dgp, h, &seed);
+    sc.spike_t = (int)sc.returns.size(); sc.spike_window = S(400);
     for (int cyc = 0; cyc < 4; cyc++) {
-        for (int i = 0; i < 100; i++) {
-            float target = dgp.mu + 3.0f * (float)i / 100.0f;
+        for (int i = 0; i < S(100); i++) {
+            float target = dgp.mu + 3.0f * (float)i / (float)S(100);
             h = target + dgp.sigma * randn(&seed);
             sc.true_h.push_back(h);
             sc.returns.push_back(expf(h * 0.5f) * randn(&seed));
@@ -190,7 +188,7 @@ static ScenarioData make_sawtooth(const SVDGPParams& dgp, unsigned int sv) {
         sc.true_h.push_back(h);
         sc.returns.push_back(expf(h * 0.5f) * randn(&seed));
     }
-    gen_calm(sc.returns, sc.true_h, 100, dgp, h, &seed);
+    gen_calm(sc.returns, sc.true_h, S(100), dgp, h, &seed);
     return sc;
 }
 
@@ -238,7 +236,9 @@ static Metrics run_bpf(const ScenarioData& sc,
     }
 
     if (mode == MODE_NATGRAD || mode == MODE_COMBINED) {
-        gpu_bpf_enable_mu_learning(state, 1, 50, 0.1f, 10.0f, 0.667f);
+        gpu_bpf_enable_mu_learning(state, 50,
+                                    5e-8f, 0.01f,    // Q_mu, P0_mu
+                                    5e-9f, 0.001f);  // Q_rho, P0_rho
         gpu_bpf_enable_rho_learning(state, 1);
     }
 
@@ -318,12 +318,11 @@ int main(int argc, char** argv) {
 
     printf("\n");
     printf("==========================================================================================================\n");
-    printf("  Standard BPF vs Adaptive BPF vs BPF+NatGrad  --  Stress Test\n");
-    printf("  Particles: %dK  nu_obs=%.0f  True DGP: rho=%.2f sigma_z=%.2f mu=%.1f\n",
-        N/1000, bnu, true_rho, true_sz, true_mu);
+    printf("  Standard BPF vs Adaptive BPF vs BPF+NatGrad(Kalman)  --  Stress Test\n");
+    printf("  Particles: %dK  nu_obs=%.0f  TICK_SCALE=%d  True DGP: rho=%.2f sigma_z=%.2f mu=%.1f\n",
+        N/1000, bnu, TICK_SCALE, true_rho, true_sz, true_mu);
     printf("==========================================================================================================\n");
 
-    // Generate all scenarios once
     ScenarioData scenarios[] = {
         make_spike_gauntlet(dgp, 42),
         make_regime_teleport(dgp, 43),
@@ -360,7 +359,6 @@ int main(int argc, char** argv) {
             Metrics cb_m  = run_bpf(scenarios[s], mc[m].rho, mc[m].sigma_z, mc[m].mu,
                                     bnu, N, seed, MODE_COMBINED);
 
-            // Determine winner
             const char* winner = "???";
             if (!std_m.had_nan && !adp_m.had_nan && !ng_m.had_nan && !cb_m.had_nan) {
                 double best = std_m.rmse;
@@ -387,7 +385,6 @@ int main(int argc, char** argv) {
                 cb_m.had_nan  ? 0.0 : cb_m.spike_rmse,
                 winner);
 
-            // Show combined final params when misspec is non-oracle
             if (m > 0 && !cb_m.had_nan) {
                 printf("  mu:%.2f rho:%.3f", cb_m.final_mu, cb_m.final_rho);
             }
@@ -401,10 +398,10 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Grand summary
     printf("\n");
     printf("==========================================================================================================\n");
-    printf("  GRAND SUMMARY (%d scenarios x %d misspec = %d runs)\n", n_sc, n_mc, total);
+    printf("  GRAND SUMMARY (%d scenarios x %d misspec = %d runs, TICK_SCALE=%d)\n",
+        n_sc, n_mc, total, TICK_SCALE);
     printf("----------------------------------------------------------------------------------------------------------\n");
     printf("  %-20s %12s %12s %12s %12s\n",     "", "Standard", "Adaptive", "NatGrad", "Combined");
     printf("  %-20s %12.4f %12.4f %12.4f %12.4f\n", "Avg RMSE",
@@ -414,7 +411,6 @@ int main(int argc, char** argv) {
     printf("  %-20s %12d %12d %12d %12d\n", "Wins",
         std_wins, adp_wins, ng_wins, cb_wins);
 
-    // Pairwise deltas
     printf("----------------------------------------------------------------------------------------------------------\n");
     printf("  Combined vs Standard:  %+.1f%% avg RMSE\n",
         100.0 * (cb_rmse_sum / std_rmse_sum - 1.0));

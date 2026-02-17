@@ -367,10 +367,12 @@ GpuBpfState* gpu_bpf_create(int n_particles, float rho, float sigma_z, float mu,
     s->update_K   = 50;
     s->grad_clip  = 5.0f;
     s->grad_count = 0;
-    s->rm_step    = 0;
-    s->rm_c       = 0.1f;
-    s->rm_t0      = 10.0f;
-    s->rm_gamma   = 0.667f;
+    s->kp_mu_P    = 0.01f;
+    s->kp_mu_Q    = 5e-8f;
+    s->kp_mu_P0   = 0.01f;
+    s->kp_rho_P   = 0.001f;
+    s->kp_rho_Q   = 5e-9f;
+    s->kp_rho_P0  = 0.001f;
 
     s->jump_enabled      = 0;              // [JUMP] PTX kernel 15
     s->jump_sigma_J      = 0.0f;
@@ -378,6 +380,23 @@ GpuBpfState* gpu_bpf_create(int n_particles, float rho, float sigma_z, float mu,
     s->jump_lambda_alert = 0.03f;
     s->jump_lambda_panic = 0.08f;
     s->jump_lambda       = 0.01f;
+
+    // CUSUM gating (all off by default)
+    s->cusum_S_ll        = 0.0f;
+    s->cusum_S_grad      = 0.0f;
+    s->cusum_h_alert     = 5.0f;
+    s->cusum_h_panic     = 10.0f;
+    s->cusum_h_grad      = 8.0f;
+    s->cusum_warmup      = 200;
+    s->cusum_ring_pos    = 0;
+    s->cusum_ring_count  = 0;
+    s->cusum_ref_ll      = 0.0f;
+    s->cusum_ref_grad    = 0.0f;
+    s->cusum_jump_active = 0;
+    s->cusum_active_ticks = 0;
+    s->cusum_consec_active = 0;
+    memset(s->cusum_ring, 0, sizeof(s->cusum_ring));
+    memset(s->cusum_grad_ring, 0, sizeof(s->cusum_grad_ring));
 
     cudaStreamCreate(&s->stream);
 
@@ -472,7 +491,7 @@ void gpu_bpf_destroy(GpuBpfState* s) {
 }
 
 // =============================================================================
-// [NEW] Online mu/rho learning — natural gradient + Robbins-Monro
+// [NEW] Online mu/rho learning — natural gradient + Kalman parameter tracker
 // =============================================================================
 
 static void bpf_grad_and_update(GpuBpfState* s, float y_t,
@@ -501,48 +520,60 @@ static void bpf_grad_and_update(GpuBpfState* s, float y_t,
         float sums[4];  // [grad_mu, fisher_mu, grad_rho, fisher_rho]
         cudaMemcpy(sums, s->d_scalars + 5, 4 * sizeof(float), cudaMemcpyDeviceToHost);
 
-        // Robbins-Monro step size: η = c / (step + t0)^gamma
-        s->rm_step++;
-        float eta = s->rm_c / powf((float)s->rm_step + s->rm_t0, s->rm_gamma);
-
         float K_f = (float)s->grad_count;
         float K_inv = 1.0f / K_f;
 
-        // ── μ update (natural gradient: score / Fisher, SNR-gated) ──
+        // ── μ update (Kalman natural gradient) ──────────────────────
         {
-            float mean_g = sums[0] * K_inv;
-            float mean_f = sums[1] * K_inv;
-            float dir = mean_g / fmaxf(mean_f, 1e-8f);
+            float mean_g = sums[0] * K_inv;   // avg gradient
+            float mean_f = sums[1] * K_inv;   // avg Fisher
 
+            // Natural gradient direction
+            float dir = mean_g / fmaxf(mean_f, 1e-8f);
             if (s->grad_clip > 0.0f && fabsf(dir) > s->grad_clip)
                 dir *= s->grad_clip / fabsf(dir);
 
-            // Soft SNR gate: snr = |mean_g| / sqrt(mean_f / K)
-            // Under correct params: mean_g ~ N(0, F/K) → snr ~ |N(0,1)|
-            // Gate ramps 0→1 over snr 0→snr_ref (2.0 ≈ 95% confidence)
-            float snr_mu = fabsf(mean_g) / fmaxf(sqrtf(mean_f / K_f), 1e-10f);
-            float gate_mu = fminf(snr_mu / 2.0f, 1.0f);
+            // Kalman predict: uncertainty grows (parameter may have drifted)
+            float P_pred = s->kp_mu_P + s->kp_mu_Q * K_f;
 
+            // Observation noise in parameter space: R = 1 / Fisher
+            float R_mu = 1.0f / fmaxf(mean_f, 1e-8f);
+
+            // Kalman gain = adaptive step size
+            float K_gain = P_pred / (P_pred + R_mu);
+
+            // Update μ via α parameterization
             float alpha = s->mu * (1.0f - s->rho);
-            alpha += eta * gate_mu * dir;
+            alpha += K_gain * dir;
             float mu_new = alpha / fmaxf(1.0f - s->rho, 1e-6f);
             s->mu = fmaxf(fminf(mu_new, 2.0f), -5.0f);
+
+            // Posterior variance shrinks
+            s->kp_mu_P = (1.0f - K_gain) * P_pred;
         }
 
-        // ── ρ update (natural gradient: score / Fisher, SNR-gated) ──
+        // ── ρ update (Kalman natural gradient) ──────────────────────
         if (s->learn_rho) {
             float mean_g = sums[2] * K_inv;
             float mean_f = sums[3] * K_inv;
-            float dir = mean_g / fmaxf(mean_f, 1e-8f);
 
+            float dir = mean_g / fmaxf(mean_f, 1e-8f);
             if (s->grad_clip > 0.0f && fabsf(dir) > s->grad_clip)
                 dir *= s->grad_clip / fabsf(dir);
 
-            float snr_rho = fabsf(mean_g) / fmaxf(sqrtf(mean_f / K_f), 1e-10f);
-            float gate_rho = fminf(snr_rho / 2.0f, 1.0f);
+            // Kalman predict
+            float P_pred = s->kp_rho_P + s->kp_rho_Q * K_f;
 
-            float rho_new = s->rho + eta * gate_rho * dir;
+            // R = 1 / Fisher
+            float R_rho = 1.0f / fmaxf(mean_f, 1e-8f);
+
+            // Kalman gain
+            float K_gain = P_pred / (P_pred + R_rho);
+
+            float rho_new = s->rho + K_gain * dir;
             s->rho = fmaxf(fminf(rho_new, 0.999f), 0.001f);
+
+            s->kp_rho_P = (1.0f - K_gain) * P_pred;
         }
 
         // Reset all 4 accumulators
@@ -608,14 +639,21 @@ void gpu_bpf_step_async(GpuBpfState* s, float y_t) {
     }
 
     // [JUMP] Kernel 15: Bernoulli MIM perturbation via PTX
-    // Regime-adaptive lambda: calm=0.01, alert=0.03, panic=0.08 (default)
-    // Jumpers uniformly distributed across all indices = natural overlap with adaptive bands.
-    if (s->jump_enabled) {
+    // jump_enabled: 0=off, 1=always on (regime-adaptive), 2=CUSUM-gated
+    if (s->jump_enabled == 1) {
+        // Always-on mode: regime-adaptive lambda from surprise EMA
         switch (h_current_regime) {
             case MIX_CALM:  s->jump_lambda = s->jump_lambda_calm;  break;
             case MIX_ALERT: s->jump_lambda = s->jump_lambda_alert; break;
             case MIX_PANIC: s->jump_lambda = s->jump_lambda_panic; break;
         }
+        void* jp_params[] = {
+            &dh, &drng, &s->jump_lambda, &s->jump_sigma_J, &n
+        };
+        ptx_launch(g_ptx.jump_perturb, st, g, b, 0, jp_params);
+    } else if (s->jump_enabled == 2 && s->cusum_jump_active) {
+        // CUSUM-gated: only launch when CUSUM has triggered
+        // jump_lambda was set by cusum_update on the previous tick
         void* jp_params[] = {
             &dh, &drng, &s->jump_lambda, &s->jump_sigma_J, &n
         };
@@ -785,29 +823,42 @@ BpfResult gpu_bpf_get_result(GpuBpfState* s) {
     return r;
 }
 
+// Forward declarations — defined after jump API section
+static float cusum_trimmed_mean(const float* ring, int count);
+static void cusum_update(GpuBpfState* s, float log_lik);
+
 BpfResult gpu_bpf_step(GpuBpfState* s, float y_t) {
     gpu_bpf_step_async(s, y_t);
     cudaStreamSynchronize(s->stream);
     BpfResult r = gpu_bpf_get_result(s);  // updates last_h_est to CURRENT tick
     // Surprise uses current tick's h_est → 1-tick regime lag (was 2-tick)
     s->last_surprise = fabsf(y_t) * expf(-s->last_h_est * 0.5f);
+    // CUSUM gating: update statistics and gate decision for next tick
+    cusum_update(s, r.log_lik);
     return r;
 }
 
 // =============================================================================
-// [NEW] Online mu/rho learning API — natural gradient + Robbins-Monro
+// [NEW] Online mu/rho learning API — natural gradient + Kalman parameter tracker
 // =============================================================================
 
-void gpu_bpf_enable_mu_learning(GpuBpfState* s, int mode, int K,
-                                 float c, float t0, float gamma) {
-    s->learn_mode = mode;   // 1=natural gradient
+void gpu_bpf_enable_mu_learning(GpuBpfState* s, int K,
+                                 float Q_mu, float P0_mu,
+                                 float Q_rho, float P0_rho) {
+    s->learn_mode = 1;
     s->update_K   = K;
     s->grad_clip  = 5.0f;
     s->grad_count = 0;
-    s->rm_step    = 0;
-    s->rm_c       = c;
-    s->rm_t0      = t0;
-    s->rm_gamma   = gamma;
+
+    // Kalman tracker for μ
+    s->kp_mu_P    = P0_mu;
+    s->kp_mu_Q    = Q_mu;
+    s->kp_mu_P0   = P0_mu;
+
+    // Kalman tracker for ρ
+    s->kp_rho_P   = P0_rho;
+    s->kp_rho_Q   = Q_rho;
+    s->kp_rho_P0  = P0_rho;
 
     // Zero all 4 device accumulators
     float zeros[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -832,10 +883,10 @@ float gpu_bpf_get_rho(GpuBpfState* s) {
 }
 
 // Called by SMC² when it pushes corrected params.
-// Resets Robbins-Monro counter so step sizes restart fresh.
+// Resets Kalman P to P0 so learning adapts from the new value.
 void gpu_bpf_set_mu(GpuBpfState* s, float mu) {
     s->mu = mu;
-    s->rm_step    = 0;
+    s->kp_mu_P    = s->kp_mu_P0;   // reset uncertainty
     s->grad_count = 0;
 
     float zeros[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -844,7 +895,7 @@ void gpu_bpf_set_mu(GpuBpfState* s, float mu) {
 
 void gpu_bpf_set_rho(GpuBpfState* s, float rho) {
     s->rho = fmaxf(fminf(rho, 0.999f), 0.001f);
-    s->rm_step    = 0;
+    s->kp_rho_P   = s->kp_rho_P0;  // reset uncertainty
     s->grad_count = 0;
 
     float zeros[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -888,6 +939,195 @@ float gpu_bpf_get_jump_lambda(const GpuBpfState* s) {
 
 float gpu_bpf_get_sigma_J(const GpuBpfState* s) {
     return s->jump_enabled ? s->jump_sigma_J : 0.0f;
+}
+
+// =============================================================================
+// CUSUM-gated jump diffusion
+// =============================================================================
+
+// Compute trimmed mean of a ring buffer (drop top/bottom 10%)
+static float cusum_trimmed_mean(const float* ring, int count) {
+    if (count < 5) {
+        float s = 0.0f;
+        for (int i = 0; i < count; i++) s += ring[i];
+        return s / (float)count;
+    }
+
+    float tmp[CUSUM_RING_SIZE];
+    memcpy(tmp, ring, count * sizeof(float));
+    for (int i = 1; i < count; i++) {
+        float key = tmp[i];
+        int j = i - 1;
+        while (j >= 0 && tmp[j] > key) { tmp[j + 1] = tmp[j]; j--; }
+        tmp[j + 1] = key;
+    }
+
+    int trim = count / 10;
+    if (trim < 1) trim = 1;
+    float s = 0.0f;
+    int n = 0;
+    for (int i = trim; i < count - trim; i++) { s += tmp[i]; n++; }
+    return (n > 0) ? s / (float)n : tmp[count / 2];
+}
+
+// Compute standard deviation from ring buffer (used for standardized CUSUM)
+static float cusum_ring_std(const float* ring, int count, float mean) {
+    if (count < 3) return 1.0f;  // avoid div by zero, return unit scale
+    float sum_sq = 0.0f;
+    for (int i = 0; i < count; i++) {
+        float d = ring[i] - mean;
+        sum_sq += d * d;
+    }
+    float var = sum_sq / (float)(count - 1);
+    return (var > 1e-12f) ? sqrtf(var) : 1e-6f;
+}
+
+// Called from gpu_bpf_step after readback. Updates CUSUM state,
+// sets cusum_jump_active and jump_lambda for the NEXT tick.
+//
+// Page's CUSUM with slack parameter k:
+//   S_t = max(0, S_{t-1} + z_t - k)
+//
+// where z_t = (μ₀ - ℓ_t) / σ is the standardized log-likelihood drop.
+// Under the null (filter healthy), E[z_t] = 0, so E[increment] = -k < 0.
+// The CUSUM is pulled toward zero by k each tick and stays near zero.
+// It only climbs when z_t > k (genuinely bad predictions).
+//
+// k = 0.5 is optimal for detecting a 1-sigma shift (Page 1954).
+// With k=0.5 and h=5, the average run length under null is ~500 ticks.
+//
+static void cusum_update(GpuBpfState* s, float log_lik) {
+    if (s->jump_enabled != 2) return;
+
+    int t = s->timestep;
+
+    // ── 1. Read gradient norm once ──
+    float grad_sq = 0.0f;
+    if (s->learn_mode) {
+        float sums[4];
+        cudaMemcpy(sums, s->d_scalars + 5, 4 * sizeof(float), cudaMemcpyDeviceToHost);
+        grad_sq = sums[0] * sums[0] + sums[2] * sums[2];
+    }
+
+    // ── 2. If jumps were active THIS tick, don't update ring or CUSUM ──
+    // Just let the CUSUM drain via slack on the next clean tick.
+    // We keep the gate decision from the previous tick.
+    if (s->cusum_jump_active) {
+        s->cusum_active_ticks++;
+        // After max_burst ticks of consecutive jump activity, force gate off
+        // to allow a clean observation. This prevents runaway activation.
+        s->cusum_consec_active++;
+        if (s->cusum_consec_active >= 20) {
+            s->cusum_jump_active = 0;
+            s->jump_lambda = 0.0f;
+            s->cusum_consec_active = 0;
+        }
+        return;
+    }
+    s->cusum_consec_active = 0;
+
+    // ── 3. Clean tick: update ring buffers ──
+    {
+        int pos = s->cusum_ring_pos;
+        s->cusum_ring[pos] = log_lik;
+        if (s->learn_mode) s->cusum_grad_ring[pos] = grad_sq;
+        s->cusum_ring_pos = (pos + 1) % CUSUM_RING_SIZE;
+        if (s->cusum_ring_count < CUSUM_RING_SIZE) s->cusum_ring_count++;
+    }
+
+    // ── 4. During warmup, just accumulate ──
+    if (t < s->cusum_warmup) return;
+
+    // ── 5. Compute references and std devs from clean ring ──
+    s->cusum_ref_ll = cusum_trimmed_mean(s->cusum_ring, s->cusum_ring_count);
+    float std_ll = cusum_ring_std(s->cusum_ring, s->cusum_ring_count, s->cusum_ref_ll);
+
+    float std_grad = 1.0f;
+    if (s->learn_mode) {
+        s->cusum_ref_grad = cusum_trimmed_mean(s->cusum_grad_ring, s->cusum_ring_count);
+        std_grad = cusum_ring_std(s->cusum_grad_ring, s->cusum_ring_count, s->cusum_ref_grad);
+    }
+
+    // ── 6. Update CUSUM: S_t = max(0, S_{t-1} + z_t - k) ──
+    const float CUSUM_SLACK = 0.5f;  // optimal for detecting 1-sigma shifts
+
+    float z_ll = (s->cusum_ref_ll - log_lik) / std_ll;
+    s->cusum_S_ll = fmaxf(0.0f, s->cusum_S_ll + z_ll - CUSUM_SLACK);
+
+    if (s->learn_mode) {
+        float z_grad = (grad_sq - s->cusum_ref_grad) / std_grad;
+        s->cusum_S_grad = fmaxf(0.0f, s->cusum_S_grad + z_grad - CUSUM_SLACK);
+    }
+
+    // ── 7. Gate decision ──
+    int ll_alert = (s->cusum_S_ll >= s->cusum_h_alert);
+    int ll_panic = (s->cusum_S_ll >= s->cusum_h_panic);
+    int grad_alert = s->learn_mode && (s->cusum_S_grad >= s->cusum_h_grad);
+
+    if (ll_panic) {
+        s->cusum_jump_active = 1;
+        s->jump_lambda = s->jump_lambda_panic;
+    } else if (ll_alert) {
+        s->cusum_jump_active = 1;
+        s->jump_lambda = grad_alert ? s->jump_lambda_panic : s->jump_lambda_alert;
+    } else if (grad_alert) {
+        s->cusum_jump_active = 1;
+        s->jump_lambda = s->jump_lambda_calm;
+    } else {
+        s->cusum_jump_active = 0;
+        s->jump_lambda = 0.0f;
+    }
+
+    if (s->cusum_jump_active) {
+        s->cusum_active_ticks++;
+    }
+}
+
+void gpu_bpf_enable_cusum_gated_jumps(GpuBpfState* s, float sigma_J,
+                                       float h_alert, float h_panic,
+                                       float h_grad, int warmup) {
+    s->jump_enabled      = 2;  // CUSUM mode
+    s->jump_sigma_J      = sigma_J;
+    s->jump_lambda_calm  = 0.01f;
+    s->jump_lambda_alert = 0.03f;
+    s->jump_lambda_panic = 0.08f;
+    s->jump_lambda       = 0.0f;  // Off until CUSUM triggers
+
+    s->cusum_S_ll        = 0.0f;
+    s->cusum_S_grad      = 0.0f;
+    s->cusum_h_alert     = h_alert;
+    s->cusum_h_panic     = h_panic;
+    s->cusum_h_grad      = h_grad;
+    s->cusum_warmup      = warmup;
+    s->cusum_ring_pos    = 0;
+    s->cusum_ring_count  = 0;
+    s->cusum_ref_ll      = 0.0f;
+    s->cusum_ref_grad    = 0.0f;
+    s->cusum_jump_active = 0;
+    s->cusum_active_ticks = 0;
+    s->cusum_consec_active = 0;
+    memset(s->cusum_ring, 0, sizeof(s->cusum_ring));
+    memset(s->cusum_grad_ring, 0, sizeof(s->cusum_grad_ring));
+}
+
+void gpu_bpf_disable_cusum_gated_jumps(GpuBpfState* s) {
+    s->jump_enabled = 0;
+    s->cusum_jump_active = 0;
+    s->cusum_consec_active = 0;
+    s->cusum_S_ll = 0.0f;
+    s->cusum_S_grad = 0.0f;
+}
+
+int gpu_bpf_cusum_is_active(const GpuBpfState* s) {
+    return s->cusum_jump_active;
+}
+
+float gpu_bpf_get_cusum_ll(const GpuBpfState* s) {
+    return s->cusum_S_ll;
+}
+
+float gpu_bpf_get_cusum_grad(const GpuBpfState* s) {
+    return s->cusum_S_grad;
 }
 
 // =============================================================================

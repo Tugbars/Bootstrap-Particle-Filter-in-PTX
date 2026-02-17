@@ -66,6 +66,9 @@ typedef enum {
 // Bootstrap Particle Filter — Pure PTX (PCG32 RNG)
 // =============================================================================
 
+/** Ring buffer size for CUSUM adaptive reference. */
+#define CUSUM_RING_SIZE 200
+
 /**
  * @brief Opaque state for the GPU Bootstrap Particle Filter.
  *
@@ -114,24 +117,55 @@ typedef struct {
     unsigned long long host_rng_state;  /**< Host-side PCG32 for resampling U      */
     int       timestep;         /**< Current tick index                            */
 
-    // ── Online mu learning (kernel 14: natural gradient + Robbins-Monro) ────
-    int       learn_mode;       /**< 0=off, 1=natural gradient, 2=robbins-monro   */
-    int       learn_rho;        /**< 0=off, 1=also learn ρ via natural gradient    */
+    // ── Online parameter learning (kernel 14: natural gradient + Kalman) ────
+    int       learn_mode;       /**< 0=off, 1=Kalman natural gradient              */
+    int       learn_rho;        /**< 0=off, 1=also learn ρ                         */
     int       update_K;         /**< Accumulate K ticks between updates            */
     float     grad_clip;        /**< Max |natural gradient| per step (0=no clip)   */
     int       grad_count;       /**< Ticks since last update                       */
-    int       rm_step;          /**< Robbins-Monro step counter (resets on push)   */
-    float     rm_c;             /**< RM step: η = c / (step + t0)^gamma           */
-    float     rm_t0;            /**< RM offset (prevents huge initial steps)       */
-    float     rm_gamma;         /**< RM exponent (2/3 for nat grad, 1/2 vanilla)  */
+
+    // Kalman parameter tracker for μ
+    float     kp_mu_P;          /**< Posterior variance of μ estimate              */
+    float     kp_mu_Q;          /**< Process noise: how fast μ drifts (e.g. 5e-8) */
+    float     kp_mu_P0;         /**< Initial P (reset value after SMC² push)      */
+
+    // Kalman parameter tracker for ρ
+    float     kp_rho_P;         /**< Posterior variance of ρ estimate              */
+    float     kp_rho_Q;         /**< Process noise: how fast ρ drifts (e.g. 5e-9) */
+    float     kp_rho_P0;        /**< Initial P (reset value after SMC² push)      */
 
     // ── Jump diffusion (Bernoulli MIM via PTX kernel 15) ───────────────────
-    int       jump_enabled;     /**< 0=off, 1=on                              */
+    int       jump_enabled;     /**< 0=off, 1=on, 2=CUSUM-gated               */
     float     jump_sigma_J;     /**< Jump size std dev (fixed, ~2.5)           */
     float     jump_lambda_calm; /**< Lambda for calm  regime (default 0.01)    */
     float     jump_lambda_alert;/**< Lambda for alert regime (default 0.03)    */
     float     jump_lambda_panic;/**< Lambda for panic regime (default 0.08)    */
     float     jump_lambda;      /**< Current tick's lambda (set by regime)     */
+
+    // ── CUSUM gating for jump diffusion ─────────────────────────────────────
+    // Two CUSUM statistics gate kernel 15 launch:
+    //   1. Log-likelihood CUSUM: detects filter prediction failure
+    //   2. Gradient norm CUSUM:  detects parameter misspecification
+    // Jump fires only when at least one CUSUM crosses its threshold.
+    // λ is set by the worse of the two signals.
+
+    float     cusum_S_ll;       /**< CUSUM statistic on log-likelihood         */
+    float     cusum_S_grad;     /**< CUSUM statistic on gradient norm          */
+    float     cusum_h_alert;    /**< Log-lik CUSUM threshold → moderate λ      */
+    float     cusum_h_panic;    /**< Log-lik CUSUM threshold → aggressive λ    */
+    float     cusum_h_grad;     /**< Gradient CUSUM threshold (single level)   */
+    int       cusum_warmup;     /**< Ticks of warmup before gating activates   */
+
+    float     cusum_ring[CUSUM_RING_SIZE]; /**< Ring buffer of recent log-lik  */
+    int       cusum_ring_pos;   /**< Write position in ring buffer             */
+    int       cusum_ring_count; /**< Number of valid entries (≤ RING_SIZE)     */
+    float     cusum_ref_ll;     /**< Adaptive reference: trimmed mean of ring  */
+    float     cusum_ref_grad;   /**< Adaptive reference: mean grad² from ring  */
+
+    float     cusum_grad_ring[CUSUM_RING_SIZE]; /**< Ring buffer of grad²     */
+    int       cusum_jump_active;/**< Whether CUSUM currently gates jumps ON    */
+    int       cusum_active_ticks; /**< Cumulative ticks where jumps were gated ON */
+    int       cusum_consec_active; /**< Consecutive active ticks (for burst limit) */
 } GpuBpfState;
 
 /**
@@ -185,28 +219,34 @@ BpfResult gpu_bpf_get_result(GpuBpfState* state);
 // ── Online mu learning API ──────────────────────────────────────────────────
 
 /**
- * @brief Enable online mu learning via natural gradient + Robbins-Monro.
+ * @brief Enable online mu learning via natural gradient + Kalman parameter tracker.
  *
  * Mode 1 (natural gradient): Δα = η_k · g_α / F_α
  *   Fisher information F_α auto-scales steps: small near optimum, large when displaced.
- *   Robbins-Monro schedule η_k = c/(k+t₀)^γ guarantees convergence.
+ *   Kalman filter on parameters provides optimal adaptive step sizes:
+ *     Predict: P = P + Q   (uncertainty grows — parameter may have drifted)
+ *     R = 1/Fisher          (observation noise in parameter space)
+ *     K = P / (P + R)       (Kalman gain = adaptive step size)
+ *     θ += K · (gradient / Fisher)   (natural gradient, Kalman-scaled)
+ *     P = (1 - K) · P      (posterior uncertainty shrinks)
  *
- * Mode 2 (Robbins-Monro only): Δα = η_k · g_α
- *   Vanilla gradient with decreasing step size. Simpler, no Fisher computation.
+ *   Q controls drift rate prior: how fast you believe the true parameter moves.
+ *   Unlike Robbins-Monro, step sizes never go stiff — Q keeps P from collapsing.
  *
- * Adds 2-3 kernel launches per tick. One sync every K ticks.
+ * Adds 1 fused kernel launch per tick. One sync every K ticks.
  *
  * @param state   BPF instance
- * @param mode    1=natural gradient, 2=robbins-monro
  * @param K       Gradient accumulation window (ticks between updates)
- * @param c       RM step scale (recommend 0.1 for nat grad, 0.003 for vanilla)
- * @param t0      RM offset (recommend 10)
- * @param gamma   RM exponent (recommend 0.667 for nat grad, 0.5 for vanilla)
+ * @param Q_mu    Process noise for μ (drift rate, e.g. 5e-8)
+ * @param P0_mu   Initial posterior variance for μ (e.g. 0.01)
+ * @param Q_rho   Process noise for ρ (drift rate, e.g. 5e-9)
+ * @param P0_rho  Initial posterior variance for ρ (e.g. 0.001)
  */
-void gpu_bpf_enable_mu_learning(GpuBpfState* state, int mode, int K,
-                                 float c, float t0, float gamma);
+void gpu_bpf_enable_mu_learning(GpuBpfState* state, int K,
+                                 float Q_mu, float P0_mu,
+                                 float Q_rho, float P0_rho);
 
-/** @brief Disable online mu learning. Mu stays at current value. */
+/** @brief Disable online parameter learning. μ and ρ stay at current values. */
 void gpu_bpf_disable_mu_learning(GpuBpfState* state);
 
 /** @brief Enable/disable online rho learning (requires learn_mode > 0). */
@@ -221,7 +261,7 @@ float gpu_bpf_get_rho(GpuBpfState* state);
 /**
  * @brief Set mu from external source (e.g. SMC² parameter push).
  *
- * Resets Robbins-Monro counter so online learning starts fresh.
+ * Resets Kalman P to P0 so learning adapts from the new value.
  *
  * @param state  BPF instance
  * @param mu     New mu value
@@ -231,7 +271,7 @@ void gpu_bpf_set_mu(GpuBpfState* state, float mu);
 /**
  * @brief Set rho from external source (e.g. SMC² parameter push).
  *
- * Resets Robbins-Monro counter. Clamps to (0.001, 0.999).
+ * Resets Kalman P to P0. Clamps to (0.001, 0.999).
  *
  * @param state  BPF instance
  * @param rho    New rho value
@@ -327,6 +367,45 @@ float gpu_bpf_get_jump_lambda(const GpuBpfState* s);
 
 /** @brief Return current jump sigma (0 if disabled). */
 float gpu_bpf_get_sigma_J(const GpuBpfState* s);
+
+// ── CUSUM-gated jump diffusion ─────────────────────────────────────────────
+
+/**
+ * @brief Enable CUSUM-gated jump diffusion.
+ *
+ * Jumps are OFF by default. Two CUSUM detectors monitor:
+ *   1. Log-likelihood increments (filter prediction failure)
+ *   2. Gradient norm from kernel 14 (parameter misspecification)
+ *
+ * When either CUSUM crosses its threshold, kernel 15 launches with
+ * lambda proportional to the severity. When both CUSUMs are below
+ * threshold, kernel 15 is skipped entirely (zero cost).
+ *
+ * Requires a warmup period (default 200 ticks) to estimate the
+ * healthy baseline from a ring buffer of log-likelihood increments.
+ *
+ * @param s           BPF instance
+ * @param sigma_J     Jump size std dev (recommend ~2.5)
+ * @param h_alert     CUSUM threshold for moderate lambda (recommend 3-5)
+ * @param h_panic     CUSUM threshold for aggressive lambda (recommend 8-12)
+ * @param h_grad      Gradient CUSUM threshold (recommend 5-10)
+ * @param warmup      Ticks before gating activates (recommend 200)
+ */
+void gpu_bpf_enable_cusum_gated_jumps(GpuBpfState* s, float sigma_J,
+                                       float h_alert, float h_panic,
+                                       float h_grad, int warmup);
+
+/** @brief Disable CUSUM gating (also disables jumps). */
+void gpu_bpf_disable_cusum_gated_jumps(GpuBpfState* s);
+
+/** @brief Return 1 if CUSUM is currently gating jumps ON. */
+int  gpu_bpf_cusum_is_active(const GpuBpfState* s);
+
+/** @brief Return the current log-likelihood CUSUM statistic. */
+float gpu_bpf_get_cusum_ll(const GpuBpfState* s);
+
+/** @brief Return the current gradient norm CUSUM statistic. */
+float gpu_bpf_get_cusum_grad(const GpuBpfState* s);
 
 // ── Batch RMSE convenience ──────────────────────────────────────────────────
 
