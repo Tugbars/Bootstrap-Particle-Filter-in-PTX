@@ -230,7 +230,7 @@ static void run_oracle(float* y, int T, int N_theta, int N_inner,
  *═══════════════════════════════════════════════════════════════════════════*/
 
 #ifndef N_THETA_TEST
-#define N_THETA_TEST 2048
+#define N_THETA_TEST 1024
 #endif
 #ifndef N_INNER_TEST
 #define N_INNER_TEST 512
