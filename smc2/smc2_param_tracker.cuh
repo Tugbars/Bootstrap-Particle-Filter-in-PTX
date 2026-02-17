@@ -12,7 +12,8 @@
  *   State model:     θ_{k+1} = θ_k + w_k,       w_k ~ N(0, Q)
  *   Measurement:     z_k = θ_k + v_k,            v_k ~ N(0, Σ_k)
  *
- * H = I (identity), F = I (random walk). Plain linear Kalman — no EKF/UKF needed.
+ * H = I (identity), F = I (random walk). Plain linear Kalman — no EKF/UKF
+ * needed.
  *
  * Q encodes parameter drift rates:
  *   - Fast:  μ_base                  (tracks market level, shifts weekly)
@@ -46,8 +47,9 @@ extern "C" {
 /**
  * @brief Curve evaluation: f(z) = base + scale * (1 - exp(-rate * z))
  */
-static inline float eval_curve_host(float base, float scale, float rate, float z) {
-    return base + scale * (1.0f - expf(-rate * z));
+static inline float eval_curve_host(float base, float scale, float rate,
+                                    float z) {
+  return base + scale * (1.0f - expf(-rate * z));
 }
 
 /**
@@ -56,38 +58,39 @@ static inline float eval_curve_host(float base, float scale, float rate, float z
  * Everything the production BPF needs, evaluated at the current z̄.
  */
 typedef struct {
-    /* Filtered 8D parameters (Kalman state) */
-    float theta[N_PARAMS];       /**< [ρ, σ_total, r, μ_base, μ_scale, μ_rate, σ_scale, σ_rate] */
-    float P_diag[N_PARAMS];      /**< Diagonal of Kalman P (parameter uncertainty) */
+  /* Filtered 8D parameters (Kalman state) */
+  float theta[N_PARAMS]; /**< [ρ, σ_total, r, μ_base, μ_scale, μ_rate, σ_scale,
+                            σ_rate] */
+  float P_diag[N_PARAMS]; /**< Diagonal of Kalman P (parameter uncertainty) */
 
-    /* Derived physical parameters */
-    float sigma_z;               /**< r · σ_total */
-    float sigma_base;            /**< √(1-r²) · σ_total */
+  /* Derived physical parameters */
+  float sigma_z;    /**< r · σ_total */
+  float sigma_base; /**< √(1-r²) · σ_total */
 
-    /* Curves evaluated at current z̄ */
-    float z_mean;                /**< Posterior mean stress level */
-    float mu;                    /**< μ(z̄) — target for BPF μ parameter */
-    float sigma_h;               /**< σ_h(z̄) — target for BPF σ_z parameter */
-    float theta_speed;           /**< θ(z̄) — mean-reversion speed at current stress */
+  /* Curves evaluated at current z̄ */
+  float z_mean;      /**< Posterior mean stress level */
+  float mu;          /**< μ(z̄) — target for BPF μ parameter */
+  float sigma_h;     /**< σ_h(z̄) — target for BPF σ_z parameter */
+  float theta_speed; /**< θ(z̄) — mean-reversion speed at current stress */
 
-    /* Diagnostics */
-    int n_updates;               /**< Number of Kalman updates performed */
-    float last_accept_rate;      /**< SMC² acceptance rate from last window */
-    float last_ess;              /**< SMC² outer ESS from last window */
+  /* Diagnostics */
+  int n_updates;          /**< Number of Kalman updates performed */
+  float last_accept_rate; /**< SMC² acceptance rate from last window */
+  float last_ess;         /**< SMC² outer ESS from last window */
 } ParamSnapshot;
 
 /**
  * @brief Process noise (Q) presets for different parameter drift rates
  */
 typedef struct {
-    float q_rho;                 /**< ρ drift variance per window */
-    float q_sigma_total;         /**< σ_total drift variance */
-    float q_r_split;             /**< r_split drift variance */
-    float q_mu_base;             /**< μ_base drift variance (fastest) */
-    float q_mu_scale;            /**< μ_scale drift variance (slow) */
-    float q_mu_rate;             /**< μ_rate drift variance (slow) */
-    float q_sigma_scale;         /**< σ_scale drift variance (slow) */
-    float q_sigma_rate;          /**< σ_rate drift variance (slow) */
+  float q_rho;         /**< ρ drift variance per window */
+  float q_sigma_total; /**< σ_total drift variance */
+  float q_r_split;     /**< r_split drift variance */
+  float q_mu_base;     /**< μ_base drift variance (fastest) */
+  float q_mu_scale;    /**< μ_scale drift variance (slow) */
+  float q_mu_rate;     /**< μ_rate drift variance (slow) */
+  float q_sigma_scale; /**< σ_scale drift variance (slow) */
+  float q_sigma_rate;  /**< σ_rate drift variance (slow) */
 } DriftConfig;
 
 /**
@@ -103,25 +106,25 @@ typedef struct ParamTracker ParamTracker;
  * @param N_inner       SMC² inner (RBPF) particle count
  * @return              Tracker instance, or NULL on failure
  */
-ParamTracker* param_tracker_create(int window_size, int stride,
-                                    int N_theta, int N_inner);
+ParamTracker *param_tracker_create(int window_size, int stride, int N_theta,
+                                   int N_inner);
 
 /**
  * @brief Destroy tracker and free all resources (including SMC² instance)
  */
-void param_tracker_destroy(ParamTracker* t);
+void param_tracker_destroy(ParamTracker *t);
 
 /**
  * @brief Feed one observation into the circular buffer
  * @param y_obs  Observation (log(y²) for OCSN, or raw return — match your DGP)
  */
-void param_tracker_feed(ParamTracker* t, float y_obs);
+void param_tracker_feed(ParamTracker *t, float y_obs);
 
 /**
  * @brief Check if enough new observations have accumulated to run a window
  * @return 1 if stride ticks have passed since last window, 0 otherwise
  */
-int param_tracker_window_ready(const ParamTracker* t);
+int param_tracker_window_ready(const ParamTracker *t);
 
 /**
  * @brief Run SMC² on the current window, then Kalman update
@@ -132,13 +135,13 @@ int param_tracker_window_ready(const ParamTracker* t);
  * This is the expensive call — runs SMC² on `window_size` observations.
  * Call only when param_tracker_window_ready() returns 1.
  */
-void param_tracker_run_window(ParamTracker* t);
+void param_tracker_run_window(ParamTracker *t);
 
 /**
  * @brief Get the current filtered parameter snapshot
  * @param snap  Output snapshot with filtered params + BPF-ready values
  */
-void param_tracker_get_snapshot(const ParamTracker* t, ParamSnapshot* snap);
+void param_tracker_get_snapshot(const ParamTracker *t, ParamSnapshot *snap);
 
 /**
  * @brief Set process noise (drift rates) for the Kalman filter
@@ -147,7 +150,7 @@ void param_tracker_get_snapshot(const ParamTracker* t, ParamSnapshot* snap);
  * Defaults are set in param_tracker_create(). Call this to override.
  * Larger Q → faster tracking, more noise. Smaller Q → smoother, more lag.
  */
-void param_tracker_set_drift(ParamTracker* t, const DriftConfig* drift);
+void param_tracker_set_drift(ParamTracker *t, const DriftConfig *drift);
 
 /**
  * @brief Set the fixed θ(z) curve used for curve evaluation
@@ -155,7 +158,8 @@ void param_tracker_set_drift(ParamTracker* t, const DriftConfig* drift);
  * θ(z) is not learned by SMC² — it's derived from sufficient statistics.
  * Update this periodically if you compute φ-based estimates.
  */
-void param_tracker_set_theta_curve(ParamTracker* t, float base, float scale, float rate);
+void param_tracker_set_theta_curve(ParamTracker *t, float base, float scale,
+                                   float rate);
 
 /**
  * @brief Set minimum P diagonal values (prevents Kalman lockup)
@@ -168,7 +172,7 @@ void param_tracker_set_theta_curve(ParamTracker* t, float base, float scale, flo
  *
  * @param p_floor  Array of N_PARAMS minimum P diagonal values
  */
-void param_tracker_set_P_floor(ParamTracker* t, const float* p_floor);
+void param_tracker_set_P_floor(ParamTracker *t, const float *p_floor);
 
 /**
  * @brief Access the internal SMC² state (for custom prior/bounds setup)
@@ -176,12 +180,12 @@ void param_tracker_set_P_floor(ParamTracker* t, const float* p_floor);
  * Call BEFORE the first param_tracker_run_window().
  * Modify priors, bounds, proposal stds, etc. directly on the returned state.
  */
-SMC2StateCUDA* param_tracker_get_smc2(ParamTracker* t);
+SMC2StateCUDA *param_tracker_get_smc2(ParamTracker *t);
 
 /**
  * @brief Get the full Kalman covariance P (8×8, row-major)
  */
-void param_tracker_get_P(const ParamTracker* t, float* P_out);
+void param_tracker_get_P(const ParamTracker *t, float *P_out);
 
 #ifdef __cplusplus
 }
