@@ -270,6 +270,10 @@ struct SMC2StateCUDA {
     SVCurve theta_curve;             /**< θ(z) curve (fixed, not learned) */
     float proposal_std[N_PARAMS];    /**< Random walk proposal std (8D) */
     
+    /* ═══ Fixed parameter mask (4-param fast mode) ═══ */
+    uint8_t fixed_mask[N_PARAMS];    /**< 1 = fixed (not learned), 0 = learned */
+    float   fixed_values[N_PARAMS];  /**< Values for fixed params */
+    
     /* ═══ Algorithm settings ═══ */
     float ess_threshold_outer;
     float ess_threshold_inner;
@@ -547,6 +551,23 @@ void smc2_cuda_set_cpmmh_rho(SMC2StateCUDA* state, float rho);
  * Order: [rho, sigma_total, r_split, mu_base, mu_scale, mu_rate, sigma_scale, sigma_rate]
  */
 void smc2_cuda_set_proposal_std(SMC2StateCUDA* state, const float* std);
+
+/**
+ * @brief Set which parameters are fixed (not learned) during SMC²
+ *
+ * Fixed params are not sampled in init, not perturbed in CPMMH, and
+ * have no prior penalty. Use for 4-param fast mode:
+ *   mask = [0,0,0,0, 1,1,1,1]  (fix curve params)
+ *   values = [-, -, -, -, μ_scale, μ_rate, σ_scale, σ_rate]
+ *
+ * Default: all zeros (all 8 params learned).
+ *
+ * @param mask    Array of N_PARAMS: 1=fixed, 0=learned
+ * @param values  Array of N_PARAMS: values for fixed params (ignored for learned)
+ */
+void smc2_cuda_set_fixed_params(SMC2StateCUDA* state,
+                                 const uint8_t* mask,
+                                 const float* values);
 
 void smc2_cuda_init_from_prior(SMC2StateCUDA* state);
 

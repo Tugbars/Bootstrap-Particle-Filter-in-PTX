@@ -416,6 +416,31 @@ set_target_properties(test_param_tracker PROPERTIES
 )
 
 # ==============================================================================
+# Target: test_4param_drift (Dual-timescale theory validation)
+#
+# Two tests:
+#   A: 4-param fast mode + Kalman + drift (should PASS — no ridge)
+#   B: 8-param Kalman 50k ticks + drift (expected to FAIL — ridge persists)
+# ==============================================================================
+
+add_executable(test_4param_drift smc2/test_4param_drift.cu)
+
+target_link_libraries(test_4param_drift PRIVATE
+    smc2_rbpf
+    CUDA::cudart
+    CUDA::curand
+)
+
+target_include_directories(test_4param_drift PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/smc2
+)
+
+set_target_properties(test_4param_drift PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+# ==============================================================================
 # Target: test_mu_learning (μ learning diagnostic)
 # ==============================================================================
 

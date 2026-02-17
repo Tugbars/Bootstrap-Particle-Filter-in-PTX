@@ -156,6 +156,8 @@ __constant__ SVBounds      d_bounds;
 __constant__ SVCurve       d_theta_curve;
 __constant__ float         d_proposal_std[N_PARAMS];
 __constant__ float         d_proposal_chol[N_PARAMS * N_PARAMS];
+__constant__ uint8_t       d_fixed_mask[N_PARAMS];    /* 1 = fixed (not learned) */
+__constant__ float         d_fixed_values[N_PARAMS];  /* values for fixed params */
 
 /*═══════════════════════════════════════════════════════════════════════════════
  * LOG PRIOR — 8 parameters
@@ -177,14 +179,14 @@ __device__ float log_prior_theta(
     if (sigma_scale < d_bounds.sigma_scale_min || sigma_scale > d_bounds.sigma_scale_max) return -INFINITY;
     if (sigma_rate < d_bounds.sigma_rate_min || sigma_rate > d_bounds.sigma_rate_max) return -INFINITY;
     
-    float d_rho = (rho - d_prior.rho_mean) / d_prior.rho_std;
-    float d_st  = (sigma_total - d_prior.sigma_total_mean) / d_prior.sigma_total_std;
-    float d_rs  = (r_split - d_prior.r_split_mean) / d_prior.r_split_std;
-    float d_mb  = (mu_base - d_prior.mu_base_mean) / d_prior.mu_base_std;
-    float d_ms  = (mu_scale - d_prior.mu_scale_mean) / d_prior.mu_scale_std;
-    float d_mr  = (mu_rate - d_prior.mu_rate_mean) / d_prior.mu_rate_std;
-    float d_ss  = (sigma_scale - d_prior.sigma_scale_mean) / d_prior.sigma_scale_std;
-    float d_sr  = (sigma_rate - d_prior.sigma_rate_mean) / d_prior.sigma_rate_std;
+    float d_rho = d_fixed_mask[0] ? 0.0f : (rho - d_prior.rho_mean) / d_prior.rho_std;
+    float d_st  = d_fixed_mask[1] ? 0.0f : (sigma_total - d_prior.sigma_total_mean) / d_prior.sigma_total_std;
+    float d_rs  = d_fixed_mask[2] ? 0.0f : (r_split - d_prior.r_split_mean) / d_prior.r_split_std;
+    float d_mb  = d_fixed_mask[3] ? 0.0f : (mu_base - d_prior.mu_base_mean) / d_prior.mu_base_std;
+    float d_ms  = d_fixed_mask[4] ? 0.0f : (mu_scale - d_prior.mu_scale_mean) / d_prior.mu_scale_std;
+    float d_mr  = d_fixed_mask[5] ? 0.0f : (mu_rate - d_prior.mu_rate_mean) / d_prior.mu_rate_std;
+    float d_ss  = d_fixed_mask[6] ? 0.0f : (sigma_scale - d_prior.sigma_scale_mean) / d_prior.sigma_scale_std;
+    float d_sr  = d_fixed_mask[7] ? 0.0f : (sigma_rate - d_prior.sigma_rate_mean) / d_prior.sigma_rate_std;
     
     return -0.5f * (d_rho*d_rho + d_st*d_st + d_rs*d_rs + d_mb*d_mb
                   + d_ms*d_ms + d_mr*d_mr + d_ss*d_ss + d_sr*d_sr);
@@ -267,6 +269,16 @@ __global__ void kernel_init_from_prior(
         }
         
         /* Derive physical params: σ_z = r·σ_total, σ_base = √(1-r²)·σ_total */
+        /* Override fixed params with constant values */
+        if (d_fixed_mask[0]) s_rho         = d_fixed_values[0];
+        if (d_fixed_mask[1]) s_sigma_total = d_fixed_values[1];
+        if (d_fixed_mask[2]) s_r_split     = d_fixed_values[2];
+        if (d_fixed_mask[3]) s_mu_base     = d_fixed_values[3];
+        if (d_fixed_mask[4]) s_mu_scale    = d_fixed_values[4];
+        if (d_fixed_mask[5]) s_mu_rate     = d_fixed_values[5];
+        if (d_fixed_mask[6]) s_sigma_scale = d_fixed_values[6];
+        if (d_fixed_mask[7]) s_sigma_rate  = d_fixed_values[7];
+
         s_sigma_z = s_r_split * s_sigma_total;
         s_sigma_base = sqrtf(fmaxf(1.0f - s_r_split * s_r_split, 1e-6f)) * s_sigma_total;
         
@@ -851,6 +863,10 @@ void kernel_cpmmh_rejuvenate_fused_impl(
                 pert[i] = d_proposal_std[i] * z_rnd[i];
         }
         
+        /* Zero perturbation for fixed params — they don't move */
+        for (int i = 0; i < N_PARAMS; i++)
+            if (d_fixed_mask[i]) pert[i] = 0.0f;
+        
         s_rho_prop          = s_rho_curr          + pert[0];
         s_sigma_total_prop  = s_sigma_total_curr  + pert[1];
         s_r_split_prop      = s_r_split_curr      + pert[2];
@@ -1290,7 +1306,11 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     state->proposal_std[5] = 0.1f;     /* mu_rate */
     state->proposal_std[6] = 0.02f;    /* sigma_scale */
     state->proposal_std[7] = 0.1f;     /* sigma_rate */
-    
+
+    /* Default: all params learned (no fixed params) */
+    memset(state->fixed_mask, 0, sizeof(state->fixed_mask));
+    memset(state->fixed_values, 0, sizeof(state->fixed_values));
+
     /* FIX #11: Default fixed-lag to 50 to prevent O(T) rejuvenation cost */
     state->fixed_lag_L = 50;
     state->t_checkpoint = -1;
@@ -1525,6 +1545,16 @@ void smc2_cuda_set_cpmmh_rho(SMC2StateCUDA* state, float rho) {
     state->cpmmh_rho = rho;
 }
 
+void smc2_cuda_set_fixed_params(SMC2StateCUDA* state,
+                                 const uint8_t* mask,
+                                 const float* values) {
+    memcpy(state->fixed_mask, mask, N_PARAMS * sizeof(uint8_t));
+    memcpy(state->fixed_values, values, N_PARAMS * sizeof(float));
+    /* Upload to constant memory immediately so next init/update sees them */
+    CUDA_CHECK(cudaMemcpyToSymbol(d_fixed_mask, state->fixed_mask, N_PARAMS * sizeof(uint8_t)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_fixed_values, state->fixed_values, N_PARAMS * sizeof(float)));
+}
+
 /*═══════════════════════════════════════════════════════════════════════════════
  * Adaptive Proposal Covariance (8×8)
  *═══════════════════════════════════════════════════════════════════════════════*/
@@ -1584,6 +1614,8 @@ void smc2_cuda_init_from_prior(SMC2StateCUDA* state) {
     CUDA_CHECK(cudaMemcpyToSymbol(d_bounds, &state->bounds, sizeof(SVBounds)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_theta_curve, &state->theta_curve, sizeof(SVCurve)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_proposal_std, state->proposal_std, N_PARAMS * sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_fixed_mask, state->fixed_mask, N_PARAMS * sizeof(uint8_t)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_fixed_values, state->fixed_values, N_PARAMS * sizeof(float)));
     
     /* Initial Cholesky = diagonal from proposal_std */
     float h_chol[N_PARAMS * N_PARAMS] = {0};
@@ -1699,6 +1731,8 @@ void smc2_cuda_init_warm(SMC2StateCUDA* state,
     CUDA_CHECK(cudaMemcpyToSymbol(d_theta_curve, &state->theta_curve, sizeof(SVCurve)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_proposal_std, state->proposal_std, N_PARAMS * sizeof(float)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_proposal_chol, h_chol, N_PARAMS * N_PARAMS * sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_fixed_mask, state->fixed_mask, N_PARAMS * sizeof(uint8_t)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_fixed_values, state->fixed_values, N_PARAMS * sizeof(float)));
 
     int N_total = state->N_theta * state->N_inner;
     unsigned long long rng_seed = (state->user_seed != 0) ? state->user_seed : 12345ULL;
