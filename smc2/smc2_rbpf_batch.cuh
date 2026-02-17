@@ -274,6 +274,11 @@ struct SMC2StateCUDA {
     float ess_threshold_outer;
     float ess_threshold_inner;
     int K_rejuv;
+
+    /* ═══ Batch update acceleration ═══ */
+    cudaStream_t compute_stream;     /**< Stream for async kernel + memcpy */
+    float* h_ess_pinned;             /**< Pinned host memory for async ESS readback */
+    int ess_check_interval;          /**< Check ESS every N ticks in batch mode (default 10) */
     
     /* ═══ Fixed-Lag PMMH ═══ */
     int fixed_lag_L;
@@ -544,7 +549,39 @@ void smc2_cuda_set_cpmmh_rho(SMC2StateCUDA* state, float rho);
 void smc2_cuda_set_proposal_std(SMC2StateCUDA* state, const float* std);
 
 void smc2_cuda_init_from_prior(SMC2StateCUDA* state);
+
+/**
+ * @brief Initialize θ-particles from a warm Gaussian prior (closes the Kalman loop)
+ *
+ * Instead of sampling from the flat prior, samples from N(warm_mean, warm_cov)
+ * clipped to bounds. Also updates the CPMMH prior and proposal to match.
+ *
+ * Usage: After the first window, the Kalman predicts (x̄, P̄ = P + Q).
+ * Pass x̄ as warm_mean and P̄ as warm_cov. This constrains slow parameters
+ * to their accumulated estimates while letting fast parameters explore.
+ *
+ * @param warm_mean  8D parameter means (Kalman predicted state)
+ * @param warm_cov   8×8 covariance matrix (Kalman P̄ = P + Q, row-major)
+ */
+void smc2_cuda_init_warm(SMC2StateCUDA* state,
+                          const float* warm_mean,
+                          const float* warm_cov);
+
 float smc2_cuda_update(SMC2StateCUDA* state, float y_obs);
+
+/**
+ * @brief Process multiple observations in batch mode (reduced sync overhead)
+ *
+ * Uploads all observations in one transfer, then processes tick-by-tick
+ * with deferred ESS checks every `ess_check_interval` ticks.
+ * On WDDM this saves ~375ms per 3000-tick window by eliminating
+ * per-tick synchronization.
+ *
+ * @param y_batch   Array of n_obs observations
+ * @param n_obs     Number of observations to process
+ * @return          Final ESS after last observation
+ */
+float smc2_cuda_update_batch(SMC2StateCUDA* state, const float* y_batch, int n_obs);
 
 /**
  * @brief Get posterior mean of learned θ parameters

@@ -341,8 +341,7 @@ void param_tracker_run_window(ParamTracker* t) {
     /* Reset and run SMC² on this window */
     smc2_cuda_init_from_prior(t->smc2);
 
-    for (int i = 0; i < W; i++)
-        smc2_cuda_update(t->smc2, window[i]);
+    smc2_cuda_update_batch(t->smc2, window, W);
 
     /* Extract posterior mean and covariance */
     float z_meas[N_PARAMS];
