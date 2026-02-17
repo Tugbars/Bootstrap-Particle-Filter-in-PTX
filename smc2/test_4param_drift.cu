@@ -191,7 +191,7 @@ void test_4param_drift(void) {
     int T_total = 12000;
     int t_shift = 6000;
     int W = 3000;
-    int STRIDE = 1500;
+    int STRIDE = 1000;
 
     float* y = (float*)malloc(T_total * sizeof(float));
     simulate_rsv_drift(&truth, mu_base_phase2, t_shift, y, T_total);
