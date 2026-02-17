@@ -135,7 +135,7 @@
 #define N_PARAMS 8
 
 #ifndef SORT_EVERY_K
-#define SORT_EVERY_K  4
+#define SORT_EVERY_K  7
 #endif
 
 #define Z_CENTER 1.5f
