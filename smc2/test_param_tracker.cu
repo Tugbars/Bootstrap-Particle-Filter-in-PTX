@@ -293,12 +293,14 @@ void test_fixed_params(void) {
         ParamSnapshot snap;
         param_tracker_get_snapshot(tracker, &snap);
         printf("\n  After window %d (t=%d..%d):\n", w + 1, t_start, t_start + W - 1);
-        printf("  %-14s  %8s  %8s  %8s\n", "Parameter", "Kalman", "±√P", "True");
-        printf("  ───────────────────────────────────────────────────\n");
+        printf("  %-14s  %8s  %8s  %8s  %7s\n", "Parameter", "Kalman", "±√P", "True", "Err%");
+        printf("  ────────────────────────────────────────────────────────────\n");
         for (int i = 0; i < N_PARAMS; i++) {
             float std_p = sqrtf(fmaxf(snap.P_diag[i], 0.0f));
-            printf("  %-14s  %8.4f  %8.4f  %8.4f\n",
-                   param_names[i], snap.theta[i], std_p, tv[i]);
+            float err = snap.theta[i] - tv[i];
+            float pct = (fabsf(tv[i]) > 0.01f) ? 100.0f * err / tv[i] : err * 100.0f;
+            printf("  %-14s  %8.4f  %8.4f  %8.4f  %+6.1f%%\n",
+                   param_names[i], snap.theta[i], std_p, tv[i], pct);
         }
         printf("  SMC²: ESS=%.1f  accept=%.1f%%\n",
                snap.last_ess, snap.last_accept_rate * 100.0f);
