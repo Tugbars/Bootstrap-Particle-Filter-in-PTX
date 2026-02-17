@@ -1867,6 +1867,83 @@ static void smc2_cuda_get_theta_moments_internal(
     for (int i = 0; i < N_PARAMS; i++) free(h_params[i]);
 }
 
+
+void smc2_cuda_get_theta_cov(SMC2StateCUDA* state, float* theta_mean, float* theta_cov) {
+    float* h_weight = (float*)malloc(state->N_theta * sizeof(float));
+    float* h_params[N_PARAMS];
+    for (int i = 0; i < N_PARAMS; i++) h_params[i] = (float*)malloc(state->N_theta * sizeof(float));
+    
+    CUDA_CHECK(cudaMemcpy(h_weight, state->d_particles.weight, state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_params[0], state->d_particles.rho, state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_params[1], state->d_particles.sigma_total, state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_params[2], state->d_particles.r_split, state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_params[3], state->d_particles.mu_base, state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_params[4], state->d_particles.mu_scale, state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_params[5], state->d_particles.mu_rate, state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_params[6], state->d_particles.sigma_scale, state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_params[7], state->d_particles.sigma_rate, state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
+    
+    /* Weighted mean */
+    for (int i = 0; i < N_PARAMS; i++) theta_mean[i] = 0.0f;
+    for (int j = 0; j < state->N_theta; j++) {
+        float w = h_weight[j];
+        for (int i = 0; i < N_PARAMS; i++) theta_mean[i] += w * h_params[i][j];
+    }
+    
+    /* Weighted covariance: Σ_ij = Σ_k w_k (θ_i^k - μ_i)(θ_j^k - μ_j) */
+    for (int i = 0; i < N_PARAMS * N_PARAMS; i++) theta_cov[i] = 0.0f;
+    for (int k = 0; k < state->N_theta; k++) {
+        float w = h_weight[k];
+        for (int i = 0; i < N_PARAMS; i++) {
+            float di = h_params[i][k] - theta_mean[i];
+            for (int j = i; j < N_PARAMS; j++) {
+                float dj = h_params[j][k] - theta_mean[j];
+                theta_cov[i * N_PARAMS + j] += w * di * dj;
+            }
+        }
+    }
+    /* Symmetrize */
+    for (int i = 0; i < N_PARAMS; i++)
+        for (int j = 0; j < i; j++)
+            theta_cov[i * N_PARAMS + j] = theta_cov[j * N_PARAMS + i];
+    
+    free(h_weight);
+    for (int i = 0; i < N_PARAMS; i++) free(h_params[i]);
+}
+
+/*═══════════════════════════════════════════════════════════════════════════════
+ * Posterior mean of z — weighted across outer and inner particles
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
+float smc2_cuda_get_z_mean(SMC2StateCUDA* state) {
+    int N_total = state->N_theta * state->N_inner;
+    float* h_weight = (float*)malloc(state->N_theta * sizeof(float));
+    float* h_z = (float*)malloc(N_total * sizeof(float));
+    
+    CUDA_CHECK(cudaMemcpy(h_weight, state->d_particles.weight,
+                          state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_z, state->d_particles.inner_z,
+                          N_total * sizeof(float), cudaMemcpyDeviceToHost));
+    
+    /* Per theta-particle: mean z across inner particles */
+    float z_global = 0.0f;
+    for (int j = 0; j < state->N_theta; j++) {
+        float z_sum = 0.0f;
+        int base = j * state->N_inner;
+        for (int i = 0; i < state->N_inner; i++) {
+            float zt = h_z[base + i];
+            float z = 1.5f * (1.0f + tanhf(zt));
+            z_sum += z;
+        }
+        z_global += h_weight[j] * (z_sum / state->N_inner);
+    }
+    
+    free(h_weight);
+    free(h_z);
+    return z_global;
+}
+
+
 void smc2_cuda_get_theta_mean(SMC2StateCUDA* state, float* theta_mean) {
     smc2_cuda_get_theta_moments_internal(state, theta_mean, NULL);
 }

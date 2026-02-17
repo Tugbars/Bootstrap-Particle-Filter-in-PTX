@@ -553,6 +553,24 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs);
  */
 void smc2_cuda_get_theta_mean(SMC2StateCUDA* state, float* theta_mean);
 void smc2_cuda_get_theta_std(SMC2StateCUDA* state, float* theta_std);
+
+/**
+ * @brief Get posterior mean AND full 8×8 covariance of learned θ parameters
+ * @param theta_mean  Output array of size N_PARAMS (posterior means)
+ * @param theta_cov   Output array of size N_PARAMS×N_PARAMS (row-major covariance)
+ * 
+ * Used by the Kalman parameter tracker as the measurement + measurement noise.
+ */
+void smc2_cuda_get_theta_cov(SMC2StateCUDA* state, float* theta_mean, float* theta_cov);
+
+/**
+ * @brief Get posterior mean of latent stress z
+ * @return  Weighted mean z across all outer/inner particles
+ * 
+ * Used to evaluate curves μ(z̄), σ_h(z̄), θ(z̄) for the production BPF.
+ */
+float smc2_cuda_get_z_mean(SMC2StateCUDA* state);
+
 float smc2_cuda_get_outer_ess(SMC2StateCUDA* state);
 
 /** @brief Internal: update adaptive proposal covariance from particle cloud */

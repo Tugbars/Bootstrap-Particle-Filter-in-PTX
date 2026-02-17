@@ -4,7 +4,7 @@
 # Directory layout:
 #   gpu_bpf/          — Host-side BPF/APF implementations + PTX driver
 #   ptx_assembly/     — Hand-written PTX kernels and pre-compiled cubins
-#   smc2/             — SMC² RBPF parameter learner (4-param, regime-switching)
+#   smc2/             — SMC² RBPF parameter learner (8-param, regime-switching)
 #   tests/            — Test harnesses and diagnostics
 #   csv_bank/         — Data files
 #
@@ -208,15 +208,21 @@ set_target_properties(gpu_bpf_ptx_full PROPERTIES
 )
 
 # ==============================================================================
-# Library: smc2_rbpf (SMC² + RBPF parameter learner, 4-param)
+# Library: smc2_rbpf (SMC² + RBPF parameter learner, 8-param)
 #
-# Learns θ = (ρ, σ_z, μ_base, σ_base) for regime-switching stochastic
-# volatility model. RBPF inner filter with OCSN Kalman updates.
-# CPMMH rejuvenation with bucket sort coupling.
-# Fixed curve shapes (μ_scale, μ_rate, σ_scale, σ_rate) in constant memory.
+# Learns θ = (ρ, σ_total, r_split, μ_base, μ_scale, μ_rate, σ_scale, σ_rate)
+# for regime-switching stochastic volatility model.
+# RBPF inner filter with OCSN Kalman updates.
+# CPMMH rejuvenation with adaptive Cholesky proposals.
+#
+# Includes Kalman parameter tracker (smc2_param_tracker) for sliding-window
+# fusion: SMC² (sensor) → Kalman (tracker) → BPF (reflex).
 # ==============================================================================
 
-add_library(smc2_rbpf STATIC smc2/smc2_rbpf_batch.cu)
+add_library(smc2_rbpf STATIC
+    smc2/smc2_rbpf_batch.cu
+    smc2/smc2_param_tracker.cu
+)
 
 target_link_libraries(smc2_rbpf PRIVATE
     CUDA::cudart
@@ -359,7 +365,7 @@ target_include_directories(test_cond_resample PRIVATE gpu_bpf)
 target_link_libraries(test_cond_resample curand)
 
 # ==============================================================================
-# Target: test_smc2_rbpf (SMC² + RBPF convergence tests, 4-param)
+# Target: test_smc2_rbpf (SMC² + RBPF convergence tests, 8-param)
 #
 # Simulates from regime-switching SV model with known params, checks recovery.
 # Tests: single window, multi-window, high-vol stress, CPMMH acceptance,
@@ -379,6 +385,32 @@ target_include_directories(test_smc2_rbpf PRIVATE
 )
 
 set_target_properties(test_smc2_rbpf PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+# ==============================================================================
+# Target: test_param_tracker (Kalman parameter tracker — Oracle vs Tracker)
+#
+# Three tests:
+#   1. Fixed params: Kalman (4×T=3000) vs Oracle (1×T=12000)
+#   2. Convergence: P shrinks monotonically across windows
+#   3. Drifting μ_base: Kalman tracks shift, Oracle averages it out
+# ==============================================================================
+
+add_executable(test_param_tracker smc2/test_param_tracker.cu)
+
+target_link_libraries(test_param_tracker PRIVATE
+    smc2_rbpf
+    CUDA::cudart
+    CUDA::curand
+)
+
+target_include_directories(test_param_tracker PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/smc2
+)
+
+set_target_properties(test_param_tracker PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
 )
