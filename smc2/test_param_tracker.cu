@@ -238,7 +238,7 @@ static void run_oracle(float* y, int T, int N_theta, int N_inner,
 
 void test_fixed_params(void) {
     printf("\n╔═══════════════════════════════════════════════════════════════╗\n");
-    printf("║  Test 1+2: Fixed Params — Oracle vs Kalman Tracker          ║\n");
+    printf("║  Test 1+2: Fixed Params — Oracle vs Kalman (overlapping)    ║\n");
     printf("╚═══════════════════════════════════════════════════════════════╝\n");
 
     RSVParams truth = make_truth(0.95, 0.10, -1.0, 0.15);
@@ -247,7 +247,7 @@ void test_fixed_params(void) {
 
     int T_total = 12000;
     int W = 3000;
-    int n_windows = T_total / W;
+    int STRIDE = 1500;
 
     float* y = (float*)malloc(T_total * sizeof(float));
     simulate_rsv(&truth, y, T_total);
@@ -256,7 +256,7 @@ void test_fixed_params(void) {
            truth.rho, truth.sigma_total, truth.r_split, truth.mu_base);
     printf("             μ_scale=%.2f  μ_rate=%.2f  σ_scale=%.2f  σ_rate=%.2f\n",
            truth.mu_scale, truth.mu_rate, truth.sigma_scale, truth.sigma_rate);
-    printf("T=%d, %d non-overlapping windows of %d\n\n", T_total, n_windows, W);
+    printf("T=%d, W=%d, stride=%d (overlap=%d)\n\n", T_total, W, STRIDE, W - STRIDE);
 
     /* ── Oracle: single long run ── */
     printf("── Running Oracle (single SMC² on T=%d) ──\n", T_total);
@@ -273,63 +273,68 @@ void test_fixed_params(void) {
 
     print_comparison("Oracle (T=12000, single run)", oracle_mean, oracle_std, tv, 0);
 
-    /* ── Kalman tracker: 4 windows ── */
-    printf("\n── Running Kalman Tracker (%d windows of %d) ──\n", n_windows, W);
+    /* ── Kalman tracker: overlapping windows ── */
+    printf("\n── Running Kalman Tracker (W=%d, stride=%d) ──\n", W, STRIDE);
 
-    ParamTracker* tracker = param_tracker_create(W, W, N_THETA_TEST, N_INNER_TEST);
+    ParamTracker* tracker = param_tracker_create(W, STRIDE, N_THETA_TEST, N_INNER_TEST);
     smc2_cuda_set_seed(param_tracker_get_smc2(tracker), 88888);
 
+    int n_windows = 0;
     cudaEventRecord(ev0);
-    for (int w = 0; w < n_windows; w++) {
-        /* Feed one window of observations */
-        int t_start = w * W;
-        for (int t = 0; t < W; t++)
-            param_tracker_feed(tracker, y[t_start + t]);
+    for (int t = 0; t < T_total; t++) {
+        param_tracker_feed(tracker, y[t]);
 
-        /* Run window */
-        param_tracker_run_window(tracker);
+        if (param_tracker_window_ready(tracker)) {
+            param_tracker_run_window(tracker);
+            n_windows++;
 
-        /* Print convergence (Test 2) */
-        ParamSnapshot snap;
-        param_tracker_get_snapshot(tracker, &snap);
-        printf("\n  After window %d (t=%d..%d):\n", w + 1, t_start, t_start + W - 1);
-        printf("  %-14s  %8s  %8s  %8s  %7s\n", "Parameter", "Kalman", "±√P", "True", "Err%");
-        printf("  ────────────────────────────────────────────────────────────\n");
-        for (int i = 0; i < N_PARAMS; i++) {
-            float std_p = sqrtf(fmaxf(snap.P_diag[i], 0.0f));
-            float err = snap.theta[i] - tv[i];
-            float pct = (fabsf(tv[i]) > 0.01f) ? 100.0f * err / tv[i] : err * 100.0f;
-            printf("  %-14s  %8.4f  %8.4f  %8.4f  %+6.1f%%\n",
-                   param_names[i], snap.theta[i], std_p, tv[i], pct);
+            /* Print convergence */
+            ParamSnapshot snap;
+            param_tracker_get_snapshot(tracker, &snap);
+            int win_end = t;
+            int win_start = t - W + 1;
+            printf("\n  Window %d (t=%d..%d):\n", n_windows, win_start, win_end);
+            printf("  %-14s  %8s  %8s  %8s  %7s\n",
+                   "Parameter", "Kalman", "±√P", "True", "Err%");
+            printf("  ────────────────────────────────────────────────────────────\n");
+            for (int i = 0; i < N_PARAMS; i++) {
+                float std_p = sqrtf(fmaxf(snap.P_diag[i], 0.0f));
+                float err = snap.theta[i] - tv[i];
+                float pct = (fabsf(tv[i]) > 0.01f) ? 100.0f * err / tv[i] : err * 100.0f;
+                printf("  %-14s  %8.4f  %8.4f  %8.4f  %+6.1f%%\n",
+                       param_names[i], snap.theta[i], std_p, tv[i], pct);
+            }
+            printf("  SMC²: ESS=%.1f  accept=%.1f%%\n",
+                   snap.last_ess, snap.last_accept_rate * 100.0f);
         }
-        printf("  SMC²: ESS=%.1f  accept=%.1f%%\n",
-               snap.last_ess, snap.last_accept_rate * 100.0f);
-        printf("  z̄=%.3f  μ(z̄)=%.4f  σ_h(z̄)=%.4f  θ(z̄)=%.4f\n",
-               snap.z_mean, snap.mu, snap.sigma_h, snap.theta_speed);
     }
     cudaEventRecord(ev1); cudaEventSynchronize(ev1);
     float tracker_ms;
     cudaEventElapsedTime(&tracker_ms, ev0, ev1);
-    printf("\n  Tracker total time: %.1f ms (%.1f ms/window)\n",
-           tracker_ms, tracker_ms / n_windows);
+    printf("\n  Tracker: %d windows, total %.1f ms (%.1f ms/window)\n",
+           n_windows, tracker_ms, tracker_ms / n_windows);
 
     /* Final comparison */
     ParamSnapshot final_snap;
     param_tracker_get_snapshot(tracker, &final_snap);
-    print_comparison("Kalman Tracker (4 × T=3000)", final_snap.theta, final_snap.P_diag, tv, 1);
+    char label[128];
+    snprintf(label, sizeof(label), "Kalman Tracker (%d × T=%d, stride=%d)",
+             n_windows, W, STRIDE);
+    print_comparison(label, final_snap.theta, final_snap.P_diag, tv, 1);
 
     /* ── Side-by-side ── */
     printf("\n  ── Oracle vs Kalman (head-to-head) ──\n\n");
-    printf("  %-14s  %8s  %8s  %8s  %8s  %8s\n",
-           "Parameter", "True", "Oracle", "Kalman", "Orc.Std", "Kal.Std");
-    printf("  ─────────────────────────────────────────────────────────────────\n");
+    printf("  %-14s  %8s  %8s  %8s  %8s  %8s  %6s\n",
+           "Parameter", "True", "Oracle", "Kalman", "Orc.σ", "Kal.σ", "Ratio");
+    printf("  ─────────────────────────────────────────────────────────────────────\n");
     for (int i = 0; i < N_PARAMS; i++) {
         float kal_std = sqrtf(fmaxf(final_snap.P_diag[i], 0.0f));
-        printf("  %-14s  %8.4f  %8.4f  %8.4f  %8.4f  %8.4f\n",
+        float ratio = (kal_std > 1e-8f) ? oracle_std[i] / kal_std : 0.0f;
+        printf("  %-14s  %8.4f  %8.4f  %8.4f  %8.4f  %8.4f  %5.1fx\n",
                param_names[i], tv[i], oracle_mean[i], final_snap.theta[i],
-               oracle_std[i], kal_std);
+               oracle_std[i], kal_std, ratio);
     }
-    printf("  ─────────────────────────────────────────────────────────────────\n");
+    printf("  ─────────────────────────────────────────────────────────────────────\n");
 
     param_tracker_destroy(tracker);
     cudaEventDestroy(ev0);
@@ -343,7 +348,7 @@ void test_fixed_params(void) {
 
 void test_drift(void) {
     printf("\n╔═══════════════════════════════════════════════════════════════╗\n");
-    printf("║  Test 3: Drifting μ_base — Kalman Tracks, Oracle Averages   ║\n");
+    printf("║  Test 3: Drifting μ_base — Overlapping Windows + P Floor    ║\n");
     printf("╚═══════════════════════════════════════════════════════════════╝\n");
 
     RSVParams truth_phase1 = make_truth(0.95, 0.10, -1.0, 0.15);
@@ -352,28 +357,29 @@ void test_drift(void) {
     int T_total = 12000;
     int t_shift = 6000;
     int W = 3000;
-    int n_windows = T_total / W;
+    int STRIDE = 1500;
 
     float* y = (float*)malloc(T_total * sizeof(float));
     simulate_rsv_drift(&truth_phase1, mu_base_phase2, t_shift, y, T_total);
 
     printf("\nDGP: μ_base = -1.0 for t < %d, then μ_base = +1.0 for t >= %d\n",
            t_shift, t_shift);
-    printf("Other params fixed: ρ=%.3f  σ_total=%.4f  r=%.4f\n\n",
+    printf("Other params fixed: ρ=%.3f  σ_total=%.4f  r=%.4f\n",
            truth_phase1.rho, truth_phase1.sigma_total, truth_phase1.r_split);
+    printf("W=%d, stride=%d (overlap=%d)\n\n", W, STRIDE, W - STRIDE);
 
     /* ── Oracle: sees everything, averages over the shift ── */
     printf("── Running Oracle (T=%d, sees both phases) ──\n", T_total);
     float oracle_mean[N_PARAMS], oracle_std[N_PARAMS];
     run_oracle(y, T_total, N_THETA_TEST, N_INNER_TEST, oracle_mean, oracle_std);
 
-    /* ── Kalman tracker: should track the shift ── */
-    printf("\n── Running Kalman Tracker (%d windows of %d) ──\n", n_windows, W);
+    /* ── Kalman tracker: overlapping windows ── */
+    printf("\n── Running Kalman Tracker (W=%d, stride=%d) ──\n", W, STRIDE);
 
-    ParamTracker* tracker = param_tracker_create(W, W, N_THETA_TEST, N_INNER_TEST);
+    ParamTracker* tracker = param_tracker_create(W, STRIDE, N_THETA_TEST, N_INNER_TEST);
     smc2_cuda_set_seed(param_tracker_get_smc2(tracker), 99999);
 
-    /* Increase Q for mu_base so tracker responds to shift */
+    /* Drift config: responsive to μ_base changes */
     DriftConfig drift;
     drift.q_rho = 1e-5f;
     drift.q_sigma_total = 1e-5f;
@@ -385,41 +391,79 @@ void test_drift(void) {
     drift.q_sigma_rate = 1e-7f;
     param_tracker_set_drift(tracker, &drift);
 
-    for (int w = 0; w < n_windows; w++) {
-        int t_start = w * W;
-        for (int t = 0; t < W; t++)
-            param_tracker_feed(tracker, y[t_start + t]);
+    int n_windows = 0;
+    printf("  %-6s  %-15s  %8s  %8s  %8s  %8s  %s\n",
+           "Win", "Range", "μ_base", "±√P", "True", "Err", "Status");
+    printf("  ─────────────────────────────────────────────────────────────────────\n");
 
-        param_tracker_run_window(tracker);
+    for (int t = 0; t < T_total; t++) {
+        param_tracker_feed(tracker, y[t]);
 
-        ParamSnapshot snap;
-        param_tracker_get_snapshot(tracker, &snap);
+        if (param_tracker_window_ready(tracker)) {
+            param_tracker_run_window(tracker);
+            n_windows++;
 
-        float true_mu_base = (t_start + W - 1 < t_shift) ? -1.0f : 1.0f;
-        printf("  Window %d (t=%d..%d): Kalman μ_base=%+.3f  (true=%+.1f)  √P=%.3f\n",
-               w + 1, t_start, t_start + W - 1,
-               snap.theta[3], true_mu_base,
-               sqrtf(fmaxf(snap.P_diag[3], 0.0f)));
+            ParamSnapshot snap;
+            param_tracker_get_snapshot(tracker, &snap);
+
+            int win_end = t;
+            int win_start = t - W + 1;
+
+            /* Determine contamination status */
+            const char* status;
+            float true_mu;
+            if (win_end < t_shift) {
+                status = "pre-shift";
+                true_mu = -1.0f;
+            } else if (win_start >= t_shift) {
+                status = "POST-SHIFT ✓";
+                true_mu = 1.0f;
+            } else {
+                /* Straddles the shift */
+                int post_frac = (int)(100.0f * (win_end - t_shift + 1) / (float)W);
+                static char sbuf[32];
+                snprintf(sbuf, sizeof(sbuf), "MIXED (%d%% post)", post_frac);
+                status = sbuf;
+                true_mu = 1.0f;  /* Compare against final truth */
+            }
+
+            float mu_est = snap.theta[3];
+            float mu_std = sqrtf(fmaxf(snap.P_diag[3], 0.0f));
+            float err = mu_est - true_mu;
+
+            printf("  %-6d  t=%5d..%5d  %+8.3f  %8.4f  %+8.1f  %+8.3f  %s\n",
+                   n_windows, win_start, win_end, mu_est, mu_std,
+                   true_mu, err, status);
+        }
     }
 
     ParamSnapshot final_snap;
     param_tracker_get_snapshot(tracker, &final_snap);
 
     printf("\n  ── Drift Test Summary ──\n\n");
-    printf("  True μ_base (final phase): +1.0\n");
-    printf("  Oracle μ_base estimate:    %+.4f  (averages both phases → biased)\n",
+    printf("  True μ_base (final phase):  +1.0\n");
+    printf("  Oracle μ_base estimate:     %+.4f  (averages both phases)\n",
            oracle_mean[3]);
-    printf("  Kalman μ_base estimate:    %+.4f  (tracks the shift)\n",
+    printf("  Kalman μ_base estimate:     %+.4f  (tracked the shift)\n",
            final_snap.theta[3]);
-    printf("\n  Oracle error:  %+.3f  (should be ~0.0, wrong for both phases)\n",
-           oracle_mean[3] - 1.0f);
-    printf("  Kalman error:  %+.3f  (should be near +1.0)\n",
-           final_snap.theta[3] - 1.0f);
+    printf("  Kalman √P on μ_base:        %.4f\n",
+           sqrtf(fmaxf(final_snap.P_diag[3], 0.0f)));
+    printf("\n  Oracle |error| from +1.0:   %.3f\n",
+           fabsf(oracle_mean[3] - 1.0f));
+    printf("  Kalman |error| from +1.0:   %.3f\n",
+           fabsf(final_snap.theta[3] - 1.0f));
 
     float oracle_off = fabsf(oracle_mean[3] - 1.0f);
     float kalman_off = fabsf(final_snap.theta[3] - 1.0f);
     printf("\n  Kalman closer to true final μ_base? %s  (%.3f vs %.3f)\n",
-           kalman_off < oracle_off ? "YES" : "NO", kalman_off, oracle_off);
+           kalman_off < oracle_off ? "YES ✓" : "NO ✗", kalman_off, oracle_off);
+
+    /* Show all params at end — other params should stay stable */
+    float tv_final[N_PARAMS];
+    get_true_arr(&truth_phase1, tv_final);
+    tv_final[3] = 1.0f;  /* Final phase truth for μ_base */
+    print_comparison("All params (truth = final-phase values)",
+                     final_snap.theta, final_snap.P_diag, tv_final, 1);
 
     param_tracker_destroy(tracker);
     free(y);

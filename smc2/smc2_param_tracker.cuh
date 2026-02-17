@@ -158,6 +158,19 @@ void param_tracker_set_drift(ParamTracker* t, const DriftConfig* drift);
 void param_tracker_set_theta_curve(ParamTracker* t, float base, float scale, float rate);
 
 /**
+ * @brief Set minimum P diagonal values (prevents Kalman lockup)
+ *
+ * If a contaminated SMC² window reports tight Σ on a wrong estimate,
+ * P can collapse to near-zero, making the Kalman gain zero for future
+ * windows. The P floor prevents this by enforcing a minimum uncertainty.
+ *
+ * Default: P_floor[i] = Q[i] (one window's drift worth of uncertainty).
+ *
+ * @param p_floor  Array of N_PARAMS minimum P diagonal values
+ */
+void param_tracker_set_P_floor(ParamTracker* t, const float* p_floor);
+
+/**
  * @brief Access the internal SMC² state (for custom prior/bounds setup)
  *
  * Call BEFORE the first param_tracker_run_window().

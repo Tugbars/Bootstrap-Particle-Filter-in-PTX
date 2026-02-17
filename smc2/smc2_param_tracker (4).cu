@@ -30,7 +30,14 @@ struct ParamTracker {
     float P[N_PARAMS * N_PARAMS];           /* Error covariance (8×8) */
     float Q[N_PARAMS * N_PARAMS];           /* Process noise (diagonal) */
     float P_floor[N_PARAMS];                /* Minimum P diagonal (prevents lockup) */
+    float Q_boost[N_PARAMS];                /* Temporary Q multiplier (innovation gating) */
     int   initialized;                       /* 0 until first measurement */
+
+    /* ── Innovation gating ── */
+    float gate_threshold;                    /* σ-threshold for gating (default 3.0) */
+    float gate_Q_multiplier;                 /* Q boost on gated param (default 100.0) */
+    int   gate_cooldown[N_PARAMS];           /* Windows remaining with boosted Q */
+    int   gate_cooldown_init;                /* Initial cooldown windows (default 3) */
 
     /* ── Observation circular buffer ── */
     float* y_buf;
@@ -151,59 +158,107 @@ static void mat_eye_minus(float* C, const float* A) {
 #undef D
 
 /*═══════════════════════════════════════════════════════════════════════════════
- * Kalman Predict + Update
+ * Kalman Predict + Update (Robust version)
  *
- * Predict:  x̄ = x,  P̄ = P + Q
- * Update:   S = P̄ + Σ_k  (innovation covariance)
- *           K = P̄ · S⁻¹   (Kalman gain)
- *           x = x̄ + K · (z_k - x̄)
- *           P = (I - K) · P̄
+ * Three robustness improvements over vanilla Kalman:
+ *
+ * 1. OVERLAP CORRECTION: When stride < window_size, consecutive Σ matrices
+ *    share data and are correlated. We inflate R by (window_size / stride)
+ *    to account for the reduced effective information per window.
+ *
+ * 2. INNOVATION GATING: If |innovation_i| > gate_threshold · √S_ii, parameter
+ *    i experienced a structural break. We temporarily boost Q_i by 100× for
+ *    a few windows, letting the Kalman "forget" and relearn quickly.
+ *
+ * 3. JOSEPH FORM: P = (I-K)·P̄·(I-K)ᵀ + K·R·Kᵀ is numerically stable,
+ *    guaranteed symmetric positive semi-definite regardless of rounding.
  *
  * All matrices are 8×8. S⁻¹ computed via Cholesky.
  *═══════════════════════════════════════════════════════════════════════════════*/
 
-static void kalman_update(ParamTracker* t, const float* z_meas, const float* R) {
+static void kalman_update(ParamTracker* t, const float* z_meas, const float* R_raw) {
+    float R[N_PARAMS * N_PARAMS];
     float P_bar[N_PARAMS * N_PARAMS];
+    float Q_eff[N_PARAMS * N_PARAMS];
     float S[N_PARAMS * N_PARAMS];
     float L[N_PARAMS * N_PARAMS];
-    float S_inv_Pbar[N_PARAMS * N_PARAMS];
     float Kt[N_PARAMS * N_PARAMS];
     float K[N_PARAMS * N_PARAMS];
-    float IminusK[N_PARAMS * N_PARAMS];
-    float P_new[N_PARAMS * N_PARAMS];
 
-    /* Predict: P̄ = P + Q */
-    mat_add(P_bar, t->P, t->Q);
+    /* ── Step 0: Overlap correction on R ──
+     * When windows overlap, consecutive measurements share data.
+     * Effective new information per window ∝ stride/window_size.
+     * Inflate R to compensate for the correlation. */
+    float overlap_factor = (t->stride < t->window_size)
+        ? (float)t->window_size / (float)t->stride
+        : 1.0f;
+    for (int i = 0; i < N_PARAMS * N_PARAMS; i++)
+        R[i] = R_raw[i] * overlap_factor;
 
-    /* Innovation covariance: S = P̄ + R */
+    /* ── Step 1: Build effective Q with innovation gating boost ──
+     * Q_eff = Q (base) + boost for gated parameters */
+    memcpy(Q_eff, t->Q, N_PARAMS * N_PARAMS * sizeof(float));
+    for (int i = 0; i < N_PARAMS; i++) {
+        if (t->gate_cooldown[i] > 0) {
+            Q_eff[i * N_PARAMS + i] *= t->gate_Q_multiplier;
+            t->gate_cooldown[i]--;
+        }
+    }
+
+    /* ── Step 2: Predict ──
+     * P̄ = P + Q_eff */
+    mat_add(P_bar, t->P, Q_eff);
+
+    /* ── Step 3: Innovation + gating check ── */
+    float innov[N_PARAMS];
+    for (int i = 0; i < N_PARAMS; i++)
+        innov[i] = z_meas[i] - t->x[i];
+
+    /* S = P̄ + R (needed for gating check) */
     mat_add(S, P_bar, R);
-
-    /* Regularize S diagonal for numerical stability */
     for (int i = 0; i < N_PARAMS; i++)
         S[i * N_PARAMS + i] += 1e-8f;
 
-    /* Cholesky of S */
+    /* Check each parameter for structural break */
+    int any_gated = 0;
+    for (int i = 0; i < N_PARAMS; i++) {
+        float s_ii = S[i * N_PARAMS + i];
+        float normalized = fabsf(innov[i]) / sqrtf(fmaxf(s_ii, 1e-12f));
+        if (normalized > t->gate_threshold && t->gate_cooldown[i] == 0) {
+            /* Structural break detected on parameter i */
+            t->gate_cooldown[i] = t->gate_cooldown_init;
+            any_gated = 1;
+        }
+    }
+
+    /* If any parameter was just gated, re-do predict and S with boosted Q */
+    if (any_gated) {
+        memcpy(Q_eff, t->Q, N_PARAMS * N_PARAMS * sizeof(float));
+        for (int i = 0; i < N_PARAMS; i++) {
+            if (t->gate_cooldown[i] > 0)
+                Q_eff[i * N_PARAMS + i] *= t->gate_Q_multiplier;
+        }
+        mat_add(P_bar, t->P, Q_eff);
+        mat_add(S, P_bar, R);
+        for (int i = 0; i < N_PARAMS; i++)
+            S[i * N_PARAMS + i] += 1e-8f;
+    }
+
+    /* ── Step 4: Cholesky of S ── */
     if (!cholesky(S, L)) {
-        /* Fallback: use diagonal of S */
         fprintf(stderr, "param_tracker: Cholesky failed on S, using diagonal fallback\n");
         memset(L, 0, sizeof(L));
         for (int i = 0; i < N_PARAMS; i++)
             L[i * N_PARAMS + i] = sqrtf(fmaxf(S[i * N_PARAMS + i], 1e-8f));
     }
 
-    /* Kalman gain: K = P_bar * S^{-1}.  Solve S*X = P_bar => X = S^{-1}*P_bar = K^T */
-    solve_spd_matrix(L, P_bar, Kt);
-
-    /* Kt = S^{-1} * P_bar, but K = P_bar * S^{-1} = Kt^T (both symmetric) */
+    /* ── Step 5: Kalman gain K = P̄ · S⁻¹ ── */
+    solve_spd_matrix(L, P_bar, Kt);  /* Kt = S⁻¹ · P̄ */
     for (int i = 0; i < N_PARAMS; i++)
         for (int j = 0; j < N_PARAMS; j++)
             K[i * N_PARAMS + j] = Kt[j * N_PARAMS + i];
 
-    /* x = x̄ + K · (z - x̄) */
-    float innov[N_PARAMS];
-    for (int i = 0; i < N_PARAMS; i++)
-        innov[i] = z_meas[i] - t->x[i];
-
+    /* ── Step 6: State update x = x̄ + K · innovation ── */
     for (int i = 0; i < N_PARAMS; i++) {
         float sum = 0.0f;
         for (int j = 0; j < N_PARAMS; j++)
@@ -211,15 +266,40 @@ static void kalman_update(ParamTracker* t, const float* z_meas, const float* R) 
         t->x[i] += sum;
     }
 
-    /* P = (I - K) · P̄ */
-    mat_eye_minus(IminusK, K);
-    mat_mul(P_new, IminusK, P_bar);
+    /* ── Step 7: Joseph form P update ──
+     * P = (I-K)·P̄·(I-K)ᵀ + K·R·Kᵀ
+     * Guaranteed symmetric positive semi-definite. */
+    float IminusK[N_PARAMS * N_PARAMS];
+    float tmp1[N_PARAMS * N_PARAMS];    /* (I-K)·P̄ */
+    float tmp2[N_PARAMS * N_PARAMS];    /* (I-K)ᵀ */
+    float term1[N_PARAMS * N_PARAMS];   /* (I-K)·P̄·(I-K)ᵀ */
+    float KR[N_PARAMS * N_PARAMS];      /* K·R */
+    float term2[N_PARAMS * N_PARAMS];   /* K·R·Kᵀ */
 
-    /* Symmetrize P for numerical stability */
+    mat_eye_minus(IminusK, K);
+    mat_mul(tmp1, IminusK, P_bar);      /* (I-K)·P̄ */
+
+    /* Transpose (I-K) */
     for (int i = 0; i < N_PARAMS; i++)
         for (int j = 0; j < N_PARAMS; j++)
-            t->P[i * N_PARAMS + j] = 0.5f * (P_new[i * N_PARAMS + j] +
-                                               P_new[j * N_PARAMS + i]);
+            tmp2[i * N_PARAMS + j] = IminusK[j * N_PARAMS + i];
+
+    mat_mul(term1, tmp1, tmp2);         /* (I-K)·P̄·(I-K)ᵀ */
+
+    mat_mul(KR, K, R);                  /* K·R */
+    /* Kᵀ */
+    float Ktrans[N_PARAMS * N_PARAMS];
+    for (int i = 0; i < N_PARAMS; i++)
+        for (int j = 0; j < N_PARAMS; j++)
+            Ktrans[i * N_PARAMS + j] = K[j * N_PARAMS + i];
+    mat_mul(term2, KR, Ktrans);         /* K·R·Kᵀ */
+
+    /* P = term1 + term2, symmetrize */
+    for (int i = 0; i < N_PARAMS; i++)
+        for (int j = 0; j < N_PARAMS; j++)
+            t->P[i * N_PARAMS + j] = 0.5f * (
+                term1[i * N_PARAMS + j] + term1[j * N_PARAMS + i] +
+                term2[i * N_PARAMS + j] + term2[j * N_PARAMS + i]);
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
@@ -303,6 +383,13 @@ ParamTracker* param_tracker_create(int window_size, int stride,
     t->P_floor[6] = 1e-4f;   /* sigma_scale: √P_min ≈ 0.010 */
     t->P_floor[7] = 1e-3f;   /* sigma_rate:  √P_min ≈ 0.032 */
 
+    /* Innovation gating defaults */
+    t->gate_threshold = 3.0f;       /* 3σ triggers structural break */
+    t->gate_Q_multiplier = 100.0f;  /* Boost Q by 100× on break */
+    t->gate_cooldown_init = 3;      /* Boosted for 3 windows after detection */
+    memset(t->gate_cooldown, 0, sizeof(t->gate_cooldown));
+    memset(t->Q_boost, 0, sizeof(t->Q_boost));
+
     t->ticks_since_window = 0;
     memset(&t->snap, 0, sizeof(t->snap));
 
@@ -369,6 +456,13 @@ void param_tracker_run_window(ParamTracker* t) {
     } else {
         kalman_update(t, z_meas, R);
     }
+
+    /* Capture gating state for diagnostics */
+    float overlap_factor = (t->stride < t->window_size)
+        ? (float)t->window_size / (float)t->stride : 1.0f;
+    for (int i = 0; i < N_PARAMS; i++)
+        t->snap.gated[i] = (t->gate_cooldown[i] > 0) ? 1 : 0;
+    t->snap.overlap_factor = overlap_factor;
 
     /* Enforce P floor: prevent lockup from confident-but-wrong measurements */
     for (int i = 0; i < N_PARAMS; i++) {
@@ -438,6 +532,13 @@ void param_tracker_set_P_floor(ParamTracker* t, const float* p_floor) {
     memcpy(t->P_floor, p_floor, N_PARAMS * sizeof(float));
 }
 
+void param_tracker_set_gating(ParamTracker* t, float threshold,
+                               float q_mult, int cooldown) {
+    t->gate_threshold = threshold;
+    t->gate_Q_multiplier = q_mult;
+    t->gate_cooldown_init = cooldown;
+}
+
 SMC2StateCUDA* param_tracker_get_smc2(ParamTracker* t) {
     return t->smc2;
 }
@@ -457,16 +558,17 @@ void param_tracker_print(const ParamTracker* t) {
     };
 
     printf("\n  ── Kalman-Filtered Parameters (update #%d) ──\n\n", t->snap.n_updates);
-    printf("  %-14s  %8s  %8s\n", "Parameter", "Value", "±√P");
-    printf("  ───────────────────────────────────────\n");
+    printf("  %-14s  %8s  %8s  %4s\n", "Parameter", "Value", "±√P", "Gate");
+    printf("  ─────────────────────────────────────────────\n");
     for (int i = 0; i < N_PARAMS; i++) {
         float std = sqrtf(fmaxf(t->P[i * N_PARAMS + i], 0.0f));
-        printf("  %-14s  %8.4f  %8.4f\n", names[i], t->x[i], std);
+        const char* gate = (t->gate_cooldown[i] > 0) ? " ⚡" : "";
+        printf("  %-14s  %8.4f  %8.4f  %s\n", names[i], t->x[i], std, gate);
     }
-    printf("  ───────────────────────────────────────\n");
+    printf("  ─────────────────────────────────────────────\n");
     printf("  Derived:  σ_z=%.4f  σ_base=%.4f\n", t->snap.sigma_z, t->snap.sigma_base);
     printf("  At z̄=%.3f: μ=%.4f  σ_h=%.4f  θ=%.4f\n",
            t->snap.z_mean, t->snap.mu, t->snap.sigma_h, t->snap.theta_speed);
-    printf("  SMC² last window: ESS=%.1f  accept=%.1f%%\n",
-           t->snap.last_ess, t->snap.last_accept_rate * 100.0f);
+    printf("  SMC² last window: ESS=%.1f  accept=%.1f%%  overlap=%.1fx\n",
+           t->snap.last_ess, t->snap.last_accept_rate * 100.0f, t->snap.overlap_factor);
 }
