@@ -64,19 +64,17 @@ float pcg32_uniformf(PCG32State* rng) {
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
- * Normal variate via CUDA intrinsic ICDF
+ * Normal variate via Box-Muller transform (matches curand quality)
  *
- * normcdfinvf() is NVIDIA's optimized single-precision Φ^{-1}(u).
- * Full float precision, hardware-accelerated on SM_50+.
- * Clamp output to [-6, +6] to avoid inf at extreme tails.
+ * Uses two uniforms → two normals. We discard one for simplicity.
+ * Box-Muller produces exact Gaussians (no ICDF approximation).
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 __device__ __forceinline__
 float pcg32_normal(PCG32State* rng) {
-    float u = pcg32_uniformf(rng);
-    float z = normcdfinvf(u);
-    /* Clamp extreme tails — irrelevant for Monte Carlo quality */
-    return fmaxf(-6.0f, fminf(6.0f, z));
+    float u1 = pcg32_uniformf(rng);
+    float u2 = pcg32_uniformf(rng);
+    return sqrtf(-2.0f * __logf(u1)) * __cosf(6.2831853071795864f * u2);
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
