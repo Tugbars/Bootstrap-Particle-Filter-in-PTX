@@ -28,6 +28,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <curand.h>
 
 #define CUDA_CHECK(call) do { \
     cudaError_t err = call; \
@@ -216,11 +217,9 @@ int64_t u0_noise_slot(int theta_idx, int t, int cap) {
  * KERNEL: RNG Initialization
  *═══════════════════════════════════════════════════════════════════════════════*/
 
-/* kernel_init_pcg32 — single definition to avoid LNK2005 */
-__global__ void kernel_init_pcg32(PCG32State* states, uint64_t seed, int N) {
+__global__ void kernel_init_rng(curandState* states, unsigned long long seed, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= N) return;
-    pcg32_seed(&states[idx], seed, (uint64_t)idx);
+    if (idx < N) curand_init(seed, idx, 0, &states[idx]);
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
@@ -239,7 +238,7 @@ __global__ void kernel_init_from_prior(
     
     if (theta_idx >= N_theta) return;
     
-    PCG32State* rng = &particles.pcg_states[global_idx];
+    curandState* rng = &particles.rng_states[global_idx];
     
     __shared__ float s_rho, s_sigma_total, s_r_split;
     __shared__ float s_mu_base, s_mu_scale, s_mu_rate;
@@ -249,14 +248,14 @@ __global__ void kernel_init_from_prior(
     if (inner_idx == 0) {
         int attempts = 0, valid = 0;
         while (!valid && attempts < 1000) {
-            s_rho = d_prior.rho_mean + d_prior.rho_std * pcg32_normal(rng);
-            s_sigma_total = d_prior.sigma_total_mean + d_prior.sigma_total_std * pcg32_normal(rng);
-            s_r_split = d_prior.r_split_mean + d_prior.r_split_std * pcg32_normal(rng);
-            s_mu_base = d_prior.mu_base_mean + d_prior.mu_base_std * pcg32_normal(rng);
-            s_mu_scale = d_prior.mu_scale_mean + d_prior.mu_scale_std * pcg32_normal(rng);
-            s_mu_rate = d_prior.mu_rate_mean + d_prior.mu_rate_std * pcg32_normal(rng);
-            s_sigma_scale = d_prior.sigma_scale_mean + d_prior.sigma_scale_std * pcg32_normal(rng);
-            s_sigma_rate = d_prior.sigma_rate_mean + d_prior.sigma_rate_std * pcg32_normal(rng);
+            s_rho = d_prior.rho_mean + d_prior.rho_std * curand_normal(rng);
+            s_sigma_total = d_prior.sigma_total_mean + d_prior.sigma_total_std * curand_normal(rng);
+            s_r_split = d_prior.r_split_mean + d_prior.r_split_std * curand_normal(rng);
+            s_mu_base = d_prior.mu_base_mean + d_prior.mu_base_std * curand_normal(rng);
+            s_mu_scale = d_prior.mu_scale_mean + d_prior.mu_scale_std * curand_normal(rng);
+            s_mu_rate = d_prior.mu_rate_mean + d_prior.mu_rate_std * curand_normal(rng);
+            s_sigma_scale = d_prior.sigma_scale_mean + d_prior.sigma_scale_std * curand_normal(rng);
+            s_sigma_rate = d_prior.sigma_rate_mean + d_prior.sigma_rate_std * curand_normal(rng);
             
             valid = (s_rho >= d_bounds.rho_min && s_rho <= d_bounds.rho_max &&
                      s_sigma_total >= d_bounds.sigma_total_min && s_sigma_total <= d_bounds.sigma_total_max &&
@@ -305,12 +304,12 @@ __global__ void kernel_init_from_prior(
     float one_minus_rho_sq = fmaxf(1.0f - rho * rho, 1e-6f);
     float z_tilde_stat_std = sigma_z / sqrtf(one_minus_rho_sq);
     
-    float z_noise_raw = pcg32_normal(rng);
+    float z_noise_raw = curand_normal(rng);
     int64_t z_noise_idx = z_noise_slot(theta_idx, 0, inner_idx, N_inner, noise_capacity);
     float z_noise_init = noise_store_roundtrip(d_z_noise, z_noise_idx, z_noise_raw);
     
     if (inner_idx == 0) {
-        float u0_noise_raw = pcg32_normal(rng);
+        float u0_noise_raw = curand_normal(rng);
         int64_t u0_idx = u0_noise_slot(theta_idx, 0, noise_capacity);
         noise_store(d_u0_noise, u0_idx, u0_noise_raw);
     }
@@ -382,7 +381,7 @@ void kernel_rbpf_step_impl(
     }
     __syncthreads();
     
-    PCG32State local_rng = particles.pcg_states[global_idx];
+    curandState local_rng = particles.rng_states[global_idx];
     
     float z_tilde = particles.inner_z[global_idx];
     float mu_h = particles.inner_mu_h[global_idx];
@@ -392,11 +391,11 @@ void kernel_rbpf_step_impl(
     int64_t z_noise_idx = z_noise_slot(theta_idx, t_current + 1, inner_idx, N_INNER, noise_capacity);
     int64_t u0_noise_idx = u0_noise_slot(theta_idx, t_current + 1, noise_capacity);
     
-    float z_noise_raw = pcg32_normal(&local_rng);
+    float z_noise_raw = curand_normal(&local_rng);
     float z_noise = noise_store_roundtrip(d_z_noise, z_noise_idx, z_noise_raw);
     
     if (inner_idx == 0) {
-        float u0_noise_raw = pcg32_normal(&local_rng);
+        float u0_noise_raw = curand_normal(&local_rng);
         float u0_stored = noise_store_roundtrip(d_u0_noise, u0_noise_idx, u0_noise_raw);
         s_u0 = u0_from_noise(u0_stored);
     }
@@ -487,7 +486,7 @@ void kernel_rbpf_step_impl(
     particles.inner_mu_h[global_idx] = mu_post;
     particles.inner_var_h[global_idx] = var_post;
     particles.inner_log_w[global_idx] = log_w;
-    particles.pcg_states[global_idx] = local_rng;
+    particles.rng_states[global_idx] = local_rng;
     
     if (inner_idx == 0) {
         particles.ess_inner[theta_idx] = ess;
@@ -662,7 +661,8 @@ __global__ void kernel_outer_resample(
 /*═══════════════════════════════════════════════════════════════════════════════
  * KERNEL: Copy θ-Particles After Resampling (8 learned params)
  *
- * FIX: Use PCG32 seeding instead of curand_init — 16 bytes vs 52 bytes state.
+ * FIX: Use Philox counter-based RNG init instead of curand_init to avoid
+ *      the high cost of full XORWOW state initialization after every resample.
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 __global__ void kernel_copy_theta_particles(
@@ -701,8 +701,8 @@ __global__ void kernel_copy_theta_particles(
         dst.inner_var_h[dst_idx] = src.inner_var_h[src_idx];
         dst.inner_log_w[dst_idx] = src.inner_log_w[src_idx];
         
-        /* PCG32 seed: unique per thread via (seed, stream) pair */
-        pcg32_seed(&dst.pcg_states[dst_idx], resample_seed, (uint64_t)dst_idx);
+        /* Use a fast sequence-based init: unique (seed, subsequence) per thread */
+        curand_init(resample_seed, (unsigned long long)dst_idx, 0, &dst.rng_states[dst_idx]);
     }
 }
 
@@ -825,7 +825,7 @@ void kernel_cpmmh_rejuvenate_fused_impl(
     __shared__ int s_accept, s_valid;
     __shared__ float s_u0_shared;
     
-    PCG32State local_rng = particles.pcg_states[global_idx];
+    curandState local_rng = particles.rng_states[global_idx];
     
     /* PROPOSE θ* (thread 0) — 8D random walk */
     if (inner_idx == 0) {
@@ -844,10 +844,10 @@ void kernel_cpmmh_rejuvenate_fused_impl(
                                      s_sigma_scale_curr, s_sigma_rate_curr);
         
         float z_rnd[N_PARAMS];
-        for (int i = 0; i < N_PARAMS; i++) z_rnd[i] = pcg32_normal(&local_rng);
+        for (int i = 0; i < N_PARAMS; i++) z_rnd[i] = curand_normal(&local_rng);
         
         float pert[N_PARAMS] = {0};
-        float mix_u = pcg32_uniformf(&local_rng);
+        float mix_u = curand_uniform(&local_rng);
         
         if (mix_u > 0.05f) {
             /* 95%: Adaptive correlated proposal via Cholesky */
@@ -890,7 +890,7 @@ void kernel_cpmmh_rejuvenate_fused_impl(
     
     if (s_valid == 0) {
         if (inner_idx == 0) d_swap_flags[theta_idx] = 0;
-        particles.pcg_states[global_idx] = local_rng;
+        particles.rng_states[global_idx] = local_rng;
         return;
     }
     
@@ -920,7 +920,7 @@ void kernel_cpmmh_rejuvenate_fused_impl(
         float z_tilde_stat_std = sigma_z / sqrtf(one_minus_rho_sq);
         
         float z_noise_curr_0 = noise_load(d_z_noise_curr, z_noise_slot(theta_idx, 0, inner_idx, N_INNER, noise_capacity));
-        float z_noise_fresh_0 = pcg32_normal(&local_rng);
+        float z_noise_fresh_0 = curand_normal(&local_rng);
         float z_noise_prop_0 = cpmmh_rho * z_noise_curr_0 + scale * z_noise_fresh_0;
         noise_store(d_z_noise_other, z_noise_slot(theta_idx, 0, inner_idx, N_INNER, noise_capacity), z_noise_prop_0);
         
@@ -968,14 +968,14 @@ void kernel_cpmmh_rejuvenate_fused_impl(
         
         int64_t z_idx_t1 = z_noise_slot(theta_idx, t + 1, inner_idx, N_INNER, noise_capacity);
         float z_noise_curr_t1 = noise_load(d_z_noise_curr, z_idx_t1);
-        float z_noise_fresh_t1 = pcg32_normal(&local_rng);
+        float z_noise_fresh_t1 = curand_normal(&local_rng);
         float z_noise_prop_t1_raw = cpmmh_rho * z_noise_curr_t1 + scale * z_noise_fresh_t1;
         float z_noise_prop_t1 = noise_store_roundtrip(d_z_noise_other, z_idx_t1, z_noise_prop_t1_raw);
         
         if (inner_idx == 0) {
             int64_t u0_idx_t1 = u0_noise_slot(theta_idx, t + 1, noise_capacity);
             float u0_noise_curr = noise_load(d_u0_noise_curr, u0_idx_t1);
-            float u0_noise_fresh = pcg32_normal(&local_rng);
+            float u0_noise_fresh = curand_normal(&local_rng);
             float u0_noise_prop_raw = cpmmh_rho * u0_noise_curr + scale * u0_noise_fresh;
             float u0_stored = noise_store_roundtrip(d_u0_noise_other, u0_idx_t1, u0_noise_prop_raw);
             s_u0_shared = u0_from_noise(u0_stored);
@@ -1072,7 +1072,7 @@ void kernel_cpmmh_rejuvenate_fused_impl(
         
         float log_alpha = (ll_prop_effective + s_lp_prop) - (ll_curr_effective + s_lp_curr);
         
-        float u = pcg32_uniformf(&local_rng);
+        float u = curand_uniform(&local_rng);
         s_accept = (__logf(u) < log_alpha) ? 1 : 0;
         
         if (s_accept) {
@@ -1099,7 +1099,7 @@ void kernel_cpmmh_rejuvenate_fused_impl(
         particles.inner_log_w[global_idx] = particles_scratch.inner_log_w[global_idx];
     }
     
-    particles.pcg_states[global_idx] = local_rng;
+    particles.rng_states[global_idx] = local_rng;
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
@@ -1230,11 +1230,11 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     ALLOC_INNER_FIELD(inner_mu_h);
     ALLOC_INNER_FIELD(inner_var_h);
     ALLOC_INNER_FIELD(inner_log_w);
-    CUDA_CHECK(cudaMalloc(&state->d_particles.pcg_states, N_total * sizeof(PCG32State)));
-    CUDA_CHECK(cudaMalloc(&state->d_particles_temp.pcg_states, N_total * sizeof(PCG32State)));
+    CUDA_CHECK(cudaMalloc(&state->d_particles.rng_states, N_total * sizeof(curandState)));
+    CUDA_CHECK(cudaMalloc(&state->d_particles_temp.rng_states, N_total * sizeof(curandState)));
     
     /* RNG init */
-    kernel_init_pcg32<<<(N_total + 255) / 256, 256>>>(state->d_particles.pcg_states, 12345ULL, N_total);
+    kernel_init_rng<<<(N_total + 255) / 256, 256>>>(state->d_particles.rng_states, 12345ULL, N_total);
     CUDA_CHECK(cudaDeviceSynchronize());
     
     /* Observation history */
@@ -1374,8 +1374,8 @@ void smc2_cuda_free(SMC2StateCUDA* state) {
     FREE_INNER_FIELD(inner_mu_h);
     FREE_INNER_FIELD(inner_var_h);
     FREE_INNER_FIELD(inner_log_w);
-    cudaFree(state->d_particles.pcg_states);
-    cudaFree(state->d_particles_temp.pcg_states);
+    cudaFree(state->d_particles.rng_states);
+    cudaFree(state->d_particles_temp.rng_states);
     
     cudaFree(state->d_y_history);
     cudaFree(state->d_ancestors);
@@ -1626,7 +1626,7 @@ void smc2_cuda_init_from_prior(SMC2StateCUDA* state) {
     
     int N_total = state->N_theta * state->N_inner;
     unsigned long long rng_seed = (state->user_seed != 0) ? state->user_seed : 12345ULL;
-    kernel_init_pcg32<<<(N_total + 255) / 256, 256>>>(state->d_particles.pcg_states, rng_seed, N_total);
+    kernel_init_rng<<<(N_total + 255) / 256, 256>>>(state->d_particles.rng_states, rng_seed, N_total);
     CUDA_CHECK(cudaDeviceSynchronize());
     
     kernel_init_from_prior<<<state->N_theta, state->N_inner>>>(
@@ -1736,7 +1736,7 @@ void smc2_cuda_init_warm(SMC2StateCUDA* state,
 
     int N_total = state->N_theta * state->N_inner;
     unsigned long long rng_seed = (state->user_seed != 0) ? state->user_seed : 12345ULL;
-    kernel_init_pcg32<<<(N_total + 255) / 256, 256>>>(state->d_particles.pcg_states, rng_seed, N_total);
+    kernel_init_rng<<<(N_total + 255) / 256, 256>>>(state->d_particles.rng_states, rng_seed, N_total);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     kernel_init_from_prior<<<state->N_theta, state->N_inner>>>(
@@ -1875,17 +1875,15 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
                 state->d_ancestors, state->N_theta, state->N_inner);
             CUDA_CHECK(cudaDeviceSynchronize());
             
-            /* Pointer swap instead of 5× D2D memcpy — zero cost.
-             * kernel_copy_checkpoint wrote reindexed data to scratch.
-             * Just swap scratch ↔ checkpoint pointers. */
+            /* Pointer swap instead of 5× D2D memcpy */
             float* tmp_f;
-            #define SWAP_PTR(a, b) do { tmp_f = (a); (a) = (b); (b) = tmp_f; } while(0)
-            SWAP_PTR(state->d_checkpoint_z,     state->d_checkpoint_scratch_z);
-            SWAP_PTR(state->d_checkpoint_mu_h,  state->d_checkpoint_scratch_mu_h);
-            SWAP_PTR(state->d_checkpoint_var_h, state->d_checkpoint_scratch_var_h);
-            SWAP_PTR(state->d_checkpoint_log_w, state->d_checkpoint_scratch_log_w);
-            SWAP_PTR(state->d_checkpoint_ll,    state->d_checkpoint_scratch_ll);
-            #undef SWAP_PTR
+            #define SWAP_CP(a, b) do { tmp_f = (a); (a) = (b); (b) = tmp_f; } while(0)
+            SWAP_CP(state->d_checkpoint_z,     state->d_checkpoint_scratch_z);
+            SWAP_CP(state->d_checkpoint_mu_h,  state->d_checkpoint_scratch_mu_h);
+            SWAP_CP(state->d_checkpoint_var_h, state->d_checkpoint_scratch_var_h);
+            SWAP_CP(state->d_checkpoint_log_w, state->d_checkpoint_scratch_log_w);
+            SWAP_CP(state->d_checkpoint_ll,    state->d_checkpoint_scratch_ll);
+            #undef SWAP_CP
         }
         
         /* Determine fixed-lag checkpoint for rejuvenation */
@@ -1914,9 +1912,6 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
                 t_checkpoint_use, cp_z, cp_mu, cp_var, cp_logw, cp_ll)
         
         for (int k = 0; k < state->K_rejuv; k++) {
-            /* Fused loop: zero d_accepts once, launch all K iterations,
-             * single sync + read at end. Eliminates (K-1) syncs + 2K memcpys.
-             * CPMMH kernel uses atomicAdd so accepts accumulate across iterations. */
             if (k == 0) {
                 int zero = 0;
                 CUDA_CHECK(cudaMemcpy(state->d_accepts, &zero, sizeof(int), cudaMemcpyHostToDevice));
@@ -1934,16 +1929,14 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
                 case 512: DISPATCH_CPMMH(512); break;
                 default: fprintf(stderr, "Unsupported N_inner=%d\n", state->N_inner); exit(EXIT_FAILURE);
             }
-            /* No sync before commit — same stream dependency */
             
             int t_start_commit = (t_checkpoint_use >= 0) ? (t_checkpoint_use + 1) : 0;
             kernel_commit_accepted_noise<<<state->N_theta, state->N_inner>>>(
                 curr_noise, other_noise, curr_u0, other_u0,
                 state->d_swap_flags, state->N_theta, state->N_inner,
                 state->t_current, state->noise_capacity, t_start_commit);
-            /* No per-iteration sync — kernels pipeline on same stream */
         }
-        /* Single sync + read after all K rejuvenation iterations */
+        /* Single sync after all K iterations */
         CUDA_CHECK(cudaDeviceSynchronize());
         {
             int h_accepts = 0;
@@ -2131,15 +2124,15 @@ float smc2_cuda_update_batch(SMC2StateCUDA* state, const float* y_batch, int n_o
                 state->d_ancestors, state->N_theta, state->N_inner);
             CUDA_CHECK(cudaDeviceSynchronize());
 
-            /* Pointer swap — zero-cost replacement for 5× D2D memcpy */
+            /* Pointer swap instead of 5× D2D memcpy */
             float* tmp_f;
-            #define SWAP_PTR(a, b) do { tmp_f = (a); (a) = (b); (b) = tmp_f; } while(0)
-            SWAP_PTR(state->d_checkpoint_z,     state->d_checkpoint_scratch_z);
-            SWAP_PTR(state->d_checkpoint_mu_h,  state->d_checkpoint_scratch_mu_h);
-            SWAP_PTR(state->d_checkpoint_var_h, state->d_checkpoint_scratch_var_h);
-            SWAP_PTR(state->d_checkpoint_log_w, state->d_checkpoint_scratch_log_w);
-            SWAP_PTR(state->d_checkpoint_ll,    state->d_checkpoint_scratch_ll);
-            #undef SWAP_PTR
+            #define SWAP_CP(a, b) do { tmp_f = (a); (a) = (b); (b) = tmp_f; } while(0)
+            SWAP_CP(state->d_checkpoint_z,     state->d_checkpoint_scratch_z);
+            SWAP_CP(state->d_checkpoint_mu_h,  state->d_checkpoint_scratch_mu_h);
+            SWAP_CP(state->d_checkpoint_var_h, state->d_checkpoint_scratch_var_h);
+            SWAP_CP(state->d_checkpoint_log_w, state->d_checkpoint_scratch_log_w);
+            SWAP_CP(state->d_checkpoint_ll,    state->d_checkpoint_scratch_ll);
+            #undef SWAP_CP
         }
 
         /* Rejuvenation */

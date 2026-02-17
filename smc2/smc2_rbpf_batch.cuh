@@ -119,9 +119,9 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <curand_kernel.h>
 #include <stdint.h>
 
-#include "smc2_pcg32.cuh"
 #include "smc2_noise_precision.cuh"
 
 /*═══════════════════════════════════════════════════════════════════════════════
@@ -229,7 +229,7 @@ struct ThetaParticlesSoA {
     float* inner_mu_h;
     float* inner_var_h;
     float* inner_log_w;
-    PCG32State* pcg_states;     /**< PCG32 RNG state per inner particle (16B vs curand's 52B) */
+    curandState* rng_states;    /**< cuRAND RNG state per inner particle */
 };
 
 /**
@@ -445,7 +445,7 @@ __device__ void ocsn_kalman_update(
  * been removed — only the template implementations exist.
  *═══════════════════════════════════════════════════════════════════════════════*/
 
-/* kernel_init_pcg32 declared in smc2_pcg32.cuh — replaces kernel_init_rng */
+__global__ void kernel_init_rng(curandState* states, unsigned long long seed, int N);
 
 __global__ void kernel_init_from_prior(
     ThetaParticlesSoA particles,
