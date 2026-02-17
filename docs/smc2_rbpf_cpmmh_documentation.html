@@ -631,6 +631,58 @@ code {
 .svg-diagram text {
   font-family: 'IBM Plex Mono', monospace;
 }
+
+/* ── Data tables ── */
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 2rem 0;
+  font-family: var(--mono);
+  font-size: 0.78rem;
+}
+.data-table th {
+  text-align: left;
+  padding: 0.6rem 0.75rem;
+  border-bottom: 2px solid var(--border);
+  color: var(--text-dim);
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  font-size: 0.65rem;
+}
+.data-table td {
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid rgba(30,45,66,0.5);
+  color: var(--text);
+}
+.data-table tr:hover td { background: rgba(79,195,247,0.03); }
+
+/* ── Canvas containers ── */
+.canvas-wrap {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem;
+  margin: 2rem 0;
+  overflow: hidden;
+}
+.canvas-wrap canvas {
+  width: 100%;
+  display: block;
+  border-radius: 4px;
+}
+.canvas-label {
+  font-family: var(--mono);
+  font-size: 0.65rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 0.75rem;
+  text-align: center;
+}
+
+/* ── Architecture stack ── */
+.arch-stack { margin: 2rem 0; }
 </style>
 </head>
 <body>
@@ -653,8 +705,8 @@ code {
       A GPU-accelerated algorithm for real-time joint estimation of latent volatility states and model parameters, featuring a novel (σ<sub>total</sub>,&nbsp;r) reparameterization that breaks the identification ridge inherent in multi-channel vol-of-vol models.
     </p>
     <div class="hero-meta">
-      <span>Architecture: <span class="val">3-Layer Nested SMC</span></span>
-      <span>Params: <span class="val">ρ, σ_total, μ_base, r</span></span>
+      <span>Architecture: <span class="val">Sensor → Tracker → Reflex</span></span>
+      <span>Params: <span class="val">8 learned · 3 derived · 0 fixed</span></span>
       <span>Target: <span class="val">CUDA / RTX 5080</span></span>
     </div>
   </div>
@@ -1327,11 +1379,163 @@ code {
 </div>
 </section>
 
+<!-- ════════════════════════════════════════════════════════════════════
+     SECTION: KALMAN PARAMETER TRACKER
+     ════════════════════════════════════════════════════════════════════ -->
+<section id="sec-kalman-tracker">
+<div class="container">
+  <div class="reveal">
+    <div class="section-num">12 — Production Deployment</div>
+    <h2>Sliding-Window SMC² with 8×8 Kalman Fusion</h2>
+
+    <p>
+      A single SMC² run over a long horizon suffers from <strong>particle depletion</strong>: every resampling event
+      kills ancestral diversity. After 80+ resamples over T=12,000, the effective θ-particle pool is a small fraction
+      of N<sub>θ</sub>. Doubling outer particles from 1024 to 2048 barely changes the final posteriors — the
+      bottleneck is the horizon length, not the particle count.
+    </p>
+
+    <p>
+      The solution: run SMC² on <strong>fresh sliding windows</strong> of T=3,000. Each window starts from prior with
+      full particle diversity, produces an 8D posterior mean θ̂ and full 8×8 covariance Σ, then gets discarded. A
+      <strong>plain linear Kalman filter</strong> on the host fuses these measurements across windows — accumulating
+      evidence at mathematically optimal rates with per-parameter drift control.
+    </p>
+
+    <div class="callout insight" data-label="Why Plain Kalman">
+      <p>
+        The measurement model is identity — SMC² returns θ̂ = θ + noise(Σ). The state transition is a random walk
+        θ<sub>k+1</sub> = θ<sub>k</sub> + drift(Q). Both linear, both Gaussian. H&nbsp;=&nbsp;I, F&nbsp;=&nbsp;I.
+        No EKF or UKF needed. The 8×8 Cholesky costs ~170 FLOPs on the host — microseconds per window.
+      </p>
+    </div>
+
+    <h3>Three-Tier Architecture</h3>
+
+    <div class="arch-stack">
+      <div class="arch-layer reveal" style="border-left: 3px solid var(--accent);">
+        <p style="margin:0"><strong style="color:var(--accent)">① Sensor — SMC² + RBPF</strong> &nbsp;·&nbsp;
+        Every 500 ticks &nbsp;·&nbsp; ~4s per window<br>
+        <span style="font-size:0.92rem">Fresh N<sub>θ</sub>=1024 particles on T=3,000 observations. Emits <code>θ̂[8]</code>, <code>Σ[8×8]</code>, and z̄. Amnesiac — each window starts from prior.</span></p>
+      </div>
+      <div style="text-align:center; font-family:var(--mono); font-size:0.7rem; color:var(--text-dim); padding:0.15rem 0; opacity:0.5;">▼ θ̂, Σ, z̄ ▼</div>
+      <div class="arch-layer reveal" style="border-left: 3px solid var(--accent3);">
+        <p style="margin:0"><strong style="color:var(--accent3)">② Tracker — 8×8 Kalman</strong> &nbsp;·&nbsp;
+        Per window completion &nbsp;·&nbsp; ~1μs<br>
+        <span style="font-size:0.92rem">Predict: P̄ = P + Q. Update: K = P̄·(P̄ + Σ)<sup>−1</sup>. Carries <code>x[8]</code> and <code>P[8×8]</code> forward forever. The memory.</span></p>
+      </div>
+      <div style="text-align:center; font-family:var(--mono); font-size:0.7rem; color:var(--text-dim); padding:0.15rem 0; opacity:0.5;">▼ μ(z̄), σ<sub>h</sub>(z̄), θ(z̄) ▼</div>
+      <div class="arch-layer reveal" style="border-left: 3px solid var(--accent2);">
+        <p style="margin:0"><strong style="color:var(--accent2)">③ Reflex — Production BPF</strong> &nbsp;·&nbsp;
+        Per tick &nbsp;·&nbsp; ~8μs<br>
+        <span style="font-size:0.92rem">Single PTX kernel, one float per particle. Parameters now regime-aware because the z-layer model computed them, not host heuristics.</span></p>
+      </div>
+    </div>
+  </div>
+
+  <div class="reveal">
+    <h3>P Converges, Uncertainty Shrinks</h3>
+
+    <p>
+      Each window adds independent information. The Kalman P matrix shrinks monotonically — later windows
+      move the estimate less because accumulated confidence is high. After 4 windows, uncertainty on ρ
+      drops from 0.019 to 0.008. After 20 windows on slow parameters like σ<sub>rate</sub>, P would
+      approach the theoretical floor set by Q.
+    </p>
+
+    <!-- Animated canvas: P shrinking across windows -->
+    <div class="canvas-wrap">
+      <div class="canvas-label">Kalman √P convergence across windows — 8 parameters</div>
+      <canvas id="kalmanPCanvas" height="300"></canvas>
+    </div>
+  </div>
+
+  <div class="reveal">
+    <h3>Oracle vs Kalman: Head-to-Head</h3>
+
+    <p>
+      Both see T=12,000 observations. The Oracle runs one continuous SMC². The Kalman fuses 4 independent
+      T=3,000 windows. Same data, same total compute. The Kalman is <strong>2–2.7× tighter on every parameter</strong>.
+    </p>
+
+    <table class="data-table">
+      <thead>
+        <tr><th>Parameter</th><th>True</th><th>Oracle</th><th>Kalman</th><th>Orc.σ</th><th>Kal.σ</th><th>Tighter</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>ρ</td><td>0.950</td><td>0.949</td><td>0.951</td><td>0.019</td><td>0.008</td><td><strong style="color:var(--accent4)">2.3×</strong></td></tr>
+        <tr><td>σ<sub>total</sub></td><td>0.180</td><td>0.203</td><td>0.205</td><td>0.064</td><td>0.024</td><td><strong style="color:var(--accent4)">2.6×</strong></td></tr>
+        <tr><td>r<sub>split</sub></td><td>0.555</td><td>0.488</td><td>0.473</td><td>0.176</td><td>0.082</td><td><strong style="color:var(--accent4)">2.1×</strong></td></tr>
+        <tr><td>μ<sub>base</sub></td><td>−1.00</td><td>−0.96</td><td>−1.01</td><td>0.244</td><td>0.092</td><td><strong style="color:var(--accent4)">2.7×</strong></td></tr>
+        <tr><td>μ<sub>scale</sub></td><td>0.500</td><td>0.521</td><td>0.483</td><td>0.249</td><td>0.108</td><td><strong style="color:var(--accent4)">2.3×</strong></td></tr>
+        <tr><td>μ<sub>rate</sub></td><td>1.000</td><td>1.048</td><td>0.926</td><td>0.449</td><td>0.196</td><td><strong style="color:var(--accent4)">2.3×</strong></td></tr>
+        <tr><td>σ<sub>scale</sub></td><td>0.100</td><td>0.112</td><td>0.106</td><td>0.043</td><td>0.021</td><td><strong style="color:var(--accent4)">2.1×</strong></td></tr>
+        <tr><td>σ<sub>rate</sub></td><td>1.000</td><td>1.068</td><td>1.123</td><td>0.455</td><td>0.202</td><td><strong style="color:var(--accent4)">2.3×</strong></td></tr>
+      </tbody>
+    </table>
+
+    <p>
+      The Oracle's posteriors barely improve when doubling N<sub>θ</sub> from 1024 to 2048 — confirming the bottleneck
+      is ancestral degeneration over the long horizon, not particle count. The Kalman sidesteps this entirely:
+      particle depletion is bounded to 3,000 ticks per window instead of 12,000.
+    </p>
+  </div>
+
+  <div class="reveal">
+    <h3>Why Kalman Beats EMA</h3>
+
+    <p>
+      Exponential moving average applies the same decay constant to every parameter regardless of measurement
+      confidence. The Kalman exploits three things EMA cannot:
+    </p>
+
+    <p>
+      <strong>Confidence weighting.</strong> If SMC² returns μ<sub>scale</sub> with std 0.05 one window and 0.40 the next,
+      EMA weights them equally. The Kalman weights the tight one ~64× more.
+    </p>
+
+    <p>
+      <strong>Cross-parameter correlations.</strong> When σ<sub>total</sub> and r<sub>split</sub> move along their
+      identification ridge, the off-diagonal entries in Σ tell the Kalman to adjust both together. EMA treats them independently.
+    </p>
+
+    <p>
+      <strong>Accumulated confidence.</strong> After 50 consistent windows, P is small. One outlier window barely moves the
+      estimate. EMA always gives the latest measurement the same relative weight — no memory of past certainty.
+    </p>
+
+    <!-- Animated canvas: Kalman vs EMA -->
+    <div class="canvas-wrap">
+      <div class="canvas-label">Kalman (blue) vs EMA (red) — tracking a parameter shift</div>
+      <canvas id="kalmanVsEmaCanvas" height="260"></canvas>
+    </div>
+  </div>
+
+  <div class="reveal">
+    <h3>Process Noise Q: Per-Parameter Drift Rates</h3>
+
+    <p>
+      Q is diagonal, encoding how fast each parameter is allowed to drift between windows. This is where the
+      timescale separation lives — not in scattered decay constants, but in one principled matrix.
+    </p>
+
+    <table class="data-table">
+      <thead><tr><th>Parameter</th><th>Q (var/window)</th><th>Timescale</th><th>Rationale</th></tr></thead>
+      <tbody>
+        <tr><td>μ<sub>base</sub></td><td>10<sup>−3</sup></td><td>days</td><td>Tracks market level, shifts with regime</td></tr>
+        <tr><td>ρ, σ<sub>total</sub>, r<sub>split</sub></td><td>10<sup>−5</sup></td><td>weeks</td><td>Dynamics parameters, change gradually</td></tr>
+        <tr><td>μ<sub>scale</sub>, μ<sub>rate</sub>, σ<sub>scale</sub>, σ<sub>rate</sub></td><td>10<sup>−7</sup></td><td>months</td><td>Curve shapes, structural, rarely shift</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+</section>
+
 <!-- ════════════════════════════════════════════════════════════════════ -->
 <footer style="padding:4rem 0; text-align:center; border-top:1px solid var(--border);">
   <div class="container">
     <p style="font-family:var(--mono); font-size:0.7rem; color:var(--text-dim); letter-spacing:0.1em;">
-      SMC² + RBPF + CPMMH WITH (σ<sub>TOTAL</sub>, r) REPARAMETERIZATION — CUDA IMPLEMENTATION
+      SMC² + RBPF + CPMMH + KALMAN TRACKER — 8 LEARNED, 3 DERIVED, 0 FIXED — CUDA SM_120
     </p>
   </div>
 </footer>
@@ -2623,6 +2827,276 @@ window.addEventListener('resize', () => {
   drawCircularBuffer();
   drawKalmanCycle();
   drawGPUArch();
+  drawKalmanP();
+});
+
+// ── Kalman P Convergence Animation ──
+function drawKalmanP() {
+  const c = document.getElementById('kalmanPCanvas');
+  if (!c) return;
+  const ctx = c.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  c.width = c.clientWidth * dpr;
+  c.height = 300 * dpr;
+  ctx.scale(dpr, dpr);
+  const W = c.clientWidth, H = 300;
+
+  const params = ['ρ', 'σ_total', 'r_split', 'μ_base', 'μ_scale', 'μ_rate', 'σ_scale', 'σ_rate'];
+  const colors = ['#4fc3f7','#ff6b9d','#a78bfa','#34d399','#fbbf24','#f97316','#06b6d4','#ec4899'];
+  // √P values across 4 windows (from test results)
+  const pData = [
+    [0.0193, 0.0124, 0.0102, 0.0083],   // rho
+    [0.0677, 0.0369, 0.0272, 0.0243],   // sigma_total
+    [0.1913, 0.1118, 0.0937, 0.0820],   // r_split
+    [0.2453, 0.1330, 0.1079, 0.0917],   // mu_base
+    [0.2490, 0.1631, 0.1366, 0.1083],   // mu_scale
+    [0.4417, 0.2799, 0.2293, 0.1962],   // mu_rate
+    [0.0423, 0.0301, 0.0237, 0.0205],   // sigma_scale
+    [0.4540, 0.3180, 0.2559, 0.2016],   // sigma_rate
+  ];
+
+  const mx = 65, my = 30, pw = W - mx - 30, ph = H - my - 55;
+  const maxP = 0.5;
+
+  ctx.fillStyle = '#0f1520';
+  ctx.fillRect(0, 0, W, H);
+
+  // Grid
+  ctx.strokeStyle = 'rgba(30,45,66,0.6)';
+  ctx.lineWidth = 0.5;
+  for (let i = 0; i <= 4; i++) {
+    let y = my + (ph * i / 4);
+    ctx.beginPath(); ctx.moveTo(mx, y); ctx.lineTo(mx + pw, y); ctx.stroke();
+  }
+
+  // Y-axis labels
+  ctx.fillStyle = 'rgba(200,214,229,0.35)';
+  ctx.font = '9px IBM Plex Mono';
+  ctx.textAlign = 'right';
+  for (let i = 0; i <= 4; i++) {
+    let v = maxP * (1 - i / 4);
+    ctx.fillText(v.toFixed(2), mx - 8, my + (ph * i / 4) + 3);
+  }
+
+  // X-axis labels
+  ctx.textAlign = 'center';
+  for (let w = 0; w < 4; w++) {
+    let x = mx + (w / 3) * pw;
+    ctx.fillText('W' + (w + 1), x, my + ph + 16);
+  }
+
+  // Draw lines with animation feel
+  for (let p = 0; p < 8; p++) {
+    ctx.strokeStyle = colors[p];
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let w = 0; w < 4; w++) {
+      let x = mx + (w / 3) * pw;
+      let y = my + ph * (1 - pData[p][w] / maxP);
+      if (w === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Dots
+    for (let w = 0; w < 4; w++) {
+      let x = mx + (w / 3) * pw;
+      let y = my + ph * (1 - pData[p][w] / maxP);
+      ctx.beginPath();
+      ctx.arc(x, y, 3, 0, Math.PI * 2);
+      ctx.fillStyle = colors[p];
+      ctx.fill();
+    }
+  }
+
+  // Legend
+  const legX = mx + 8, legY = my + ph + 30;
+  ctx.font = '8px IBM Plex Mono';
+  for (let p = 0; p < 8; p++) {
+    let x = legX + (p % 4) * (pw / 4);
+    let y = legY + Math.floor(p / 4) * 14;
+    ctx.fillStyle = colors[p];
+    ctx.fillRect(x, y - 4, 8, 3);
+    ctx.fillStyle = 'rgba(200,214,229,0.5)';
+    ctx.textAlign = 'left';
+    ctx.fillText(params[p], x + 12, y);
+  }
+}
+
+// ── Kalman vs EMA Animation ──
+let emaAnimFrame = null;
+function animateKalmanVsEma() {
+  const c = document.getElementById('kalmanVsEmaCanvas');
+  if (!c) return;
+  const ctx = c.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  c.width = c.clientWidth * dpr;
+  c.height = 260 * dpr;
+  ctx.scale(dpr, dpr);
+  const W = c.clientWidth, H = 260;
+
+  const nWindows = 20;
+  const shiftAt = 10; // window where truth shifts
+  const truthBefore = -1.0, truthAfter = 1.0;
+
+  // Simulate noisy SMC² measurements
+  const seed = 42;
+  function seededRand(i) {
+    let x = Math.sin(seed + i * 127.1) * 43758.5453;
+    return x - Math.floor(x);
+  }
+
+  let measurements = [];
+  for (let w = 0; w < nWindows; w++) {
+    let truth = w < shiftAt ? truthBefore : truthAfter;
+    // window straddling the shift gets blended
+    if (w === shiftAt) truth = (truthBefore + truthAfter) / 2;
+    let noise = (seededRand(w) - 0.5) * 0.4;
+    measurements.push(truth + noise);
+  }
+
+  // Kalman tracking
+  let kx = 0, kP = 4.0, Q = 0.01;
+  let kalman = [];
+  for (let w = 0; w < nWindows; w++) {
+    let R = 0.04; // measurement variance
+    let Pbar = kP + Q;
+    let K = Pbar / (Pbar + R);
+    kx = kx + K * (measurements[w] - kx);
+    kP = (1 - K) * Pbar;
+    kalman.push(kx);
+  }
+
+  // EMA tracking
+  let ex = 0, alpha = 0.3;
+  let ema = [];
+  for (let w = 0; w < nWindows; w++) {
+    ex = alpha * measurements[w] + (1 - alpha) * ex;
+    ema.push(ex);
+  }
+
+  const mx = 55, my = 25, pw = W - mx - 20, ph = H - my - 40;
+  let animT = 0;
+
+  function frame() {
+    animT += 0.03;
+    let showN = Math.min(nWindows, Math.floor(animT * 4) + 1);
+
+    ctx.fillStyle = '#0f1520';
+    ctx.fillRect(0, 0, W, H);
+
+    // Grid
+    ctx.strokeStyle = 'rgba(30,45,66,0.6)';
+    ctx.lineWidth = 0.5;
+    let yVals = [-1.5, -1, -0.5, 0, 0.5, 1, 1.5];
+    for (let v of yVals) {
+      let y = my + ph * (1 - (v + 1.5) / 3);
+      ctx.beginPath(); ctx.moveTo(mx, y); ctx.lineTo(mx + pw, y); ctx.stroke();
+    }
+
+    // Truth line
+    ctx.setLineDash([4, 4]);
+    ctx.strokeStyle = 'rgba(200,214,229,0.25)';
+    ctx.lineWidth = 1;
+    // before shift
+    let yBefore = my + ph * (1 - (truthBefore + 1.5) / 3);
+    let yAfter = my + ph * (1 - (truthAfter + 1.5) / 3);
+    let xShift = mx + (shiftAt / (nWindows - 1)) * pw;
+    ctx.beginPath(); ctx.moveTo(mx, yBefore); ctx.lineTo(xShift, yBefore); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(xShift, yAfter); ctx.lineTo(mx + pw, yAfter); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Shift marker
+    ctx.strokeStyle = 'rgba(251,191,36,0.3)';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(xShift, my); ctx.lineTo(xShift, my + ph); ctx.stroke();
+    ctx.fillStyle = 'rgba(251,191,36,0.5)';
+    ctx.font = '8px IBM Plex Mono';
+    ctx.textAlign = 'center';
+    ctx.fillText('μ_base shifts', xShift, my - 6);
+
+    // Y-axis
+    ctx.fillStyle = 'rgba(200,214,229,0.3)';
+    ctx.font = '9px IBM Plex Mono';
+    ctx.textAlign = 'right';
+    for (let v of [-1, 0, 1]) {
+      let y = my + ph * (1 - (v + 1.5) / 3);
+      ctx.fillText(v.toFixed(1), mx - 8, y + 3);
+    }
+
+    function toXY(w, val) {
+      return {
+        x: mx + (w / (nWindows - 1)) * pw,
+        y: my + ph * (1 - (val + 1.5) / 3)
+      };
+    }
+
+    // Measurements (grey dots)
+    for (let w = 0; w < showN; w++) {
+      let p = toXY(w, measurements[w]);
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 2.5, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(200,214,229,0.2)';
+      ctx.fill();
+    }
+
+    // Kalman (blue)
+    ctx.strokeStyle = '#4fc3f7';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    for (let w = 0; w < showN; w++) {
+      let p = toXY(w, kalman[w]);
+      if (w === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+    }
+    ctx.stroke();
+
+    // EMA (red)
+    ctx.strokeStyle = '#ff6b9d';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([6, 3]);
+    ctx.beginPath();
+    for (let w = 0; w < showN; w++) {
+      let p = toXY(w, ema[w]);
+      if (w === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Legend
+    ctx.font = '9px IBM Plex Mono';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#4fc3f7';
+    ctx.fillRect(mx + 10, my + 6, 16, 3);
+    ctx.fillText('Kalman', mx + 30, my + 12);
+    ctx.fillStyle = '#ff6b9d';
+    ctx.fillRect(mx + 100, my + 6, 16, 3);
+    ctx.fillText('EMA (α=0.3)', mx + 120, my + 12);
+    ctx.fillStyle = 'rgba(200,214,229,0.3)';
+    ctx.fillRect(mx + 220, my + 6, 16, 3);
+    ctx.fillText('Truth', mx + 240, my + 12);
+
+    if (showN < nWindows) {
+      emaAnimFrame = requestAnimationFrame(frame);
+    }
+  }
+  frame();
+}
+
+drawKalmanP();
+
+// Start Kalman animations when visible
+const kalmanAnimObserver = new IntersectionObserver((entries) => {
+  entries.forEach(e => {
+    if (e.isIntersecting) {
+      if (e.target.id === 'kalmanVsEmaCanvas') animateKalmanVsEma();
+      if (e.target.id === 'kalmanPCanvas') drawKalmanP();
+      kalmanAnimObserver.unobserve(e.target);
+    }
+  });
+}, { threshold: 0.3 });
+
+['kalmanPCanvas', 'kalmanVsEmaCanvas'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) kalmanAnimObserver.observe(el);
 });
 </script>
 </body>
