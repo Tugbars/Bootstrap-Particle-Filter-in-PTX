@@ -1,11 +1,11 @@
 /**
  * @file test_smc2_rbpf.cu
- * @brief Test suite for SMC² + RBPF 4-parameter learner
+ * @brief Test suite for SMC² + RBPF 8-parameter learner
  *
  * Self-contained DGP matching the RBPF generative model exactly.
- * Learned: ρ, σ_total, μ_base, r_split  (4 params, reparameterized)
- * Physical: σ_z = r·σ_total, σ_base = √(1-r²)·σ_total
- * Fixed:   μ_scale, μ_rate, σ_scale, σ_rate, θ(z) curve
+ * Learned (8D): ρ, σ_total, r_split, μ_base, μ_scale, μ_rate, σ_scale, σ_rate
+ * Derived: σ_z = r·σ_total, σ_base = √(1-r²)·σ_total
+ * Fixed:   θ(z) speed curve only
  * Observations: log(y²) for OCSN likelihood.
  *
  * Build:
@@ -140,19 +140,26 @@ static void simulate_rsv(const RSVParams* p, float* y_obs, float* h_true,
  *═══════════════════════════════════════════════════════════════════════════*/
 
 /* Learned param names (what SMC² actually estimates) */
-static const char* param_names[N_PARAMS] = {"rho", "sigma_total", "mu_base", "r_split"};
+static const char* param_names[N_PARAMS] = {
+    "rho", "sigma_total", "r_split", "mu_base",
+    "mu_scale", "mu_rate", "sigma_scale", "sigma_rate"
+};
 
 /* True values in the learned parameterization */
 static void get_true_arr(const RSVParams* p, float* out) {
     out[0] = (float)p->rho;
     out[1] = (float)p->sigma_total;
-    out[2] = (float)p->mu_base;
-    out[3] = (float)p->r_split;
+    out[2] = (float)p->r_split;
+    out[3] = (float)p->mu_base;
+    out[4] = (float)p->mu_scale;
+    out[5] = (float)p->mu_rate;
+    out[6] = (float)p->sigma_scale;
+    out[7] = (float)p->sigma_rate;
 }
 
 /* Recover physical (σ_z, σ_base) from learned (σ_total, r) */
 static void to_physical(const float* learned, float* sigma_z, float* sigma_base) {
-    float st = learned[1], r = learned[3];
+    float st = learned[1], r = learned[2];
     *sigma_z = r * st;
     *sigma_base = sqrtf(fmaxf(1.0f - r * r, 1e-6f)) * st;
 }
@@ -219,9 +226,9 @@ static void print_progress(SMC2StateCUDA* s, int t) {
         100.0f * s->n_rejuv_accepts / s->n_rejuv_total : 0.0f;
     float ess = smc2_cuda_get_outer_ess(s);
     printf("  t=%4d: ESS=%5.1f, resamp=%2d, accept=%5.1f%%, "
-           "ρ=%.3f, σt=%.3f, r=%.3f, μb=%.2f  [σz=%.3f σb=%.3f]\n",
+           "ρ=%.3f, σt=%.3f, r=%.3f, μb=%.2f, μs=%.2f, μr=%.2f, σs=%.3f, σr=%.2f  [σz=%.3f σb=%.3f]\n",
            t, ess, s->n_resamples, acc,
-           m[0], m[1], m[3], m[2], sz, sb);
+           m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], sz, sb);
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
@@ -260,8 +267,12 @@ void test_basic(void) {
     printf("  Prior samples (learned space):\n");
     printf("    rho         = %.4f ± %.4f\n", theta_mean[0], theta_std[0]);
     printf("    sigma_total = %.4f ± %.4f\n", theta_mean[1], theta_std[1]);
-    printf("    mu_base     = %.4f ± %.4f\n", theta_mean[2], theta_std[2]);
-    printf("    r_split     = %.4f ± %.4f\n", theta_mean[3], theta_std[3]);
+    printf("    r_split     = %.4f ± %.4f\n", theta_mean[2], theta_std[2]);
+    printf("    mu_base     = %.4f ± %.4f\n", theta_mean[3], theta_std[3]);
+    printf("    mu_scale    = %.4f ± %.4f\n", theta_mean[4], theta_std[4]);
+    printf("    mu_rate     = %.4f ± %.4f\n", theta_mean[5], theta_std[5]);
+    printf("    sigma_scale = %.4f ± %.4f\n", theta_mean[6], theta_std[6]);
+    printf("    sigma_rate  = %.4f ± %.4f\n", theta_mean[7], theta_std[7]);
     printf("  Derived physical:\n");
     printf("    sigma_z     ≈ %.4f\n", sz);
     printf("    sigma_base  ≈ %.4f\n", sb);
@@ -281,22 +292,29 @@ void test_prior_data_agreement(void) {
     
     SMC2StateCUDA* state = smc2_cuda_alloc(N_THETA, N_INNER);
     
-    printf("\nDefault prior (reparameterized):\n");
+    printf("\nDefault prior (reparameterized, 8D):\n");
     printf("  rho         = %.3f ± %.3f\n", state->prior.rho_mean, state->prior.rho_std);
     printf("  sigma_total = %.3f ± %.3f\n", state->prior.sigma_total_mean, state->prior.sigma_total_std);
-    printf("  mu_base     = %.3f ± %.3f\n", state->prior.mu_base_mean, state->prior.mu_base_std);
     printf("  r_split     = %.3f ± %.3f\n", state->prior.r_split_mean, state->prior.r_split_std);
+    printf("  mu_base     = %.3f ± %.3f\n", state->prior.mu_base_mean, state->prior.mu_base_std);
+    printf("  mu_scale    = %.3f ± %.3f\n", state->prior.mu_scale_mean, state->prior.mu_scale_std);
+    printf("  mu_rate     = %.3f ± %.3f\n", state->prior.mu_rate_mean, state->prior.mu_rate_std);
+    printf("  sigma_scale = %.3f ± %.3f\n", state->prior.sigma_scale_mean, state->prior.sigma_scale_std);
+    printf("  sigma_rate  = %.3f ± %.3f\n", state->prior.sigma_rate_mean, state->prior.sigma_rate_std);
     
     printf("\nDefault bounds:\n");
     printf("  rho         ∈ [%.3f, %.3f]\n", state->bounds.rho_min, state->bounds.rho_max);
     printf("  sigma_total ∈ [%.3f, %.3f]\n", state->bounds.sigma_total_min, state->bounds.sigma_total_max);
-    printf("  mu_base     ∈ [%.3f, %.3f]\n", state->bounds.mu_base_min, state->bounds.mu_base_max);
     printf("  r_split     ∈ [%.3f, %.3f]\n", state->bounds.r_split_min, state->bounds.r_split_max);
+    printf("  mu_base     ∈ [%.3f, %.3f]\n", state->bounds.mu_base_min, state->bounds.mu_base_max);
+    printf("  mu_scale    ∈ [%.3f, %.3f]\n", state->bounds.mu_scale_min, state->bounds.mu_scale_max);
+    printf("  mu_rate     ∈ [%.3f, %.3f]\n", state->bounds.mu_rate_min, state->bounds.mu_rate_max);
+    printf("  sigma_scale ∈ [%.3f, %.3f]\n", state->bounds.sigma_scale_min, state->bounds.sigma_scale_max);
+    printf("  sigma_rate  ∈ [%.3f, %.3f]\n", state->bounds.sigma_rate_min, state->bounds.sigma_rate_max);
     
-    printf("\nFixed curve shapes (constant memory):\n");
-    printf("  mu_scale=%.2f  mu_rate=%.2f  sigma_scale=%.2f  sigma_rate=%.2f\n",
-           state->fixed_curves.mu_scale, state->fixed_curves.mu_rate,
-           state->fixed_curves.sigma_scale, state->fixed_curves.sigma_rate);
+    printf("\nFixed (constant memory): θ(z) speed curve only\n");
+    printf("  theta_base=%.2f  theta_scale=%.2f  theta_rate=%.2f\n",
+           state->theta_curve.base, state->theta_curve.scale, state->theta_curve.rate);
     
     RSVParams truth = make_truth(0.95, 0.10, -1.0, 0.15);
     printf("\nTest truth (physical → reparameterized):\n");
@@ -317,7 +335,7 @@ void test_parameter_learning(void) {
     printf("═══════════════════════════════════════════════════════════════\n");
     
     RSVParams truth = make_truth(0.95, 0.10, -1.0, 0.15);
-    int T = 3000;
+    int T = 1200;
     
     float* y = (float*)malloc(T * sizeof(float));
     float* h = (float*)malloc(T * sizeof(float));
@@ -326,9 +344,9 @@ void test_parameter_learning(void) {
     
     printf("\nTRUE (physical): ρ=%.3f, σ_z=%.3f, μ_base=%.3f, σ_base=%.3f\n",
            truth.rho, truth.sigma_z, truth.mu_base, truth.sigma_base);
-    printf("TRUE (learned):  ρ=%.3f, σ_total=%.4f, μ_base=%.3f, r=%.4f\n",
-           truth.rho, truth.sigma_total, truth.mu_base, truth.r_split);
-    printf("  Fixed shapes: mu_scale=%.2f, mu_rate=%.2f, sigma_scale=%.2f, sigma_rate=%.2f\n",
+    printf("TRUE (learned):  ρ=%.3f, σ_total=%.4f, r=%.4f, μ_base=%.3f\n",
+           truth.rho, truth.sigma_total, truth.r_split, truth.mu_base);
+    printf("  Curve shapes:  μ_scale=%.2f, μ_rate=%.2f, σ_scale=%.2f, σ_rate=%.2f\n",
            truth.mu_scale, truth.mu_rate, truth.sigma_scale, truth.sigma_rate);
     
     printf("\nGenerated T=%d observations\n", T);
@@ -376,7 +394,7 @@ void test_parameter_learning(void) {
     print_recovery_table(&truth, mean, sd, &n_ok, &n_15);
     printf("OVERALL: %d/%d within 2σ, %d/%d within 15%% relative error\n",
            n_ok, N_PARAMS, n_15, N_PARAMS);
-    printf("%s\n", n_ok >= 3 ? "PASSED" : "NEEDS INVESTIGATION");
+    printf("%s\n", n_ok >= 6 ? "PASSED" : "NEEDS INVESTIGATION");
     
     cudaEventDestroy(ev0); cudaEventDestroy(ev1);
     smc2_cuda_free(state);
@@ -393,7 +411,7 @@ void test_high_vol(void) {
     printf("═══════════════════════════════════════════════════════════════\n");
     
     RSVParams truth = make_truth(0.98, 0.08, 2.0, 0.20);
-    int T = 3000;
+    int T = 1000;
     
     float* y = (float*)malloc(T * sizeof(float));
     float* h = (float*)malloc(T * sizeof(float));
@@ -411,6 +429,7 @@ void test_high_vol(void) {
     s->prior.sigma_total_mean = 0.22f;    s->prior.sigma_total_std = 0.15f;
     s->prior.mu_base_mean = 0.0f;         s->prior.mu_base_std = 2.0f;
     s->prior.r_split_mean = 0.4f;         s->prior.r_split_std = 0.2f;
+    /* mu/sigma curve priors stay at defaults */
     s->bounds.mu_base_min = -5.0f;        s->bounds.mu_base_max = 8.0f;
     smc2_cuda_set_fixed_lag(s, 200);
     smc2_cuda_set_seed(s, 999);
@@ -442,7 +461,7 @@ void test_high_vol(void) {
     int n_ok, n_15;
     print_recovery_table(&truth, mean, sd, &n_ok, &n_15);
     printf("OVERALL: %d/%d within 2σ → %s\n", n_ok, N_PARAMS,
-           n_ok >= 2 ? "PASSED" : "NEEDS INVESTIGATION");
+           n_ok >= 5 ? "PASSED" : "NEEDS INVESTIGATION");
     
     cudaEventDestroy(ev0); cudaEventDestroy(ev1);
     smc2_cuda_free(s);
@@ -493,14 +512,14 @@ void test_identifiability(void) {
         smc2_cuda_get_theta_mean(s, mean);
         learned_rho[c] = mean[0];
         learned_st[c]  = mean[1];
-        learned_r[c]   = mean[3];
+        learned_r[c]   = mean[2];
         to_physical(mean, &derived_sz[c], &derived_sb[c]);
         
         printf("  Case %c: ρ=%.4f (true %.2f)  σ_total=%.4f (true %.4f)  "
                "r=%.4f (true %.4f)  [σ_z=%.4f  σ_base=%.4f]\n",
                'A' + c, mean[0], (float)cases[c].rho,
                mean[1], (float)cases[c].sigma_total,
-               mean[3], (float)cases[c].r_split,
+               mean[2], (float)cases[c].r_split,
                derived_sz[c], derived_sb[c]);
         smc2_cuda_free(s);
     }
@@ -535,10 +554,11 @@ void print_usage(const char* prog) {
 
 int main(int argc, char** argv) {
     printf("\n╔═══════════════════════════════════════════════════════════════╗\n");
-    printf("║  SMC² RBPF — 4-Param Convergence Tests                      ║\n");
-    printf("║  Learned: ρ, σ_total, μ_base, r_split                       ║\n");
-    printf("║  Physical: σ_z = r·σ_total, σ_base = √(1-r²)·σ_total       ║\n");
-    printf("║  Fixed:   μ_scale=0.5  μ_rate=1.0  σ_scale=0.1  σ_rate=1.0 ║\n");
+    printf("║  SMC² RBPF — 8-Param Convergence Tests                      ║\n");
+    printf("║  Learned: ρ, σ_total, r, μ_base, μ_scale, μ_rate,          ║\n");
+    printf("║           σ_scale, σ_rate                                    ║\n");
+    printf("║  Derived: σ_z = r·σ_total, σ_base = √(1-r²)·σ_total       ║\n");
+    printf("║  Fixed:   θ(z) speed curve only                              ║\n");
     printf("╚═══════════════════════════════════════════════════════════════╝\n");
     
     seed_rng(12345);

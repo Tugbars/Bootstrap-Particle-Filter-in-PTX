@@ -1,10 +1,13 @@
 /**
  * @file smc2_rbpf_cuda.cu
- * @brief SMC² with RBPF Inner Filter - Kernel Implementations (4-param version)
+ * @brief SMC² with RBPF Inner Filter - Kernel Implementations (8-param version)
  * 
- * Learned parameters: rho, sigma_total, mu_base, r_split
- * Physical params:    sigma_z = r_split * sigma_total, sigma_base = sqrt(1-r²) * sigma_total
- * Fixed parameters:   mu_scale, mu_rate, sigma_scale, sigma_rate (in constant memory)
+ * Learned parameters (8D):
+ *   rho, sigma_total, r_split, mu_base, mu_scale, mu_rate, sigma_scale, sigma_rate
+ * Derived:
+ *   sigma_z = r_split * sigma_total,  sigma_base = sqrt(1-r²) * sigma_total
+ * Fixed:
+ *   θ(z) speed curve (θ_base, θ_scale, θ_rate) in constant memory
  *
  * OCSN Parameterization Note:
  *   This file uses the Omori et al. (2007) centered parameterization where
@@ -151,26 +154,40 @@ void ocsn_kalman_update(
 __constant__ SVPrior       d_prior;
 __constant__ SVBounds      d_bounds;
 __constant__ SVCurve       d_theta_curve;
-__constant__ SVFixedCurves d_fixed_curves;
 __constant__ float         d_proposal_std[N_PARAMS];
 __constant__ float         d_proposal_chol[N_PARAMS * N_PARAMS];
 
 /*═══════════════════════════════════════════════════════════════════════════════
- * LOG PRIOR — 4 parameters only
+ * LOG PRIOR — 8 parameters
+ *
+ * Order: rho, sigma_total, r_split, mu_base, mu_scale, mu_rate, sigma_scale, sigma_rate
  *═══════════════════════════════════════════════════════════════════════════════*/
 
-__device__ float log_prior_theta(float rho, float sigma_total, float mu_base, float r_split) {
+__device__ float log_prior_theta(
+    float rho, float sigma_total, float r_split,
+    float mu_base, float mu_scale, float mu_rate,
+    float sigma_scale, float sigma_rate
+) {
     if (rho < d_bounds.rho_min || rho > d_bounds.rho_max) return -INFINITY;
     if (sigma_total < d_bounds.sigma_total_min || sigma_total > d_bounds.sigma_total_max) return -INFINITY;
-    if (mu_base < d_bounds.mu_base_min || mu_base > d_bounds.mu_base_max) return -INFINITY;
     if (r_split < d_bounds.r_split_min || r_split > d_bounds.r_split_max) return -INFINITY;
+    if (mu_base < d_bounds.mu_base_min || mu_base > d_bounds.mu_base_max) return -INFINITY;
+    if (mu_scale < d_bounds.mu_scale_min || mu_scale > d_bounds.mu_scale_max) return -INFINITY;
+    if (mu_rate < d_bounds.mu_rate_min || mu_rate > d_bounds.mu_rate_max) return -INFINITY;
+    if (sigma_scale < d_bounds.sigma_scale_min || sigma_scale > d_bounds.sigma_scale_max) return -INFINITY;
+    if (sigma_rate < d_bounds.sigma_rate_min || sigma_rate > d_bounds.sigma_rate_max) return -INFINITY;
     
     float d_rho = (rho - d_prior.rho_mean) / d_prior.rho_std;
     float d_st  = (sigma_total - d_prior.sigma_total_mean) / d_prior.sigma_total_std;
-    float d_mb  = (mu_base - d_prior.mu_base_mean) / d_prior.mu_base_std;
     float d_rs  = (r_split - d_prior.r_split_mean) / d_prior.r_split_std;
+    float d_mb  = (mu_base - d_prior.mu_base_mean) / d_prior.mu_base_std;
+    float d_ms  = (mu_scale - d_prior.mu_scale_mean) / d_prior.mu_scale_std;
+    float d_mr  = (mu_rate - d_prior.mu_rate_mean) / d_prior.mu_rate_std;
+    float d_ss  = (sigma_scale - d_prior.sigma_scale_mean) / d_prior.sigma_scale_std;
+    float d_sr  = (sigma_rate - d_prior.sigma_rate_mean) / d_prior.sigma_rate_std;
     
-    return -0.5f * (d_rho*d_rho + d_st*d_st + d_mb*d_mb + d_rs*d_rs);
+    return -0.5f * (d_rho*d_rho + d_st*d_st + d_rs*d_rs + d_mb*d_mb
+                  + d_ms*d_ms + d_mr*d_mr + d_ss*d_ss + d_sr*d_sr);
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
@@ -221,7 +238,9 @@ __global__ void kernel_init_from_prior(
     
     curandState* rng = &particles.rng_states[global_idx];
     
-    __shared__ float s_rho, s_sigma_total, s_mu_base, s_r_split;
+    __shared__ float s_rho, s_sigma_total, s_r_split;
+    __shared__ float s_mu_base, s_mu_scale, s_mu_rate;
+    __shared__ float s_sigma_scale, s_sigma_rate;
     __shared__ float s_sigma_z, s_sigma_base;  /* derived from (sigma_total, r_split) */
     
     if (inner_idx == 0) {
@@ -229,13 +248,21 @@ __global__ void kernel_init_from_prior(
         while (!valid && attempts < 1000) {
             s_rho = d_prior.rho_mean + d_prior.rho_std * curand_normal(rng);
             s_sigma_total = d_prior.sigma_total_mean + d_prior.sigma_total_std * curand_normal(rng);
-            s_mu_base = d_prior.mu_base_mean + d_prior.mu_base_std * curand_normal(rng);
             s_r_split = d_prior.r_split_mean + d_prior.r_split_std * curand_normal(rng);
+            s_mu_base = d_prior.mu_base_mean + d_prior.mu_base_std * curand_normal(rng);
+            s_mu_scale = d_prior.mu_scale_mean + d_prior.mu_scale_std * curand_normal(rng);
+            s_mu_rate = d_prior.mu_rate_mean + d_prior.mu_rate_std * curand_normal(rng);
+            s_sigma_scale = d_prior.sigma_scale_mean + d_prior.sigma_scale_std * curand_normal(rng);
+            s_sigma_rate = d_prior.sigma_rate_mean + d_prior.sigma_rate_std * curand_normal(rng);
             
             valid = (s_rho >= d_bounds.rho_min && s_rho <= d_bounds.rho_max &&
                      s_sigma_total >= d_bounds.sigma_total_min && s_sigma_total <= d_bounds.sigma_total_max &&
+                     s_r_split >= d_bounds.r_split_min && s_r_split <= d_bounds.r_split_max &&
                      s_mu_base >= d_bounds.mu_base_min && s_mu_base <= d_bounds.mu_base_max &&
-                     s_r_split >= d_bounds.r_split_min && s_r_split <= d_bounds.r_split_max);
+                     s_mu_scale >= d_bounds.mu_scale_min && s_mu_scale <= d_bounds.mu_scale_max &&
+                     s_mu_rate >= d_bounds.mu_rate_min && s_mu_rate <= d_bounds.mu_rate_max &&
+                     s_sigma_scale >= d_bounds.sigma_scale_min && s_sigma_scale <= d_bounds.sigma_scale_max &&
+                     s_sigma_rate >= d_bounds.sigma_rate_min && s_sigma_rate <= d_bounds.sigma_rate_max);
             attempts++;
         }
         
@@ -245,8 +272,12 @@ __global__ void kernel_init_from_prior(
         
         particles.rho[theta_idx] = s_rho;
         particles.sigma_total[theta_idx] = s_sigma_total;
-        particles.mu_base[theta_idx] = s_mu_base;
         particles.r_split[theta_idx] = s_r_split;
+        particles.mu_base[theta_idx] = s_mu_base;
+        particles.mu_scale[theta_idx] = s_mu_scale;
+        particles.mu_rate[theta_idx] = s_mu_rate;
+        particles.sigma_scale[theta_idx] = s_sigma_scale;
+        particles.sigma_rate[theta_idx] = s_sigma_rate;
         
         particles.log_weight[theta_idx] = 0.0f;
         particles.weight[theta_idx] = 1.0f / N_theta;
@@ -275,8 +306,8 @@ __global__ void kernel_init_from_prior(
     float z = z_tilde_to_z(z_tilde);
     
     float theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
-    float mu_z = eval_curve(s_mu_base, d_fixed_curves.mu_scale, d_fixed_curves.mu_rate, z);
-    float sigma_h = eval_curve(s_sigma_base, d_fixed_curves.sigma_scale, d_fixed_curves.sigma_rate, z);
+    float mu_z = eval_curve(s_mu_base, s_mu_scale, s_mu_rate, z);
+    float sigma_h = eval_curve(s_sigma_base, s_sigma_scale, s_sigma_rate, z);
     
     float phi = 1.0f - theta_z;
     float one_minus_phi_sq = fmaxf(1.0f - phi * phi, 1e-6f);
@@ -320,13 +351,18 @@ void kernel_rbpf_step_impl(
     void* s_cub_temp = reinterpret_cast<void*>(&s_idx[N_INNER]);
     
     __shared__ float s_rho, s_sigma_z, s_mu_base, s_sigma_base;
+    __shared__ float s_mu_scale, s_mu_rate, s_sigma_scale, s_sigma_rate;
     __shared__ float s_log_max, s_sum_w, s_u0;
     
     if (inner_idx == 0) {
         s_rho = particles.rho[theta_idx];
         float sigma_total = particles.sigma_total[theta_idx];
-        s_mu_base = particles.mu_base[theta_idx];
         float r = particles.r_split[theta_idx];
+        s_mu_base = particles.mu_base[theta_idx];
+        s_mu_scale = particles.mu_scale[theta_idx];
+        s_mu_rate = particles.mu_rate[theta_idx];
+        s_sigma_scale = particles.sigma_scale[theta_idx];
+        s_sigma_rate = particles.sigma_rate[theta_idx];
         /* Derive physical params */
         s_sigma_z = r * sigma_total;
         s_sigma_base = sqrtf(fmaxf(1.0f - r * r, 1e-6f)) * sigma_total;
@@ -404,8 +440,8 @@ void kernel_rbpf_step_impl(
     
     /* KALMAN PREDICT */
     float theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
-    float mu_z = eval_curve(s_mu_base, d_fixed_curves.mu_scale, d_fixed_curves.mu_rate, z);
-    float sigma_h = eval_curve(s_sigma_base, d_fixed_curves.sigma_scale, d_fixed_curves.sigma_rate, z);
+    float mu_z = eval_curve(s_mu_base, s_mu_scale, s_mu_rate, z);
+    float sigma_h = eval_curve(s_sigma_base, s_sigma_scale, s_sigma_rate, z);
     
     float phi = 1.0f - theta_z;
     float mu_pred = phi * mu_h + theta_z * mu_z;
@@ -462,7 +498,7 @@ __global__ void kernel_reset_outer_weights(ThetaParticlesSoA particles, int N_th
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
- * KERNEL: Compute Particle Moments (4D)
+ * KERNEL: Compute Particle Moments (8D)
  *
  * Thread-strided loops: supports N_theta up to 8192 with 1024-thread block.
  *═══════════════════════════════════════════════════════════════════════════════*/
@@ -487,8 +523,12 @@ __global__ void kernel_compute_particle_moments(
     const float* param_ptrs[N_PARAMS];
     param_ptrs[0] = particles.rho;
     param_ptrs[1] = particles.sigma_total;
-    param_ptrs[2] = particles.mu_base;
-    param_ptrs[3] = particles.r_split;
+    param_ptrs[2] = particles.r_split;
+    param_ptrs[3] = particles.mu_base;
+    param_ptrs[4] = particles.mu_scale;
+    param_ptrs[5] = particles.mu_rate;
+    param_ptrs[6] = particles.sigma_scale;
+    param_ptrs[7] = particles.sigma_rate;
     
     /* Phase 1: Compute means via thread-strided reduction */
     __shared__ float s_mean[N_PARAMS];
@@ -607,7 +647,7 @@ __global__ void kernel_outer_resample(
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
- * KERNEL: Copy θ-Particles After Resampling (4 learned params)
+ * KERNEL: Copy θ-Particles After Resampling (8 learned params)
  *
  * FIX: Use Philox counter-based RNG init instead of curand_init to avoid
  *      the high cost of full XORWOW state initialization after every resample.
@@ -627,8 +667,12 @@ __global__ void kernel_copy_theta_particles(
     if (inner_idx == 0) {
         dst.rho[theta_idx] = src.rho[ancestor];
         dst.sigma_total[theta_idx] = src.sigma_total[ancestor];
-        dst.mu_base[theta_idx] = src.mu_base[ancestor];
         dst.r_split[theta_idx] = src.r_split[ancestor];
+        dst.mu_base[theta_idx] = src.mu_base[ancestor];
+        dst.mu_scale[theta_idx] = src.mu_scale[ancestor];
+        dst.mu_rate[theta_idx] = src.mu_rate[ancestor];
+        dst.sigma_scale[theta_idx] = src.sigma_scale[ancestor];
+        dst.sigma_rate[theta_idx] = src.sigma_rate[ancestor];
         
         dst.log_weight[theta_idx] = 0.0f;
         dst.weight[theta_idx] = 1.0f / N_theta;
@@ -715,7 +759,7 @@ __global__ void kernel_copy_checkpoint(
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
- * KERNEL: CPMMH Fused Rejuvenation (4D proposal)
+ * KERNEL: CPMMH Fused Rejuvenation (8D proposal)
  *
  * FIX: Removed unused seed/move_id/block_id parameters.
  *      Added __syncthreads() before final ESS reduction.
@@ -756,8 +800,14 @@ void kernel_cpmmh_rejuvenate_fused_impl(
     void* s_cub_temp = reinterpret_cast<void*>(&s_idx[N_INNER]);
     
     __shared__ float s_log_max, s_sum_w, s_ess_prop;
-    __shared__ float s_rho_curr, s_sigma_total_curr, s_mu_base_curr, s_r_split_curr;
-    __shared__ float s_rho_prop, s_sigma_total_prop, s_mu_base_prop, s_r_split_prop;
+    /* Current θ (8 params) */
+    __shared__ float s_rho_curr, s_sigma_total_curr, s_r_split_curr;
+    __shared__ float s_mu_base_curr, s_mu_scale_curr, s_mu_rate_curr;
+    __shared__ float s_sigma_scale_curr, s_sigma_rate_curr;
+    /* Proposed θ* (8 params) */
+    __shared__ float s_rho_prop, s_sigma_total_prop, s_r_split_prop;
+    __shared__ float s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop;
+    __shared__ float s_sigma_scale_prop, s_sigma_rate_prop;
     __shared__ float s_sigma_z_prop, s_sigma_base_prop;  /* derived */
     __shared__ float s_ll_curr, s_ll_prop, s_lp_curr, s_lp_prop;
     __shared__ int s_accept, s_valid;
@@ -765,15 +815,21 @@ void kernel_cpmmh_rejuvenate_fused_impl(
     
     curandState local_rng = particles.rng_states[global_idx];
     
-    /* PROPOSE θ* (thread 0) — 4D random walk in (ρ, σ_total, μ_base, r) space */
+    /* PROPOSE θ* (thread 0) — 8D random walk */
     if (inner_idx == 0) {
         s_rho_curr = particles.rho[theta_idx];
         s_sigma_total_curr = particles.sigma_total[theta_idx];
-        s_mu_base_curr = particles.mu_base[theta_idx];
         s_r_split_curr = particles.r_split[theta_idx];
+        s_mu_base_curr = particles.mu_base[theta_idx];
+        s_mu_scale_curr = particles.mu_scale[theta_idx];
+        s_mu_rate_curr = particles.mu_rate[theta_idx];
+        s_sigma_scale_curr = particles.sigma_scale[theta_idx];
+        s_sigma_rate_curr = particles.sigma_rate[theta_idx];
         
         s_ll_curr = particles.log_likelihood[theta_idx];
-        s_lp_curr = log_prior_theta(s_rho_curr, s_sigma_total_curr, s_mu_base_curr, s_r_split_curr);
+        s_lp_curr = log_prior_theta(s_rho_curr, s_sigma_total_curr, s_r_split_curr,
+                                     s_mu_base_curr, s_mu_scale_curr, s_mu_rate_curr,
+                                     s_sigma_scale_curr, s_sigma_rate_curr);
         
         float z_rnd[N_PARAMS];
         for (int i = 0; i < N_PARAMS; i++) z_rnd[i] = curand_normal(&local_rng);
@@ -795,16 +851,22 @@ void kernel_cpmmh_rejuvenate_fused_impl(
                 pert[i] = d_proposal_std[i] * z_rnd[i];
         }
         
-        s_rho_prop = s_rho_curr + pert[0];
-        s_sigma_total_prop = s_sigma_total_curr + pert[1];
-        s_mu_base_prop = s_mu_base_curr + pert[2];
-        s_r_split_prop = s_r_split_curr + pert[3];
+        s_rho_prop          = s_rho_curr          + pert[0];
+        s_sigma_total_prop  = s_sigma_total_curr  + pert[1];
+        s_r_split_prop      = s_r_split_curr      + pert[2];
+        s_mu_base_prop      = s_mu_base_curr      + pert[3];
+        s_mu_scale_prop     = s_mu_scale_curr     + pert[4];
+        s_mu_rate_prop      = s_mu_rate_curr      + pert[5];
+        s_sigma_scale_prop  = s_sigma_scale_curr  + pert[6];
+        s_sigma_rate_prop   = s_sigma_rate_curr   + pert[7];
         
         /* Derive physical params for RBPF replay */
         s_sigma_z_prop = s_r_split_prop * s_sigma_total_prop;
         s_sigma_base_prop = sqrtf(fmaxf(1.0f - s_r_split_prop * s_r_split_prop, 1e-6f)) * s_sigma_total_prop;
         
-        s_lp_prop = log_prior_theta(s_rho_prop, s_sigma_total_prop, s_mu_base_prop, s_r_split_prop);
+        s_lp_prop = log_prior_theta(s_rho_prop, s_sigma_total_prop, s_r_split_prop,
+                                     s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop,
+                                     s_sigma_scale_prop, s_sigma_rate_prop);
         s_valid = isfinite(s_lp_prop) ? 1 : 0;
         s_accept = 0;
     }
@@ -822,6 +884,10 @@ void kernel_cpmmh_rejuvenate_fused_impl(
     float sigma_z = s_sigma_z_prop;
     float mu_base = s_mu_base_prop;
     float sigma_base = s_sigma_base_prop;
+    float mu_scale = s_mu_scale_prop;
+    float mu_rate = s_mu_rate_prop;
+    float sigma_scale = s_sigma_scale_prop;
+    float sigma_rate = s_sigma_rate_prop;
     
     float z_tilde, mu_h, var_h, log_w;
     float ll_accum = 0.0f;
@@ -846,8 +912,8 @@ void kernel_cpmmh_rejuvenate_fused_impl(
         float z_init = z_tilde_to_z(z_tilde);
         
         float theta_z_init = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z_init);
-        float mu_z_init = eval_curve(mu_base, d_fixed_curves.mu_scale, d_fixed_curves.mu_rate, z_init);
-        float sigma_h_init = eval_curve(sigma_base, d_fixed_curves.sigma_scale, d_fixed_curves.sigma_rate, z_init);
+        float mu_z_init = eval_curve(mu_base, mu_scale, mu_rate, z_init);
+        float sigma_h_init = eval_curve(sigma_base, sigma_scale, sigma_rate, z_init);
         float phi_init = 1.0f - theta_z_init;
         float h_stat_var = (sigma_h_init * sigma_h_init) / fmaxf(1.0f - phi_init * phi_init, 1e-6f);
         
@@ -922,13 +988,13 @@ void kernel_cpmmh_rejuvenate_fused_impl(
             __syncthreads();
         }
         
-        /* Propagate + Kalman with fixed curve shapes */
+        /* Propagate + Kalman with proposed curve params */
         float z_tilde_new = rho * z_tilde + sigma_z * z_noise_prop_t1;
         float z = z_tilde_to_z(z_tilde_new);
         
         float theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
-        float mu_z_val = eval_curve(mu_base, d_fixed_curves.mu_scale, d_fixed_curves.mu_rate, z);
-        float sigma_h = eval_curve(sigma_base, d_fixed_curves.sigma_scale, d_fixed_curves.sigma_rate, z);
+        float mu_z_val = eval_curve(mu_base, mu_scale, mu_rate, z);
+        float sigma_h = eval_curve(sigma_base, sigma_scale, sigma_rate, z);
         float phi = 1.0f - theta_z;
         
         float mu_pred = phi * mu_h + theta_z * mu_z_val;
@@ -996,8 +1062,12 @@ void kernel_cpmmh_rejuvenate_fused_impl(
         if (s_accept) {
             particles.rho[theta_idx] = s_rho_prop;
             particles.sigma_total[theta_idx] = s_sigma_total_prop;
-            particles.mu_base[theta_idx] = s_mu_base_prop;
             particles.r_split[theta_idx] = s_r_split_prop;
+            particles.mu_base[theta_idx] = s_mu_base_prop;
+            particles.mu_scale[theta_idx] = s_mu_scale_prop;
+            particles.mu_rate[theta_idx] = s_mu_rate_prop;
+            particles.sigma_scale[theta_idx] = s_sigma_scale_prop;
+            particles.sigma_rate[theta_idx] = s_sigma_rate_prop;
             particles.log_likelihood[theta_idx] = s_ll_prop;
             particles.ess_inner[theta_idx] = s_ess_prop;
             atomicAdd(d_accepts, 1);
@@ -1121,15 +1191,19 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     state->N_inner = N_inner;
     state->ess_threshold_outer = 0.5f;
     state->ess_threshold_inner = 0.5f;
-    state->K_rejuv = 10;
+    state->K_rejuv = 15;  /* 8D space needs more moves per rejuvenation */
     
     int N_total = N_theta * N_inner;
     
-    /* 4 learned θ-level params */
+    /* 8 learned θ-level params */
     ALLOC_THETA_FIELD(rho);
     ALLOC_THETA_FIELD(sigma_total);
-    ALLOC_THETA_FIELD(mu_base);
     ALLOC_THETA_FIELD(r_split);
+    ALLOC_THETA_FIELD(mu_base);
+    ALLOC_THETA_FIELD(mu_scale);
+    ALLOC_THETA_FIELD(mu_rate);
+    ALLOC_THETA_FIELD(sigma_scale);
+    ALLOC_THETA_FIELD(sigma_rate);
     ALLOC_THETA_FIELD(log_weight);
     ALLOC_THETA_FIELD(weight);
     ALLOC_THETA_FIELD(log_likelihood);
@@ -1181,36 +1255,41 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     CUDA_CHECK(cudaMalloc(&state->d_u0_noise[0], noise_array_bytes(u0_noise_size)));
     CUDA_CHECK(cudaMalloc(&state->d_u0_noise[1], noise_array_bytes(u0_noise_size)));
     
-    /* Prior (4 params): ρ, σ_total, μ_base, r_split
-     * σ_total ≈ √(σ_z² + σ_base²), r = σ_z/σ_total
-     * Default prior centers: σ_total ≈ 0.18 (from old σ_z=0.1, σ_base=0.15), r ≈ 0.5 */
+    /* Prior (8 params): ρ, σ_total, r_split, μ_base, μ_scale, μ_rate, σ_scale, σ_rate
+     * σ_total ≈ √(σ_z² + σ_base²), r = σ_z/σ_total */
     state->prior.rho_mean = 0.95f;          state->prior.rho_std = 0.02f;
     state->prior.sigma_total_mean = 0.18f;  state->prior.sigma_total_std = 0.1f;
-    state->prior.mu_base_mean = -1.0f;      state->prior.mu_base_std = 0.5f;
     state->prior.r_split_mean = 0.5f;       state->prior.r_split_std = 0.2f;
+    state->prior.mu_base_mean = -1.0f;      state->prior.mu_base_std = 0.5f;
+    state->prior.mu_scale_mean = 0.5f;      state->prior.mu_scale_std = 0.3f;
+    state->prior.mu_rate_mean = 1.0f;       state->prior.mu_rate_std = 0.5f;
+    state->prior.sigma_scale_mean = 0.1f;   state->prior.sigma_scale_std = 0.05f;
+    state->prior.sigma_rate_mean = 1.0f;    state->prior.sigma_rate_std = 0.5f;
     
-    /* Bounds (4 params) */
+    /* Bounds (8 params) */
     state->bounds.rho_min = 0.8f;              state->bounds.rho_max = 0.999f;
     state->bounds.sigma_total_min = 0.01f;     state->bounds.sigma_total_max = 1.5f;
-    state->bounds.mu_base_min = -10.0f;        state->bounds.mu_base_max = 5.0f;
     state->bounds.r_split_min = 0.01f;         state->bounds.r_split_max = 0.99f;
+    state->bounds.mu_base_min = -10.0f;        state->bounds.mu_base_max = 5.0f;
+    state->bounds.mu_scale_min = 0.01f;        state->bounds.mu_scale_max = 5.0f;
+    state->bounds.mu_rate_min = 0.1f;          state->bounds.mu_rate_max = 10.0f;
+    state->bounds.sigma_scale_min = 0.001f;    state->bounds.sigma_scale_max = 1.0f;
+    state->bounds.sigma_rate_min = 0.1f;       state->bounds.sigma_rate_max = 10.0f;
     
-    /* Fixed curve shapes (calibrated offline) */
-    state->fixed_curves.mu_scale = 0.5f;
-    state->fixed_curves.mu_rate = 1.0f;
-    state->fixed_curves.sigma_scale = 0.1f;
-    state->fixed_curves.sigma_rate = 1.0f;
-    
-    /* Theta curve (fixed) */
+    /* Theta curve (fixed — derived from φ-based sufficient stats) */
     state->theta_curve.base = 0.02f;
     state->theta_curve.scale = 0.08f;
     state->theta_curve.rate = 1.5f;
     
-    /* Proposal std (4 params) */
+    /* Proposal std (8 params) */
     state->proposal_std[0] = 0.01f;    /* rho */
     state->proposal_std[1] = 0.02f;    /* sigma_total */
-    state->proposal_std[2] = 0.1f;     /* mu_base */
-    state->proposal_std[3] = 0.05f;    /* r_split — wider since weakly identified */
+    state->proposal_std[2] = 0.05f;    /* r_split — weakly identified */
+    state->proposal_std[3] = 0.1f;     /* mu_base */
+    state->proposal_std[4] = 0.05f;    /* mu_scale */
+    state->proposal_std[5] = 0.1f;     /* mu_rate */
+    state->proposal_std[6] = 0.02f;    /* sigma_scale */
+    state->proposal_std[7] = 0.1f;     /* sigma_rate */
     
     /* FIX #11: Default fixed-lag to 50 to prevent O(T) rejuvenation cost */
     state->fixed_lag_L = 50;
@@ -1232,7 +1311,7 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     CUDA_CHECK(cudaMalloc(&state->d_checkpoint_scratch_log_w, N_total * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&state->d_checkpoint_scratch_ll, N_theta * sizeof(float)));
     
-    /* Adaptive proposal scratch (4D) */
+    /* Adaptive proposal scratch (8D) */
     CUDA_CHECK(cudaMalloc(&state->d_temp_mean, N_PARAMS * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&state->d_temp_cov, N_PARAMS * N_PARAMS * sizeof(float)));
     state->use_adaptive_proposals = true;
@@ -1256,8 +1335,12 @@ void smc2_cuda_free(SMC2StateCUDA* state) {
     
     FREE_THETA_FIELD(rho);
     FREE_THETA_FIELD(sigma_total);
-    FREE_THETA_FIELD(mu_base);
     FREE_THETA_FIELD(r_split);
+    FREE_THETA_FIELD(mu_base);
+    FREE_THETA_FIELD(mu_scale);
+    FREE_THETA_FIELD(mu_rate);
+    FREE_THETA_FIELD(sigma_scale);
+    FREE_THETA_FIELD(sigma_rate);
     FREE_THETA_FIELD(log_weight);
     FREE_THETA_FIELD(weight);
     FREE_THETA_FIELD(log_likelihood);
@@ -1417,10 +1500,14 @@ void smc2_cuda_set_proposal_std(SMC2StateCUDA* state, const float* std) {
     if (std) {
         memcpy(state->proposal_std, std, N_PARAMS * sizeof(float));
     } else {
-        state->proposal_std[0] = 0.01f;
-        state->proposal_std[1] = 0.02f;
-        state->proposal_std[2] = 0.1f;
-        state->proposal_std[3] = 0.05f;
+        state->proposal_std[0] = 0.01f;   /* rho */
+        state->proposal_std[1] = 0.02f;   /* sigma_total */
+        state->proposal_std[2] = 0.05f;   /* r_split */
+        state->proposal_std[3] = 0.1f;    /* mu_base */
+        state->proposal_std[4] = 0.05f;   /* mu_scale */
+        state->proposal_std[5] = 0.1f;    /* mu_rate */
+        state->proposal_std[6] = 0.02f;   /* sigma_scale */
+        state->proposal_std[7] = 0.1f;    /* sigma_rate */
     }
     CUDA_CHECK(cudaMemcpyToSymbol(d_proposal_std, state->proposal_std, N_PARAMS * sizeof(float)));
 }
@@ -1430,7 +1517,7 @@ void smc2_cuda_set_cpmmh_rho(SMC2StateCUDA* state, float rho) {
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
- * Adaptive Proposal Covariance (4×4)
+ * Adaptive Proposal Covariance (8×8)
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 #define ADAPTIVE_SCALE_FACTOR (2.38f * 2.38f / (float)N_PARAMS)
@@ -1487,7 +1574,6 @@ void smc2_cuda_init_from_prior(SMC2StateCUDA* state) {
     CUDA_CHECK(cudaMemcpyToSymbol(d_prior, &state->prior, sizeof(SVPrior)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_bounds, &state->bounds, sizeof(SVBounds)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_theta_curve, &state->theta_curve, sizeof(SVCurve)));
-    CUDA_CHECK(cudaMemcpyToSymbol(d_fixed_curves, &state->fixed_curves, sizeof(SVFixedCurves)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_proposal_std, state->proposal_std, N_PARAMS * sizeof(float)));
     
     /* Initial Cholesky = diagonal from proposal_std */
@@ -1750,8 +1836,12 @@ static void smc2_cuda_get_theta_moments_internal(
     CUDA_CHECK(cudaMemcpy(h_weight, state->d_particles.weight, state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(h_params[0], state->d_particles.rho, state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(h_params[1], state->d_particles.sigma_total, state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_params[2], state->d_particles.mu_base, state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_params[3], state->d_particles.r_split, state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_params[2], state->d_particles.r_split, state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_params[3], state->d_particles.mu_base, state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_params[4], state->d_particles.mu_scale, state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_params[5], state->d_particles.mu_rate, state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_params[6], state->d_particles.sigma_scale, state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_params[7], state->d_particles.sigma_rate, state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
     
     /* Weighted mean */
     for (int i = 0; i < N_PARAMS; i++) theta_mean[i] = 0.0f;

@@ -17,8 +17,9 @@
  * 
  *   ┌─────────────────────────────────────────────────────────────────┐
  *   │ OUTER: SMC² over θ-particles (N_theta = 256)                │
- *   │   - Learned parameters: ρ, σ_z, μ_base, σ_base              │
- *   │   - Fixed curve shapes: μ_scale, μ_rate, σ_scale, σ_rate    │
+ *   │   - Learned parameters (8D): ρ, σ_total, r, μ_base,       │
+ *   │     μ_scale, μ_rate, σ_scale, σ_rate                       │
+ *   │   - Fixed: θ(z) speed curve only                            │
  *   │   - Weights: accumulated likelihood p̂(y_{1:t} | θ)          │
  *   │   - Resample when ESS < threshold                           │
  *   │   - Rejuvenate via CPMMH moves                              │
@@ -41,31 +42,25 @@
  *   └─────────────────────────────────────────────────────────────────┘
  * 
  * 
- * Parameter Space (4D learned + 4D fixed)
- * ========================================
+ * Parameter Space (8D learned + θ(z) fixed)
+ * ==========================================
  * 
- * Learned by SMC²:
+ * Learned by SMC² (8D):
  *   ρ            - AR(1) persistence of z̃ (dynamics)
  *   σ_total      - Total vol-of-vol: √(σ_z² + σ_base²) (well-identified)
- *   μ_base       - Base mean level (curve level)
  *   r            - Vol-of-vol split: σ_z/σ_total ∈ (0,1) (weakly identified)
+ *   μ_base       - μ(z) curve base level
+ *   μ_scale      - μ(z) curve amplitude
+ *   μ_rate       - μ(z) curve steepness
+ *   σ_scale      - σ_h(z) curve amplitude
+ *   σ_rate       - σ_h(z) curve steepness
  * 
  * Physical parameters recovered as:
  *   σ_z    = r · σ_total        (z̃ innovation scale)
  *   σ_base = √(1-r²) · σ_total (σ_h curve base level)
  * 
- * Rationale: σ_z and σ_base have an identification ridge — the data constrains
- * their combined effect (σ_total) but not how it's split between the two
- * channels. This reparameterization aligns CPMMH proposals with the likelihood
- * geometry, improving acceptance rates and posterior accuracy.
- * 
- * Fixed (calibrated offline):
- *   μ_scale, μ_rate     - Mean curve shape
- *   σ_scale, σ_rate     - Vol-of-vol curve shape
- * 
- * Rationale: curve LEVELS need to adapt online, but curve SHAPES are
- * slow-moving and can be calibrated offline. This halves the proposal
- * dimension from 8D to 4D, roughly doubling MH acceptance rates.
+ * Fixed (θ(z) speed curve — derived offline from φ-based sufficient stats):
+ *   θ_base, θ_scale, θ_rate
  * 
  * 
  * CPMMH Coupling: Why We Sort After Resampling
@@ -135,8 +130,9 @@
 
 #define OCSN_K 10
 
-/** Number of learned parameters in the SMC² outer layer */
-#define N_PARAMS 4
+/** Number of learned parameters in the SMC² outer layer
+ *  8D: rho, sigma_total, r_split, mu_base, mu_scale, mu_rate, sigma_scale, sigma_rate */
+#define N_PARAMS 8
 
 #ifndef SORT_EVERY_K
 #define SORT_EVERY_K  4
@@ -156,7 +152,7 @@
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 /**
- * @brief Gaussian prior specification for learned θ parameters (4D)
+ * @brief Gaussian prior specification for learned θ parameters (8D)
  * 
  * Each parameter has independent N(mean, std²) prior.
  * Used in MH acceptance ratio: π(θ*)/π(θ).
@@ -164,8 +160,12 @@
 struct SVPrior {
     float rho_mean, rho_std;
     float sigma_total_mean, sigma_total_std;
-    float mu_base_mean, mu_base_std;
     float r_split_mean, r_split_std;
+    float mu_base_mean, mu_base_std;
+    float mu_scale_mean, mu_scale_std;
+    float mu_rate_mean, mu_rate_std;
+    float sigma_scale_mean, sigma_scale_std;
+    float sigma_rate_mean, sigma_rate_std;
 };
 
 /**
@@ -176,21 +176,12 @@ struct SVPrior {
 struct SVBounds {
     float rho_min, rho_max;
     float sigma_total_min, sigma_total_max;
-    float mu_base_min, mu_base_max;
     float r_split_min, r_split_max;
-};
-
-/**
- * @brief Fixed curve shape parameters (calibrated offline, not learned)
- * 
- * These define how μ(z) and σ_h(z) curves respond to regime z.
- * The BASE levels are learned; the SHAPES are fixed.
- */
-struct SVFixedCurves {
-    float mu_scale;       /**< μ(z) curve: scale */
-    float mu_rate;        /**< μ(z) curve: rate */
-    float sigma_scale;    /**< σ_h(z) curve: scale */
-    float sigma_rate;     /**< σ_h(z) curve: rate */
+    float mu_base_min, mu_base_max;
+    float mu_scale_min, mu_scale_max;
+    float mu_rate_min, mu_rate_max;
+    float sigma_scale_min, sigma_scale_max;
+    float sigma_rate_min, sigma_rate_max;
 };
 
 /**
@@ -207,17 +198,26 @@ struct SVCurve {
  * 
  * Memory layout uses Structure-of-Arrays for coalesced GPU access.
  * 
- * Only 4 parameters are learned (rho, sigma_total, mu_base, r_split).
- * Physical sigma_z = r_split * sigma_total, sigma_base = sqrt(1-r²) * sigma_total.
- * Curve shapes (mu_scale, mu_rate, sigma_scale, sigma_rate) live in
- * constant memory as SVFixedCurves.
+ * 8 parameters are learned:
+ *   rho, sigma_total, r_split, mu_base, mu_scale, mu_rate, sigma_scale, sigma_rate
+ *
+ * Physical params derived per-particle:
+ *   sigma_z    = r_split * sigma_total
+ *   sigma_base = sqrt(1-r²) * sigma_total
+ *
+ * θ(z) speed curve remains fixed (in constant memory as SVCurve).
+ * θ_base/θ_scale/θ_rate can be derived offline from φ-based sufficient stats.
  */
 struct ThetaParticlesSoA {
     /* ═══ Learned θ-level arrays (N_theta elements) ═══ */
     float* rho;              /**< AR(1) coefficient for z̃ dynamics */
     float* sigma_total;      /**< Total vol-of-vol: √(σ_z² + σ_base²) */
-    float* mu_base;          /**< μ(z) curve: base parameter (learned) */
     float* r_split;          /**< Vol-of-vol split ratio: σ_z / σ_total ∈ (0,1) */
+    float* mu_base;          /**< μ(z) curve: base parameter */
+    float* mu_scale;         /**< μ(z) curve: scale parameter */
+    float* mu_rate;          /**< μ(z) curve: rate parameter */
+    float* sigma_scale;      /**< σ_h(z) curve: scale parameter */
+    float* sigma_rate;       /**< σ_h(z) curve: rate parameter */
     
     float* log_weight;
     float* weight;
@@ -268,8 +268,7 @@ struct SMC2StateCUDA {
     SVPrior prior;
     SVBounds bounds;
     SVCurve theta_curve;             /**< θ(z) curve (fixed, not learned) */
-    SVFixedCurves fixed_curves;      /**< Fixed curve shapes for μ and σ_h */
-    float proposal_std[N_PARAMS];    /**< Random walk proposal std */
+    float proposal_std[N_PARAMS];    /**< Random walk proposal std (8D) */
     
     /* ═══ Algorithm settings ═══ */
     float ess_threshold_outer;
@@ -539,7 +538,8 @@ void smc2_cuda_set_cpmmh_rho(SMC2StateCUDA* state, float rho);
 
 /**
  * @brief Set proposal standard deviations
- * @param std  Array of N_PARAMS floats [rho, sigma_total, mu_base, r_split], or NULL for defaults
+ * @param std  Array of N_PARAMS floats, or NULL for defaults
+ * Order: [rho, sigma_total, r_split, mu_base, mu_scale, mu_rate, sigma_scale, sigma_rate]
  */
 void smc2_cuda_set_proposal_std(SMC2StateCUDA* state, const float* std);
 
@@ -549,7 +549,7 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs);
 /**
  * @brief Get posterior mean of learned θ parameters
  * @param theta_mean  Output array of size N_PARAMS
- * Order: [rho, sigma_total, mu_base, r_split]
+ * Order: [rho, sigma_total, r_split, mu_base, mu_scale, mu_rate, sigma_scale, sigma_rate]
  */
 void smc2_cuda_get_theta_mean(SMC2StateCUDA* state, float* theta_mean);
 void smc2_cuda_get_theta_std(SMC2StateCUDA* state, float* theta_std);
