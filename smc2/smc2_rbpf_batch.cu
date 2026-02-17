@@ -1875,7 +1875,7 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
                 state->d_ancestors, state->N_theta, state->N_inner);
             CUDA_CHECK(cudaDeviceSynchronize());
             
-            /* Pointer swap instead of 5× D2D memcpy */
+            /* Pointer swap instead of 5x D2D memcpy */
             float* tmp_f;
             #define SWAP_CP(a, b) do { tmp_f = (a); (a) = (b); (b) = tmp_f; } while(0)
             SWAP_CP(state->d_checkpoint_z,     state->d_checkpoint_scratch_z);
@@ -1929,6 +1929,7 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
                 case 512: DISPATCH_CPMMH(512); break;
                 default: fprintf(stderr, "Unsupported N_inner=%d\n", state->N_inner); exit(EXIT_FAILURE);
             }
+            /* No sync before commit — same stream dependency */
             
             int t_start_commit = (t_checkpoint_use >= 0) ? (t_checkpoint_use + 1) : 0;
             kernel_commit_accepted_noise<<<state->N_theta, state->N_inner>>>(
@@ -2124,7 +2125,7 @@ float smc2_cuda_update_batch(SMC2StateCUDA* state, const float* y_batch, int n_o
                 state->d_ancestors, state->N_theta, state->N_inner);
             CUDA_CHECK(cudaDeviceSynchronize());
 
-            /* Pointer swap instead of 5× D2D memcpy */
+            /* Pointer swap instead of 5x D2D memcpy */
             float* tmp_f;
             #define SWAP_CP(a, b) do { tmp_f = (a); (a) = (b); (b) = tmp_f; } while(0)
             SWAP_CP(state->d_checkpoint_z,     state->d_checkpoint_scratch_z);
