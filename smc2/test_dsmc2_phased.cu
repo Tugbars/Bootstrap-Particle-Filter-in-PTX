@@ -390,8 +390,8 @@ static RunResult run_pipeline(
 /* ── Main ────────────────────────────────────────────────────────────────── */
 
 int main(int argc, char** argv) {
-    int n_bpf   = (argc > 1) ? atoi(argv[1]) : 300000;
-    int n_theta = 256;
+    int n_bpf   = (argc > 1) ? atoi(argv[1]) : 30000;
+    int n_theta = 1024;
     int n_inner = 512;
     int seed    = 42;
     g_seed      = 12345;
