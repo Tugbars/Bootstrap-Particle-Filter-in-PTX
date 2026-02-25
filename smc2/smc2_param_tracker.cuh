@@ -45,14 +45,6 @@ extern "C" {
 #endif
 
 /**
- * @brief Curve evaluation: f(z) = base + scale * (1 - exp(-rate * z))
- */
-static inline float eval_curve_host(float base, float scale, float rate,
-                                    float z) {
-  return base + scale * (1.0f - expf(-rate * z));
-}
-
-/**
  * @brief Snapshot of filtered parameters for the production BPF
  *
  * Everything the production BPF needs, evaluated at the current z̄.

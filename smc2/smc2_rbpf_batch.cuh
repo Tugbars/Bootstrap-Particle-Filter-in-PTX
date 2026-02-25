@@ -253,6 +253,7 @@ struct SMC2StateCUDA {
     /* ═══ CPMMH noise buffers ═══ */
     noise_t* d_z_noise[2];
     noise_t* d_u0_noise[2];
+    noise_t* d_s_noise[2];      /**< Mixture indicator noise (per inner particle per tick) */
     int noise_buf;
     int noise_capacity;
     float cpmmh_rho;
@@ -450,7 +451,7 @@ __global__ void kernel_init_rng(curandState* states, unsigned long long seed, in
 __global__ void kernel_init_from_prior(
     ThetaParticlesSoA particles,
     int N_theta, int N_inner,
-    noise_t* d_z_noise, noise_t* d_u0_noise,
+    noise_t* d_z_noise, noise_t* d_u0_noise, noise_t* d_s_noise,
     int noise_capacity
 );
 
@@ -472,6 +473,7 @@ __global__ void kernel_copy_theta_particles(
 __global__ void kernel_copy_noise_arrays(
     const noise_t* src_z, noise_t* dst_z,
     const noise_t* src_u0, noise_t* dst_u0,
+    const noise_t* src_s, noise_t* dst_s,
     const int* d_ancestors, int N_theta, int N_inner,
     int t_current, int noise_capacity, int t_start
 );
@@ -487,6 +489,7 @@ __global__ void kernel_copy_noise_arrays(
  *       const float* y_history,
  *       noise_t* d_z_noise_curr, noise_t* d_z_noise_other,
  *       noise_t* d_u0_noise_curr, noise_t* d_u0_noise_other,
+ *       noise_t* d_s_noise_curr, noise_t* d_s_noise_other,
  *       int t_current, int N_theta, int noise_capacity,
  *       float cpmmh_rho,
  *       int* d_accepts, int* d_swap_flags,
@@ -499,6 +502,7 @@ __global__ void kernel_copy_noise_arrays(
 __global__ void kernel_commit_accepted_noise(
     noise_t* d_z_noise_0, noise_t* d_z_noise_1,
     noise_t* d_u0_noise_0, noise_t* d_u0_noise_1,
+    noise_t* d_s_noise_0, noise_t* d_s_noise_1,
     const int* d_swap_flags, int N_theta, int N_inner,
     int t_current, int noise_capacity, int t_start
 );
@@ -533,6 +537,11 @@ __global__ void kernel_save_checkpoint(
 /*═══════════════════════════════════════════════════════════════════════════════
  * SECTION 7: HOST API
  *═══════════════════════════════════════════════════════════════════════════════*/
+
+/** @brief Host-side curve evaluation (mirrors device eval_curve) */
+static inline float eval_curve_host(float base, float scale, float rate, float z) {
+    return base + scale * (1.0f - expf(-rate * z));
+}
 
 #ifdef __cplusplus
 extern "C" {

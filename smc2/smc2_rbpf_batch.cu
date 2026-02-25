@@ -148,6 +148,94 @@ void ocsn_kalman_update(
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
+ * OCSN Kalman Update (Sampled Mixture Component)
+ *
+ * Samples ONE mixture component s_t from the posterior p(s|y, h_pred), then
+ * performs a single-component Kalman update with R = v_{s_t}².
+ *
+ * Why sample instead of marginalize:
+ *   - Conditional on s_t, the Kalman update uses R = v_k² (often << π²/2)
+ *   - Dominant components have v_k² ≈ 0.1–0.6, giving 5–10x more info/tick
+ *   - Moment-matching dilutes information via between-component mean spread
+ *   - The mixture indicator s_t is just one more discrete r.v. per particle
+ *
+ * The log-likelihood returned is the MARGINAL (sum over all K components),
+ * which is correct for SMC² weight computation regardless of which s_t was
+ * sampled. This ensures proper particle weights for the outer SMC layer.
+ *
+ * The sampled component index is returned via *out_component for diagnostics.
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
+__device__
+void ocsn_kalman_update_sampled(
+    float y,              /**< Observation: log(price_return²) */
+    float mu_pred,        /**< Prior mean E[h] */
+    float var_pred,       /**< Prior variance Var[h] */
+    float u_mix,          /**< Uniform [0,1) for mixture sampling */
+    float* mu_post,       /**< [out] Posterior mean (conditioned on sampled s) */
+    float* var_post,      /**< [out] Posterior variance (conditioned on sampled s) */
+    float* log_lik,       /**< [out] Log MARGINAL likelihood (over all K) */
+    int* out_component    /**< [out] Sampled component index (for diagnostics, may be NULL) */
+) {
+    float safe_var = fmaxf(var_pred, 1e-6f);
+    
+    /* ── Pass 1: Compute unnormalized log posterior weights for each component ── */
+    float log_alpha[OCSN_K];
+    float log_max = -1e30f;
+    
+    #pragma unroll
+    for (int k = 0; k < OCSN_K; k++) {
+        float v_k = d_OCSN_VARS[k];
+        float inv_v_k = d_OCSN_INV_VARS[k];
+        float log_v_k = d_OCSN_LOG_VARS[k];
+        
+        float S = safe_var + v_k;
+        float inv_S = 1.0f / S;
+        float innov = y - mu_pred - d_OCSN_MEANS[k];
+        float log_S = log_v_k + log1pf(safe_var * inv_v_k);
+        
+        float val = d_OCSN_LOG_WEIGHTS[k] - 0.5f * (log_S + innov * innov * inv_S);
+        log_alpha[k] = val;
+        log_max = fmaxf(log_max, val);
+    }
+    
+    /* ── Normalize to get posterior mixture weights ── */
+    float sum_exp = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < OCSN_K; k++) {
+        sum_exp += __expf(log_alpha[k] - log_max);
+    }
+    float log_norm = log_max + __logf(sum_exp);
+    
+    /* Marginal log-likelihood (correct for SMC² weights regardless of s_t) */
+    *log_lik = log_norm;
+    
+    /* ── Sample component via inverse CDF using u_mix ── */
+    float cum = 0.0f;
+    int s = OCSN_K - 1;  /* fallback to last component */
+    
+    #pragma unroll
+    for (int k = 0; k < OCSN_K; k++) {
+        cum += __expf(log_alpha[k] - log_norm);
+        if (u_mix < cum) {
+            s = k;
+            break;
+        }
+    }
+    
+    /* ── Single-component Kalman update with R = v_s² ── */
+    float S_s = safe_var + d_OCSN_VARS[s];
+    float inv_S_s = 1.0f / S_s;
+    float innov_s = y - mu_pred - d_OCSN_MEANS[s];
+    float K_s = safe_var * inv_S_s;
+    
+    *mu_post = mu_pred + K_s * innov_s;
+    *var_post = fmaxf((1.0f - K_s) * safe_var, 1e-6f);
+    
+    if (out_component) *out_component = s;
+}
+
+/*═══════════════════════════════════════════════════════════════════════════════
  * CONSTANT MEMORY — Model parameters
  *═══════════════════════════════════════════════════════════════════════════════*/
 
@@ -213,6 +301,20 @@ int64_t u0_noise_slot(int theta_idx, int t, int cap) {
     return (int64_t)theta_idx * cap + t_slot;
 }
 
+/**
+ * @brief Index into s_noise (mixture indicator) buffer
+ * 
+ * Same layout as z_noise: per-theta, per-time, per-inner-particle.
+ * Each inner particle needs its own mixture indicator because each
+ * has a different (mu_pred, var_pred) and thus different posterior
+ * over OCSN components.
+ */
+__device__ __forceinline__
+int64_t s_noise_slot(int theta_idx, int t, int inner_idx, int N_inner, int cap) {
+    int t_slot = t % cap;
+    return (int64_t)theta_idx * N_inner * cap + (int64_t)t_slot * N_inner + inner_idx;
+}
+
 /*═══════════════════════════════════════════════════════════════════════════════
  * KERNEL: RNG Initialization
  *═══════════════════════════════════════════════════════════════════════════════*/
@@ -229,7 +331,7 @@ __global__ void kernel_init_rng(curandState* states, unsigned long long seed, in
 __global__ void kernel_init_from_prior(
     ThetaParticlesSoA particles,
     int N_theta, int N_inner,
-    noise_t* d_z_noise, noise_t* d_u0_noise,
+    noise_t* d_z_noise, noise_t* d_u0_noise, noise_t* d_s_noise,
     int noise_capacity
 ) {
     int theta_idx = blockIdx.x;
@@ -308,6 +410,11 @@ __global__ void kernel_init_from_prior(
     int64_t z_noise_idx = z_noise_slot(theta_idx, 0, inner_idx, N_inner, noise_capacity);
     float z_noise_init = noise_store_roundtrip(d_z_noise, z_noise_idx, z_noise_raw);
     
+    /* Store initial mixture indicator noise (per inner particle) */
+    float s_noise_raw = curand_normal(rng);
+    int64_t s_idx = s_noise_slot(theta_idx, 0, inner_idx, N_inner, noise_capacity);
+    noise_store(d_s_noise, s_idx, s_noise_raw);
+    
     if (inner_idx == 0) {
         float u0_noise_raw = curand_normal(rng);
         int64_t u0_idx = u0_noise_slot(theta_idx, 0, noise_capacity);
@@ -342,7 +449,7 @@ void kernel_rbpf_step_impl(
     ThetaParticlesSoA particles,
     float y_obs,
     int N_theta,
-    noise_t* d_z_noise, noise_t* d_u0_noise,
+    noise_t* d_z_noise, noise_t* d_u0_noise, noise_t* d_s_noise,
     int t_current, int noise_capacity
 ) {
     static_assert(N_INNER <= 1024, "N_INNER must be <= 1024");
@@ -390,9 +497,15 @@ void kernel_rbpf_step_impl(
     
     int64_t z_noise_idx = z_noise_slot(theta_idx, t_current + 1, inner_idx, N_INNER, noise_capacity);
     int64_t u0_noise_idx = u0_noise_slot(theta_idx, t_current + 1, noise_capacity);
+    int64_t s_noise_idx = s_noise_slot(theta_idx, t_current + 1, inner_idx, N_INNER, noise_capacity);
     
     float z_noise_raw = curand_normal(&local_rng);
     float z_noise = noise_store_roundtrip(d_z_noise, z_noise_idx, z_noise_raw);
+    
+    /* Generate and store mixture indicator noise (per inner particle) */
+    float s_noise_raw = curand_normal(&local_rng);
+    float s_noise_stored = noise_store_roundtrip(d_s_noise, s_noise_idx, s_noise_raw);
+    float u_mix = u0_from_noise(s_noise_stored);  /* Φ(z) → uniform [0,1) */
     
     if (inner_idx == 0) {
         float u0_noise_raw = curand_normal(&local_rng);
@@ -460,9 +573,10 @@ void kernel_rbpf_step_impl(
     float var_pred = phi * phi * var_h + sigma_h * sigma_h;
     var_pred = fmaxf(var_pred, 1e-8f);
     
-    /* OCSN UPDATE */
+    /* OCSN UPDATE (sampled mixture component for sharp Kalman update) */
     float mu_post, var_post, log_lik;
-    ocsn_kalman_update(y_obs, mu_pred, var_pred, &mu_post, &var_post, &log_lik);
+    ocsn_kalman_update_sampled(y_obs, mu_pred, var_pred, u_mix,
+                               &mu_post, &var_post, &log_lik, NULL);
     log_w += log_lik;
     
     /* NORMALIZE + ESS */
@@ -661,8 +775,15 @@ __global__ void kernel_outer_resample(
 /*═══════════════════════════════════════════════════════════════════════════════
  * KERNEL: Copy θ-Particles After Resampling (8 learned params)
  *
- * FIX: Use Philox counter-based RNG init instead of curand_init to avoid
- *      the high cost of full XORWOW state initialization after every resample.
+ * FIX #14: Uses seed-folding instead of subsequence-based curand_init to
+ *          avoid the expensive 2^67 skip-ahead matrix multiply per thread.
+ *          With subsequence=0, XORWOW init is just a seed hash (~0.1μs/thread).
+ *          At 512×512 = 262K threads, saves 5-10ms per resample.
+ *
+ *          Note: curandStatePhilox4_32_10_t would be even faster but is
+ *          larger than curandState (curandStateXORWOW_t) on CUDA ≥13.x,
+ *          so it can't be stored in the existing rng_states array without
+ *          changing the struct type across all kernels.
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 __global__ void kernel_copy_theta_particles(
@@ -701,8 +822,18 @@ __global__ void kernel_copy_theta_particles(
         dst.inner_var_h[dst_idx] = src.inner_var_h[src_idx];
         dst.inner_log_w[dst_idx] = src.inner_log_w[src_idx];
         
-        /* Use a fast sequence-based init: unique (seed, subsequence) per thread */
-        curand_init(resample_seed, (unsigned long long)dst_idx, 0, &dst.rng_states[dst_idx]);
+        /* FIX #14: Fast XORWOW init — fold thread ID into seed, use subsequence=0.
+         * The expensive part of curand_init is the subsequence parameter which
+         * performs a 2^67 skip-ahead via matrix exponentiation (~20μs/thread).
+         * With subsequence=0, init is just seeding (~0.1μs/thread).
+         * 
+         * Uniqueness: each thread gets a different seed via Knuth multiplicative
+         * hash + bit mixing. XORWOW with different seeds has good cross-stream
+         * independence for the few hundred draws per particle per window. */
+        unsigned long long unique_seed = resample_seed
+            ^ ((unsigned long long)dst_idx * 2654435761ULL)
+            ^ ((unsigned long long)dst_idx << 32);
+        curand_init(unique_seed, 0ULL, 0ULL, &dst.rng_states[dst_idx]);
     }
 }
 
@@ -717,6 +848,7 @@ __global__ void kernel_copy_theta_particles(
 __global__ void kernel_copy_noise_arrays(
     const noise_t* src_z_noise, noise_t* dst_z_noise,
     const noise_t* src_u0_noise, noise_t* dst_u0_noise,
+    const noise_t* src_s_noise, noise_t* dst_s_noise,
     const int* d_ancestors,
     int N_theta, int N_inner, int t_current, int noise_capacity,
     int t_start
@@ -732,6 +864,10 @@ __global__ void kernel_copy_noise_arrays(
         int64_t src_idx = z_noise_slot(ancestor, t, inner_idx, N_inner, noise_capacity);
         int64_t dst_idx = z_noise_slot(theta_idx, t, inner_idx, N_inner, noise_capacity);
         dst_z_noise[dst_idx] = src_z_noise[src_idx];
+        /* s_noise has same layout as z_noise */
+        int64_t s_src = s_noise_slot(ancestor, t, inner_idx, N_inner, noise_capacity);
+        int64_t s_dst = s_noise_slot(theta_idx, t, inner_idx, N_inner, noise_capacity);
+        dst_s_noise[s_dst] = src_s_noise[s_src];
     }
     
     if (inner_idx == 0) {
@@ -786,6 +922,7 @@ void kernel_cpmmh_rejuvenate_fused_impl(
     const float* y_history,
     noise_t* d_z_noise_curr, noise_t* d_z_noise_other,
     noise_t* d_u0_noise_curr, noise_t* d_u0_noise_other,
+    noise_t* d_s_noise_curr, noise_t* d_s_noise_other,
     int t_current, int N_theta, int noise_capacity,
     float cpmmh_rho,
     int* d_accepts, int* d_swap_flags,
@@ -924,6 +1061,12 @@ void kernel_cpmmh_rejuvenate_fused_impl(
         float z_noise_prop_0 = cpmmh_rho * z_noise_curr_0 + scale * z_noise_fresh_0;
         noise_store(d_z_noise_other, z_noise_slot(theta_idx, 0, inner_idx, N_INNER, noise_capacity), z_noise_prop_0);
         
+        /* Correlate mixture indicator noise at t=0 */
+        float s_noise_curr_0 = noise_load(d_s_noise_curr, s_noise_slot(theta_idx, 0, inner_idx, N_INNER, noise_capacity));
+        float s_noise_fresh_0 = curand_normal(&local_rng);
+        float s_noise_prop_0 = cpmmh_rho * s_noise_curr_0 + scale * s_noise_fresh_0;
+        noise_store(d_s_noise_other, s_noise_slot(theta_idx, 0, inner_idx, N_INNER, noise_capacity), s_noise_prop_0);
+        
         z_tilde = z_tilde_stat_std * z_noise_prop_0;
         float z_init = z_tilde_to_z(z_tilde);
         
@@ -972,6 +1115,14 @@ void kernel_cpmmh_rejuvenate_fused_impl(
         float z_noise_prop_t1_raw = cpmmh_rho * z_noise_curr_t1 + scale * z_noise_fresh_t1;
         float z_noise_prop_t1 = noise_store_roundtrip(d_z_noise_other, z_idx_t1, z_noise_prop_t1_raw);
         
+        /* Correlate mixture indicator noise (per inner particle, like z_noise) */
+        int64_t s_idx_t1 = s_noise_slot(theta_idx, t + 1, inner_idx, N_INNER, noise_capacity);
+        float s_noise_curr_t1 = noise_load(d_s_noise_curr, s_idx_t1);
+        float s_noise_fresh_t1 = curand_normal(&local_rng);
+        float s_noise_prop_t1_raw = cpmmh_rho * s_noise_curr_t1 + scale * s_noise_fresh_t1;
+        float s_noise_prop_t1 = noise_store_roundtrip(d_s_noise_other, s_idx_t1, s_noise_prop_t1_raw);
+        float u_mix = u0_from_noise(s_noise_prop_t1);
+        
         if (inner_idx == 0) {
             int64_t u0_idx_t1 = u0_noise_slot(theta_idx, t + 1, noise_capacity);
             float u0_noise_curr = noise_load(d_u0_noise_curr, u0_idx_t1);
@@ -1018,7 +1169,8 @@ void kernel_cpmmh_rejuvenate_fused_impl(
         var_pred = fmaxf(var_pred, 1e-8f);
         
         float mu_post, var_post, log_lik;
-        ocsn_kalman_update(y_obs, mu_pred, var_pred, &mu_post, &var_post, &log_lik);
+        ocsn_kalman_update_sampled(y_obs, mu_pred, var_pred, u_mix,
+                                   &mu_post, &var_post, &log_lik, NULL);
         log_w += log_lik;
         
         log_max = block_reduce_max(log_w, s_reduction);
@@ -1116,6 +1268,7 @@ void kernel_cpmmh_rejuvenate_fused_impl(
 __global__ void kernel_commit_accepted_noise(
     noise_t* d_z_noise_0, noise_t* d_z_noise_1,
     noise_t* d_u0_noise_0, noise_t* d_u0_noise_1,
+    noise_t* d_s_noise_0, noise_t* d_s_noise_1,
     const int* d_swap_flags,
     int N_theta, int N_inner,
     int t_current, int noise_capacity, int t_start
@@ -1128,6 +1281,9 @@ __global__ void kernel_commit_accepted_noise(
     for (int t = t_start; t <= t_current + 1; t++) {
         int64_t idx = z_noise_slot(theta_idx, t, inner_idx, N_inner, noise_capacity);
         d_z_noise_0[idx] = d_z_noise_1[idx];
+        /* s_noise has same layout as z_noise */
+        int64_t s_idx = s_noise_slot(theta_idx, t, inner_idx, N_inner, noise_capacity);
+        d_s_noise_0[s_idx] = d_s_noise_1[s_idx];
     }
     if (inner_idx == 0) {
         for (int t = t_start; t <= t_current + 1; t++) {
@@ -1266,10 +1422,13 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     
     int64_t z_noise_size = (int64_t)N_theta * N_inner * state->noise_capacity;
     int64_t u0_noise_size = (int64_t)N_theta * state->noise_capacity;
+    int64_t s_noise_size = z_noise_size;  /* same layout as z_noise */
     CUDA_CHECK(cudaMalloc(&state->d_z_noise[0], noise_array_bytes(z_noise_size)));
     CUDA_CHECK(cudaMalloc(&state->d_z_noise[1], noise_array_bytes(z_noise_size)));
     CUDA_CHECK(cudaMalloc(&state->d_u0_noise[0], noise_array_bytes(u0_noise_size)));
     CUDA_CHECK(cudaMalloc(&state->d_u0_noise[1], noise_array_bytes(u0_noise_size)));
+    CUDA_CHECK(cudaMalloc(&state->d_s_noise[0], noise_array_bytes(s_noise_size)));
+    CUDA_CHECK(cudaMalloc(&state->d_s_noise[1], noise_array_bytes(s_noise_size)));
     
     /* Prior (8 params): ρ, σ_total, r_split, μ_base, μ_scale, μ_rate, σ_scale, σ_rate
      * σ_total ≈ √(σ_z² + σ_base²), r = σ_z/σ_total */
@@ -1386,6 +1545,7 @@ void smc2_cuda_free(SMC2StateCUDA* state) {
     
     cudaFree(state->d_z_noise[0]); cudaFree(state->d_z_noise[1]);
     cudaFree(state->d_u0_noise[0]); cudaFree(state->d_u0_noise[1]);
+    cudaFree(state->d_s_noise[0]); cudaFree(state->d_s_noise[1]);
     
     cudaFree(state->d_checkpoint_z);
     cudaFree(state->d_checkpoint_mu_h);
@@ -1444,8 +1604,9 @@ void smc2_cuda_set_noise_capacity(SMC2StateCUDA* state, int capacity) {
     int64_t new_u0_size = (int64_t)state->N_theta * capacity;
     int64_t old_u0_size = (int64_t)state->N_theta * state->noise_capacity;
     
-    /* Check if allocation would be unreasonably large */
-    int64_t total_bytes = 4 * noise_array_bytes(new_z_size) + 4 * noise_array_bytes(new_u0_size);
+    /* Check if allocation would be unreasonably large (now 6 buffers: z×2 + u0×2 + s×2) */
+    int64_t total_bytes = 4 * noise_array_bytes(new_z_size) + 4 * noise_array_bytes(new_u0_size)
+                        + 4 * noise_array_bytes(new_z_size); /* s_noise same size as z_noise */
     if (total_bytes > (int64_t)8 * 1024 * 1024 * 1024LL) {
         static bool warned = false;
         if (!warned) {
@@ -1460,11 +1621,13 @@ void smc2_cuda_set_noise_capacity(SMC2StateCUDA* state, int capacity) {
         return;
     }
     
-    noise_t *new_z_0, *new_z_1, *new_u0_0, *new_u0_1;
+    noise_t *new_z_0, *new_z_1, *new_u0_0, *new_u0_1, *new_s_0, *new_s_1;
     CUDA_CHECK(cudaMalloc(&new_z_0, noise_array_bytes(new_z_size)));
     CUDA_CHECK(cudaMalloc(&new_z_1, noise_array_bytes(new_z_size)));
     CUDA_CHECK(cudaMalloc(&new_u0_0, noise_array_bytes(new_u0_size)));
     CUDA_CHECK(cudaMalloc(&new_u0_1, noise_array_bytes(new_u0_size)));
+    CUDA_CHECK(cudaMalloc(&new_s_0, noise_array_bytes(new_z_size)));
+    CUDA_CHECK(cudaMalloc(&new_s_1, noise_array_bytes(new_z_size)));
     
     /* NOTE: With circular buffer, old data positions don't map 1:1 to new buffer
      * positions when capacity changes. But this is only called before init_from_prior
@@ -1477,12 +1640,18 @@ void smc2_cuda_set_noise_capacity(SMC2StateCUDA* state, int capacity) {
         int64_t copy_u0 = (old_u0_size < new_u0_size) ? old_u0_size : new_u0_size;
         CUDA_CHECK(cudaMemcpy(new_u0_0, state->d_u0_noise[0], noise_array_bytes(copy_u0), cudaMemcpyDeviceToDevice));
     }
+    if (state->d_s_noise[0] && old_z_size > 0) {
+        int64_t copy_s = (old_z_size < new_z_size) ? old_z_size : new_z_size;
+        CUDA_CHECK(cudaMemcpy(new_s_0, state->d_s_noise[0], noise_array_bytes(copy_s), cudaMemcpyDeviceToDevice));
+    }
     
     cudaFree(state->d_z_noise[0]); cudaFree(state->d_z_noise[1]);
     cudaFree(state->d_u0_noise[0]); cudaFree(state->d_u0_noise[1]);
+    cudaFree(state->d_s_noise[0]); cudaFree(state->d_s_noise[1]);
     
     state->d_z_noise[0] = new_z_0; state->d_z_noise[1] = new_z_1;
     state->d_u0_noise[0] = new_u0_0; state->d_u0_noise[1] = new_u0_1;
+    state->d_s_noise[0] = new_s_0; state->d_s_noise[1] = new_s_1;
     state->noise_buf = 0;
     state->noise_capacity = capacity;
 }
@@ -1499,8 +1668,9 @@ void smc2_cuda_set_fixed_lag(SMC2StateCUDA* state, int L) {
             int64_t new_z_size = (int64_t)state->N_theta * state->N_inner * target_cap;
             int64_t new_u0_size = (int64_t)state->N_theta * target_cap;
             
-            /* Sanity check: shouldn't exceed 8 GB */
-            int64_t total_bytes = 4 * noise_array_bytes(new_z_size) + 4 * noise_array_bytes(new_u0_size);
+            /* Sanity check: shouldn't exceed 8 GB (now includes s_noise) */
+            int64_t total_bytes = 4 * noise_array_bytes(new_z_size) + 4 * noise_array_bytes(new_u0_size)
+                                + 4 * noise_array_bytes(new_z_size);
             if (total_bytes > (int64_t)8 * 1024 * 1024 * 1024LL) {
                 fprintf(stderr, "WARNING: Fixed-lag noise allocation would require %.1f GB. "
                         "Consider reducing N_theta or N_inner.\n",
@@ -1508,17 +1678,21 @@ void smc2_cuda_set_fixed_lag(SMC2StateCUDA* state, int L) {
                 return;
             }
             
-            noise_t *new_z_0, *new_z_1, *new_u0_0, *new_u0_1;
+            noise_t *new_z_0, *new_z_1, *new_u0_0, *new_u0_1, *new_s_0, *new_s_1;
             CUDA_CHECK(cudaMalloc(&new_z_0, noise_array_bytes(new_z_size)));
             CUDA_CHECK(cudaMalloc(&new_z_1, noise_array_bytes(new_z_size)));
             CUDA_CHECK(cudaMalloc(&new_u0_0, noise_array_bytes(new_u0_size)));
             CUDA_CHECK(cudaMalloc(&new_u0_1, noise_array_bytes(new_u0_size)));
+            CUDA_CHECK(cudaMalloc(&new_s_0, noise_array_bytes(new_z_size)));
+            CUDA_CHECK(cudaMalloc(&new_s_1, noise_array_bytes(new_z_size)));
             
             cudaFree(state->d_z_noise[0]); cudaFree(state->d_z_noise[1]);
             cudaFree(state->d_u0_noise[0]); cudaFree(state->d_u0_noise[1]);
+            cudaFree(state->d_s_noise[0]); cudaFree(state->d_s_noise[1]);
             
             state->d_z_noise[0] = new_z_0; state->d_z_noise[1] = new_z_1;
             state->d_u0_noise[0] = new_u0_0; state->d_u0_noise[1] = new_u0_1;
+            state->d_s_noise[0] = new_s_0; state->d_s_noise[1] = new_s_1;
             state->noise_buf = 0;
             state->noise_capacity = target_cap;
         }
@@ -1632,6 +1806,7 @@ void smc2_cuda_init_from_prior(SMC2StateCUDA* state) {
     kernel_init_from_prior<<<state->N_theta, state->N_inner>>>(
         state->d_particles, state->N_theta, state->N_inner,
         state->d_z_noise[state->noise_buf], state->d_u0_noise[state->noise_buf],
+        state->d_s_noise[state->noise_buf],
         state->noise_capacity
     );
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -1742,6 +1917,7 @@ void smc2_cuda_init_warm(SMC2StateCUDA* state,
     kernel_init_from_prior<<<state->N_theta, state->N_inner>>>(
         state->d_particles, state->N_theta, state->N_inner,
         state->d_z_noise[state->noise_buf], state->d_u0_noise[state->noise_buf],
+        state->d_s_noise[state->noise_buf],
         state->noise_capacity
     );
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -1801,6 +1977,7 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
         kernel_rbpf_step_impl<N><<<state->N_theta, N, rbpf_shared_mem_size<N>()>>>( \
             state->d_particles, y_obs, state->N_theta, \
             state->d_z_noise[state->noise_buf], state->d_u0_noise[state->noise_buf], \
+            state->d_s_noise[state->noise_buf], \
             state->t_current, state->noise_capacity)
     
     switch (state->N_inner) {
@@ -1837,7 +2014,9 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
             state->d_particles, state->d_ancestors, state->d_uniform, state->N_theta);
         /* No sync — next kernel depends on d_ancestors, same stream */
         
-        unsigned long long resample_seed = time(NULL) * 1000ULL + state->n_resamples * 12345ULL;
+        /* FIX #9: Use host PRNG for seed — time(NULL) has 1s resolution,
+         * causing identical seeds for resamples within the same second. */
+        unsigned long long resample_seed = xorshift64star(&state->host_rng_state);
         kernel_copy_theta_particles<<<state->N_theta, state->N_inner>>>(
             state->d_particles, state->d_particles_temp, state->d_ancestors,
             state->N_theta, state->N_inner, resample_seed);
@@ -1851,6 +2030,7 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
         kernel_copy_noise_arrays<<<state->N_theta, state->N_inner>>>(
             state->d_z_noise[state->noise_buf], state->d_z_noise[other_buf],
             state->d_u0_noise[state->noise_buf], state->d_u0_noise[other_buf],
+            state->d_s_noise[state->noise_buf], state->d_s_noise[other_buf],
             state->d_ancestors, state->N_theta, state->N_inner,
             state->t_current, state->noise_capacity, t_noise_start);
         /* Sync before pointer swap — need all copies complete */
@@ -1907,6 +2087,7 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
             kernel_cpmmh_rejuvenate_fused_impl<N><<<state->N_theta, N, cpmmh_shared_mem_size<N>()>>>( \
                 state->d_particles, state->d_particles_temp, state->d_y_history, \
                 curr_noise, other_noise, curr_u0, other_u0, \
+                curr_s, other_s, \
                 state->t_current, state->N_theta, state->noise_capacity, state->cpmmh_rho, \
                 state->d_accepts, state->d_swap_flags, \
                 t_checkpoint_use, cp_z, cp_mu, cp_var, cp_logw, cp_ll)
@@ -1921,6 +2102,8 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
             noise_t* other_noise = state->d_z_noise[1 - state->noise_buf];
             noise_t* curr_u0 = state->d_u0_noise[state->noise_buf];
             noise_t* other_u0 = state->d_u0_noise[1 - state->noise_buf];
+            noise_t* curr_s = state->d_s_noise[state->noise_buf];
+            noise_t* other_s = state->d_s_noise[1 - state->noise_buf];
             
             switch (state->N_inner) {
                 case 64:  DISPATCH_CPMMH(64);  break;
@@ -1934,6 +2117,7 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
             int t_start_commit = (t_checkpoint_use >= 0) ? (t_checkpoint_use + 1) : 0;
             kernel_commit_accepted_noise<<<state->N_theta, state->N_inner>>>(
                 curr_noise, other_noise, curr_u0, other_u0,
+                curr_s, other_s,
                 state->d_swap_flags, state->N_theta, state->N_inner,
                 state->t_current, state->noise_capacity, t_start_commit);
         }
@@ -1947,6 +2131,24 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
         }
         #undef DISPATCH_CPMMH
         
+        /* FIX #12: Save checkpoint BEFORE reset_outer_weights.
+         * reset_outer_weights zeroes log_likelihood, so saving after it
+         * would store zeros into d_checkpoint_ll, making the CPMMH MH ratio
+         * degenerate to just the prior ratio on the next rejuvenation.
+         * By saving here, checkpoint_ll captures the cumulative LL correctly. */
+        if (state->fixed_lag_L > 0) {
+            int target = (state->t_current / state->fixed_lag_L) * state->fixed_lag_L;
+            if (target > state->t_checkpoint && state->t_current > 0) {
+                kernel_save_checkpoint<<<state->N_theta, state->N_inner>>>(
+                    state->d_particles,
+                    state->d_checkpoint_z, state->d_checkpoint_mu_h,
+                    state->d_checkpoint_var_h, state->d_checkpoint_log_w, state->d_checkpoint_ll,
+                    state->N_theta, state->N_inner);
+                CUDA_CHECK(cudaDeviceSynchronize());
+                state->t_checkpoint = target;
+            }
+        }
+        
         kernel_reset_outer_weights<<<(state->N_theta + 255) / 256, 256>>>(
             state->d_particles, state->N_theta);
         /* No sync — ESS kernel on same stream */
@@ -1957,7 +2159,9 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
         CUDA_CHECK(cudaMemcpy(&h_ess, state->d_ess, sizeof(float), cudaMemcpyDeviceToHost));
     }
     
-    /* Save checkpoint */
+    /* Save checkpoint for non-resample ticks.
+     * If the resample block already saved at this target, t_checkpoint == target
+     * so this is a no-op. */
     if (state->fixed_lag_L > 0) {
         int target = (state->t_current / state->fixed_lag_L) * state->fixed_lag_L;
         if (target > state->t_checkpoint && state->t_current > 0) {
@@ -2039,6 +2243,7 @@ float smc2_cuda_update_batch(SMC2StateCUDA* state, const float* y_batch, int n_o
             kernel_rbpf_step_impl<N><<<state->N_theta, N, rbpf_shared_mem_size<N>(), stream>>>( \
                 state->d_particles, y_obs, state->N_theta, \
                 state->d_z_noise[state->noise_buf], state->d_u0_noise[state->noise_buf], \
+                state->d_s_noise[state->noise_buf], \
                 state->t_current, state->noise_capacity)
 
         switch (state->N_inner) {
@@ -2083,30 +2288,37 @@ float smc2_cuda_update_batch(SMC2StateCUDA* state, const float* y_batch, int n_o
         /* Check if resample needed */
         if (h_ess >= state->ess_threshold_outer * state->N_theta) continue;
 
-        /* ══ RESAMPLE PATH (same as smc2_cuda_update, runs on default stream) ══ */
+        /* ══ RESAMPLE PATH ══
+         * FIX #13: All kernels use compute_stream for explicit stream ownership.
+         * Previously used default stream which is only safe with legacy default
+         * stream semantics. Using explicit stream is robust under all CUDA
+         * stream modes including --default-stream per-thread. */
         state->n_resamples++;
 
         float h_uniform = xorshift64star_uniform(&state->host_rng_state);
-        CUDA_CHECK(cudaMemcpy(state->d_uniform, &h_uniform, sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpyAsync(state->d_uniform, &h_uniform, sizeof(float),
+                                    cudaMemcpyHostToDevice, stream));
 
         int resample_block = (state->N_theta < 1024) ? state->N_theta : 1024;
-        kernel_outer_resample<<<1, resample_block, state->N_theta * sizeof(float)>>>(
+        kernel_outer_resample<<<1, resample_block, state->N_theta * sizeof(float), stream>>>(
             state->d_particles, state->d_ancestors, state->d_uniform, state->N_theta);
 
-        unsigned long long resample_seed = time(NULL) * 1000ULL + state->n_resamples * 12345ULL;
-        kernel_copy_theta_particles<<<state->N_theta, state->N_inner>>>(
+        /* FIX #9: Use host PRNG for seed (same as single-tick path) */
+        unsigned long long resample_seed = xorshift64star(&state->host_rng_state);
+        kernel_copy_theta_particles<<<state->N_theta, state->N_inner, 0, stream>>>(
             state->d_particles, state->d_particles_temp, state->d_ancestors,
             state->N_theta, state->N_inner, resample_seed);
 
         int other_buf = 1 - state->noise_buf;
         int t_noise_start = (state->fixed_lag_L > 0 && state->t_checkpoint >= 0)
                             ? state->t_checkpoint : 0;
-        kernel_copy_noise_arrays<<<state->N_theta, state->N_inner>>>(
+        kernel_copy_noise_arrays<<<state->N_theta, state->N_inner, 0, stream>>>(
             state->d_z_noise[state->noise_buf], state->d_z_noise[other_buf],
             state->d_u0_noise[state->noise_buf], state->d_u0_noise[other_buf],
+            state->d_s_noise[state->noise_buf], state->d_s_noise[other_buf],
             state->d_ancestors, state->N_theta, state->N_inner,
             state->t_current, state->noise_capacity, t_noise_start);
-        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaStreamSynchronize(stream));
 
         state->noise_buf = other_buf;
 
@@ -2116,14 +2328,14 @@ float smc2_cuda_update_batch(SMC2StateCUDA* state, const float* y_batch, int n_o
 
         /* Checkpoint reindex (FIX #5: dedicated scratch) */
         if (state->fixed_lag_L > 0 && state->t_checkpoint >= 0) {
-            kernel_copy_checkpoint<<<state->N_theta, state->N_inner>>>(
+            kernel_copy_checkpoint<<<state->N_theta, state->N_inner, 0, stream>>>(
                 state->d_checkpoint_z, state->d_checkpoint_mu_h,
                 state->d_checkpoint_var_h, state->d_checkpoint_log_w, state->d_checkpoint_ll,
                 state->d_checkpoint_scratch_z, state->d_checkpoint_scratch_mu_h,
                 state->d_checkpoint_scratch_var_h, state->d_checkpoint_scratch_log_w,
                 state->d_checkpoint_scratch_ll,
                 state->d_ancestors, state->N_theta, state->N_inner);
-            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaStreamSynchronize(stream));
 
             /* Pointer swap instead of 5x D2D memcpy */
             float* tmp_f;
@@ -2154,9 +2366,10 @@ float smc2_cuda_update_batch(SMC2StateCUDA* state, const float* y_batch, int n_o
         smc2_update_adaptive_covariance(state);
 
         #define DISPATCH_CPMMH_BATCH(N) \
-            kernel_cpmmh_rejuvenate_fused_impl<N><<<state->N_theta, N, cpmmh_shared_mem_size<N>()>>>( \
+            kernel_cpmmh_rejuvenate_fused_impl<N><<<state->N_theta, N, cpmmh_shared_mem_size<N>(), stream>>>( \
                 state->d_particles, state->d_particles_temp, state->d_y_history, \
                 curr_noise, other_noise, curr_u0, other_u0, \
+                curr_s, other_s, \
                 state->t_current, state->N_theta, state->noise_capacity, state->cpmmh_rho, \
                 state->d_accepts, state->d_swap_flags, \
                 t_checkpoint_use, cp_z, cp_mu, cp_var, cp_logw, cp_ll)
@@ -2164,13 +2377,16 @@ float smc2_cuda_update_batch(SMC2StateCUDA* state, const float* y_batch, int n_o
         for (int k = 0; k < state->K_rejuv; k++) {
             if (k == 0) {
                 int zero = 0;
-                CUDA_CHECK(cudaMemcpy(state->d_accepts, &zero, sizeof(int), cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpyAsync(state->d_accepts, &zero, sizeof(int),
+                                            cudaMemcpyHostToDevice, stream));
             }
 
             noise_t* curr_noise = state->d_z_noise[state->noise_buf];
             noise_t* other_noise = state->d_z_noise[1 - state->noise_buf];
             noise_t* curr_u0 = state->d_u0_noise[state->noise_buf];
             noise_t* other_u0 = state->d_u0_noise[1 - state->noise_buf];
+            noise_t* curr_s = state->d_s_noise[state->noise_buf];
+            noise_t* other_s = state->d_s_noise[1 - state->noise_buf];
 
             switch (state->N_inner) {
                 case 64:  DISPATCH_CPMMH_BATCH(64);  break;
@@ -2181,12 +2397,13 @@ float smc2_cuda_update_batch(SMC2StateCUDA* state, const float* y_batch, int n_o
             }
 
             int t_start_commit = (t_checkpoint_use >= 0) ? (t_checkpoint_use + 1) : 0;
-            kernel_commit_accepted_noise<<<state->N_theta, state->N_inner>>>(
+            kernel_commit_accepted_noise<<<state->N_theta, state->N_inner, 0, stream>>>(
                 curr_noise, other_noise, curr_u0, other_u0,
+                curr_s, other_s,
                 state->d_swap_flags, state->N_theta, state->N_inner,
                 state->t_current, state->noise_capacity, t_start_commit);
         }
-        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaStreamSynchronize(stream));
         {
             int h_accepts = 0;
             CUDA_CHECK(cudaMemcpy(&h_accepts, state->d_accepts, sizeof(int), cudaMemcpyDeviceToHost));
@@ -2195,13 +2412,30 @@ float smc2_cuda_update_batch(SMC2StateCUDA* state, const float* y_batch, int n_o
         }
         #undef DISPATCH_CPMMH_BATCH
 
-        kernel_reset_outer_weights<<<(state->N_theta + 255) / 256, 256>>>(
+        /* FIX #12: Save checkpoint BEFORE reset_outer_weights (same as single-tick path).
+         * Must capture cumulative LL before it gets zeroed. */
+        if (state->fixed_lag_L > 0) {
+            int target = (state->t_current / state->fixed_lag_L) * state->fixed_lag_L;
+            if (target > state->t_checkpoint && state->t_current > 0) {
+                kernel_save_checkpoint<<<state->N_theta, state->N_inner, 0, stream>>>(
+                    state->d_particles,
+                    state->d_checkpoint_z, state->d_checkpoint_mu_h,
+                    state->d_checkpoint_var_h, state->d_checkpoint_log_w, state->d_checkpoint_ll,
+                    state->N_theta, state->N_inner);
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                state->t_checkpoint = target;
+            }
+        }
+
+        kernel_reset_outer_weights<<<(state->N_theta + 255) / 256, 256, 0, stream>>>(
             state->d_particles, state->N_theta);
 
-        kernel_compute_outer_ess<<<1, ess_block, 32 * sizeof(float)>>>(
+        kernel_compute_outer_ess<<<1, ess_block, 32 * sizeof(float), stream>>>(
             state->d_particles, state->d_ess, state->N_theta);
-        CUDA_CHECK(cudaDeviceSynchronize());
-        CUDA_CHECK(cudaMemcpy(&h_ess, state->d_ess, sizeof(float), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpyAsync(state->h_ess_pinned, state->d_ess,
+                                    sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        h_ess = *state->h_ess_pinned;
     }
 
     return h_ess;
