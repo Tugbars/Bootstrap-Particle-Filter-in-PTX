@@ -285,15 +285,15 @@ static RunResult run_pipeline(
     SMC2StateCUDA* smc2 = smc2_cuda_alloc(n_theta, n_inner);
 
     /* Set priors centered on true values but with uncertainty */
-    SVPrior prior;
-    prior.rho_mean         = dgp.rho;            prior.rho_std         = 0.05f;
-    prior.sigma_total_mean = dgp.sigma_z * 1.5f; prior.sigma_total_std = 0.1f;
-    prior.r_split_mean     = 0.5f;               prior.r_split_std     = 0.2f;
-    prior.mu_base_mean     = dgp.mu_floor;        prior.mu_base_std     = 1.0f;
-    prior.mu_scale_mean    = dgp.mu_ceiling - dgp.mu_floor;
-    prior.mu_scale_std     = 1.5f;
-    /* mu_rate, sigma_scale, sigma_rate priors omitted — set in header struct */
-    smc2_cuda_set_prior(smc2, &prior);
+    smc2->prior.rho_mean         = dgp.rho;            smc2->prior.rho_std         = 0.05f;
+    smc2->prior.sigma_total_mean = dgp.sigma_z * 1.5f; smc2->prior.sigma_total_std = 0.1f;
+    smc2->prior.r_split_mean     = 0.5f;               smc2->prior.r_split_std     = 0.2f;
+    smc2->prior.mu_base_mean     = dgp.mu_floor;        smc2->prior.mu_base_std     = 1.0f;
+    smc2->prior.mu_scale_mean    = dgp.mu_ceiling - dgp.mu_floor;
+    smc2->prior.mu_scale_std     = 1.5f;
+    smc2->prior.mu_rate_mean     = 0.5f;                smc2->prior.mu_rate_std     = 0.3f;
+    smc2->prior.sigma_scale_mean = 0.5f;                smc2->prior.sigma_scale_std = 0.3f;
+    smc2->prior.sigma_rate_mean  = 0.3f;                smc2->prior.sigma_rate_std  = 0.2f;
 
     /* ── Set parameter mask based on mode ────────────────────────────── */
     uint8_t mask[N_PARAMS] = {0};

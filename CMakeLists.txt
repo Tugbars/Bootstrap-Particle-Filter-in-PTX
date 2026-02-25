@@ -222,6 +222,7 @@ set_target_properties(gpu_bpf_ptx_full PROPERTIES
 add_library(smc2_rbpf STATIC
     smc2/smc2_rbpf_batch.cu
     smc2/smc2_param_tracker.cu
+    smc2/cpmmh_gpu_learn_v3.cu
 )
 
 target_link_libraries(smc2_rbpf PRIVATE
@@ -231,6 +232,7 @@ target_link_libraries(smc2_rbpf PRIVATE
 
 target_include_directories(smc2_rbpf PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/smc2
+    ${CMAKE_CURRENT_SOURCE_DIR}/gpu_bpf
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 
@@ -538,6 +540,38 @@ if(TARGET ptx_cubin_full)
 endif()
 
 # ==============================================================================
+# Target: test_dsmc2_phased (dSMC² phased learning — end-to-end pipeline test)
+#
+# Full pipeline: dBPF (per-tick) + SMC² (background) + phased param learning.
+# 12-segment multi-regime gauntlet (~51K ticks) exercises Phase 1→2→3.
+# Compares: Phased vs Fixed4 vs All8.
+# ==============================================================================
+
+add_executable(test_dsmc2_phased smc2/test_dsmc2_phased.cu)
+
+target_link_libraries(test_dsmc2_phased PRIVATE
+    gpu_bpf_ptx_full
+    smc2_rbpf
+    CUDA::cuda_driver
+    CUDA::cudart
+    CUDA::curand
+)
+
+target_include_directories(test_dsmc2_phased PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/smc2
+    ${CMAKE_CURRENT_SOURCE_DIR}/gpu_bpf
+)
+
+set_target_properties(test_dsmc2_phased PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+if(TARGET ptx_cubin_full)
+    add_dependencies(test_dsmc2_phased ptx_cubin_full)
+endif()
+
+# ==============================================================================
 # Print summary
 # ==============================================================================
 
@@ -552,4 +586,17 @@ message(STATUS "  CUDA architectures:${CMAKE_CUDA_ARCHITECTURES}")
 message(STATUS "  CUDA toolkit:      ${CUDAToolkit_TARGET_DIR}")
 message(STATUS "  ptxas:             ${PTXAS_EXECUTABLE}")
 message(STATUS "  Build type:        ${CMAKE_BUILD_TYPE}")
+message(STATUS "")
+message(STATUS "  Libraries:")
+message(STATUS "    gpu_bpf           — nvcc BPF/APF (legacy)")
+message(STATUS "    gpu_bpf_ptx_full  — PTX BPF (14 kernels + Kalman param tracker)")
+message(STATUS "    smc2_rbpf         — SMC² RBPF (8-param, CPMMH, phased learning)")
+message(STATUS "")
+message(STATUS "  Tests:")
+message(STATUS "    test_smc2_rbpf         — SMC² convergence")
+message(STATUS "    test_param_tracker     — Kalman parameter tracker")
+message(STATUS "    test_4param_drift      — Dual-timescale validation")
+message(STATUS "    test_dsmc2_phased      — dSMC² pipeline (phased learning)")
+message(STATUS "    test_bpf_adaptive_stress — BPF stress (Standard/Adaptive/NatGrad)")
+message(STATUS "    test_mu_learning       — μ learning diagnostic")
 message(STATUS "-------------------------------------------")

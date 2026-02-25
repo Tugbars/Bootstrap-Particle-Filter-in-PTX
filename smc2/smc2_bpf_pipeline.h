@@ -22,6 +22,7 @@
 
 #include "gpu_bpf_full.cuh"
 #include "smc2_rbpf_batch.cuh"
+#include "smc2_phased_learning.h"
 #include <cuda_runtime.h>
 
 /* ── Pipeline configuration ─────────────────────────────────────────────── */
@@ -31,7 +32,6 @@ typedef struct {
     int   stride;            /**< Ticks between windows (e.g. 1500)            */
     int   sync_mode;         /**< 0=async (production), 1=sync (testing)       */
     int   push_rho;          /**< Push ρ from SMC² to dBPF? (0/1)             */
-    int   push_sigma_z;      /**< Push σ_z from SMC² to dBPF? (0/1)           */
     float obs_buffer_sec;    /**< Observation ring buffer size in seconds      */
 } PipelineConfig;
 
@@ -41,7 +41,6 @@ static inline PipelineConfig pipeline_default_config(void) {
     c.stride         = 1500;
     c.sync_mode      = 1;       /* Start in sync mode for testing */
     c.push_rho       = 1;
-    c.push_sigma_z   = 1;
     c.obs_buffer_sec = 0.0f;    /* Unused for now */
     return c;
 }
@@ -80,6 +79,9 @@ typedef struct {
 
     /* SMC² running state */
     int             smc2_running;        /**< 1 if SMC² window in progress    */
+
+    /* Phased learning controller (optional) */
+    PhasedLearner*  phased;              /**< NULL if phased learning disabled */
 } SMC2BpfPipeline;
 
 /* ── Lifecycle ──────────────────────────────────────────────────────────── */
@@ -121,11 +123,16 @@ static inline SMC2BpfPipeline* pipeline_create(
     p->n_pushes          = 0;
     p->smc2_running      = 0;
 
+    /* Phased learning: enabled by default */
+    PhasedConfig pc = phased_default_config();
+    p->phased = phased_create(smc2, pc);
+
     return p;
 }
 
 static inline void pipeline_destroy(SMC2BpfPipeline* p) {
     if (!p) return;
+    if (p->phased) phased_destroy(p->phased);
     cudaStreamDestroy(p->stream_bpf);
     cudaStreamDestroy(p->stream_smc2);
     free(p->obs_buffer);
@@ -138,28 +145,41 @@ static inline void pipeline_push_params(SMC2BpfPipeline* p) {
     /* Synchronize SMC² stream — results must be ready */
     cudaStreamSynchronize(p->stream_smc2);
 
-    /* Extract posterior means from SMC² */
-    /* TODO: Replace with actual smc2_get_posterior_mean() call.
-     *       For now, this shows the interface contract. */
-    float post_mu, post_rho, post_sigma_total, post_r_split;
-    smc2_cuda_get_posterior_means(p->smc2,
-        &post_rho, &post_sigma_total, &post_r_split, &post_mu);
+    /* ── Phased learning: observe z-range and maybe advance phase ──── */
+    if (p->phased) {
+        phased_observe_z_from_smc2(p->phased);
+        if (phased_update(p->phased)) {
+            /* Phase advanced — mask changed, next window uses new param set */
+        }
+    }
 
-    /* Derive σ_z from σ_total and r_split */
-    float post_sigma_z = post_r_split * post_sigma_total;
+    /* ── Extract posterior means from SMC² ──────────────────────────── */
+    /* theta_mean layout: [rho, sigma_total, r_split, mu_base,
+     *                     mu_scale, mu_rate, sigma_scale, sigma_rate] */
+    float theta_mean[N_PARAMS];
+    smc2_cuda_get_theta_mean(p->smc2, theta_mean);
 
-    /* Push μ (always) */
+    float post_rho         = theta_mean[0];
+    float post_sigma_total = theta_mean[1];
+    float post_r_split     = theta_mean[2];
+    float post_mu          = theta_mean[3];  /* mu_base = floor */
+    float post_sigma_z     = post_r_split * post_sigma_total;
+
+    /* Push μ (always — Kalman P resets to P0) */
     gpu_bpf_set_mu(p->bpf, post_mu);
 
-    /* Push ρ (optional) */
+    /* Push ρ (optional — Kalman P resets to P0) */
     if (p->config.push_rho) {
         gpu_bpf_set_rho(p->bpf, post_rho);
     }
 
-    /* Push σ_z (optional — can't be learned by gradient, SMC² is only source) */
-    if (p->config.push_sigma_z) {
-        gpu_bpf_set_sigma_z(p->bpf, post_sigma_z);
-    }
+    /*
+     * σ_z cannot be pushed — gpu_bpf has no set_sigma_z().
+     * σ_z is set at creation time only. To update it, the BPF must be
+     * recreated. In practice, σ_z changes slowly enough that recreation
+     * at epoch boundaries (every ~100 windows) is acceptable.
+     * TODO: Add gpu_bpf_set_sigma_z() to the BPF API.
+     */
 
     /* Record for diagnostics */
     p->last_push_mu      = post_mu;
@@ -181,16 +201,17 @@ static inline void pipeline_launch_smc2_window(SMC2BpfPipeline* p) {
     if (start < 0) return;  /* Not enough data yet */
 
     /* Build contiguous observation array for SMC² */
-    /* (In production, SMC² could read directly from ring buffer) */
     float* window_obs = (float*)malloc(W * sizeof(float));
     for (int i = 0; i < W; i++) {
         int buf_idx = (start + i) % p->obs_capacity;
         window_obs[i] = p->obs_buffer[buf_idx];
     }
 
-    /* Run SMC² on stream_smc2 */
-    /* TODO: Replace with actual smc2_cuda_run_window() call */
-    smc2_cuda_process_window(p->smc2, window_obs, W, p->stream_smc2);
+    /* Re-initialize SMC² from prior for each window (sliding window mode) */
+    smc2_cuda_init_from_prior(p->smc2);
+
+    /* Run SMC² batch update — processes all W observations */
+    smc2_cuda_update_batch(p->smc2, window_obs, W);
 
     free(window_obs);
 
@@ -274,6 +295,10 @@ static inline void pipeline_print_status(const SMC2BpfPipeline* p) {
     }
     printf("  bpf_mu:       %.4f\n", gpu_bpf_get_mu(p->bpf));
     printf("  bpf_rho:      %.4f\n", gpu_bpf_get_rho(p->bpf));
+    if (p->phased) {
+        printf("  ---\n");
+        phased_print_status(p->phased);
+    }
 }
 
 #endif /* SMC2_BPF_PIPELINE_H */

@@ -135,7 +135,7 @@
 #define N_PARAMS 8
 
 #ifndef SORT_EVERY_K
-#define SORT_EVERY_K  8
+#define SORT_EVERY_K  4
 #endif
 
 #define Z_CENTER 1.5f
@@ -229,7 +229,7 @@ struct ThetaParticlesSoA {
     float* inner_mu_h;
     float* inner_var_h;
     float* inner_log_w;
-    curandState* rng_states;
+    curandState* rng_states;    /**< cuRAND RNG state per inner particle */
 };
 
 /**
@@ -628,6 +628,12 @@ void smc2_cuda_get_theta_cov(SMC2StateCUDA* state, float* theta_mean, float* the
  * Used to evaluate curves μ(z̄), σ_h(z̄), θ(z̄) for the production BPF.
  */
 float smc2_cuda_get_z_mean(SMC2StateCUDA* state);
+
+/** Get z min/max/mean across all inner particles. Used by phased learning. */
+void smc2_cuda_get_z_range(SMC2StateCUDA* state,
+                            float* z_mean_out,
+                            float* z_min_out,
+                            float* z_max_out);
 
 float smc2_cuda_get_outer_ess(SMC2StateCUDA* state);
 

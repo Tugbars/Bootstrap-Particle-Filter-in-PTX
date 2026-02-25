@@ -1875,18 +1875,15 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
                 state->d_ancestors, state->N_theta, state->N_inner);
             CUDA_CHECK(cudaDeviceSynchronize());
             
-            /* Swap scratch → checkpoint */
-            int N_total = state->N_theta * state->N_inner;
-            CUDA_CHECK(cudaMemcpy(state->d_checkpoint_z, state->d_checkpoint_scratch_z,
-                                  N_total * sizeof(float), cudaMemcpyDeviceToDevice));
-            CUDA_CHECK(cudaMemcpy(state->d_checkpoint_mu_h, state->d_checkpoint_scratch_mu_h,
-                                  N_total * sizeof(float), cudaMemcpyDeviceToDevice));
-            CUDA_CHECK(cudaMemcpy(state->d_checkpoint_var_h, state->d_checkpoint_scratch_var_h,
-                                  N_total * sizeof(float), cudaMemcpyDeviceToDevice));
-            CUDA_CHECK(cudaMemcpy(state->d_checkpoint_log_w, state->d_checkpoint_scratch_log_w,
-                                  N_total * sizeof(float), cudaMemcpyDeviceToDevice));
-            CUDA_CHECK(cudaMemcpy(state->d_checkpoint_ll, state->d_checkpoint_scratch_ll,
-                                  state->N_theta * sizeof(float), cudaMemcpyDeviceToDevice));
+            /* Pointer swap instead of 5x D2D memcpy */
+            float* tmp_f;
+            #define SWAP_CP(a, b) do { tmp_f = (a); (a) = (b); (b) = tmp_f; } while(0)
+            SWAP_CP(state->d_checkpoint_z,     state->d_checkpoint_scratch_z);
+            SWAP_CP(state->d_checkpoint_mu_h,  state->d_checkpoint_scratch_mu_h);
+            SWAP_CP(state->d_checkpoint_var_h, state->d_checkpoint_scratch_var_h);
+            SWAP_CP(state->d_checkpoint_log_w, state->d_checkpoint_scratch_log_w);
+            SWAP_CP(state->d_checkpoint_ll,    state->d_checkpoint_scratch_ll);
+            #undef SWAP_CP
         }
         
         /* Determine fixed-lag checkpoint for rejuvenation */
@@ -1915,8 +1912,10 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
                 t_checkpoint_use, cp_z, cp_mu, cp_var, cp_logw, cp_ll)
         
         for (int k = 0; k < state->K_rejuv; k++) {
-            int h_accepts = 0;
-            CUDA_CHECK(cudaMemcpy(state->d_accepts, &h_accepts, sizeof(int), cudaMemcpyHostToDevice));
+            if (k == 0) {
+                int zero = 0;
+                CUDA_CHECK(cudaMemcpy(state->d_accepts, &zero, sizeof(int), cudaMemcpyHostToDevice));
+            }
             
             noise_t* curr_noise = state->d_z_noise[state->noise_buf];
             noise_t* other_noise = state->d_z_noise[1 - state->noise_buf];
@@ -1937,12 +1936,14 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
                 curr_noise, other_noise, curr_u0, other_u0,
                 state->d_swap_flags, state->N_theta, state->N_inner,
                 state->t_current, state->noise_capacity, t_start_commit);
-            /* Sync needed: we read d_accepts on host */
-            CUDA_CHECK(cudaDeviceSynchronize());
-            
+        }
+        /* Single sync after all K iterations */
+        CUDA_CHECK(cudaDeviceSynchronize());
+        {
+            int h_accepts = 0;
             CUDA_CHECK(cudaMemcpy(&h_accepts, state->d_accepts, sizeof(int), cudaMemcpyDeviceToHost));
             state->n_rejuv_accepts += h_accepts;
-            state->n_rejuv_total += state->N_theta;
+            state->n_rejuv_total += state->K_rejuv * state->N_theta;
         }
         #undef DISPATCH_CPMMH
         
@@ -2124,17 +2125,15 @@ float smc2_cuda_update_batch(SMC2StateCUDA* state, const float* y_batch, int n_o
                 state->d_ancestors, state->N_theta, state->N_inner);
             CUDA_CHECK(cudaDeviceSynchronize());
 
-            int N_total = state->N_theta * state->N_inner;
-            CUDA_CHECK(cudaMemcpy(state->d_checkpoint_z, state->d_checkpoint_scratch_z,
-                                  N_total * sizeof(float), cudaMemcpyDeviceToDevice));
-            CUDA_CHECK(cudaMemcpy(state->d_checkpoint_mu_h, state->d_checkpoint_scratch_mu_h,
-                                  N_total * sizeof(float), cudaMemcpyDeviceToDevice));
-            CUDA_CHECK(cudaMemcpy(state->d_checkpoint_var_h, state->d_checkpoint_scratch_var_h,
-                                  N_total * sizeof(float), cudaMemcpyDeviceToDevice));
-            CUDA_CHECK(cudaMemcpy(state->d_checkpoint_log_w, state->d_checkpoint_scratch_log_w,
-                                  N_total * sizeof(float), cudaMemcpyDeviceToDevice));
-            CUDA_CHECK(cudaMemcpy(state->d_checkpoint_ll, state->d_checkpoint_scratch_ll,
-                                  state->N_theta * sizeof(float), cudaMemcpyDeviceToDevice));
+            /* Pointer swap instead of 5x D2D memcpy */
+            float* tmp_f;
+            #define SWAP_CP(a, b) do { tmp_f = (a); (a) = (b); (b) = tmp_f; } while(0)
+            SWAP_CP(state->d_checkpoint_z,     state->d_checkpoint_scratch_z);
+            SWAP_CP(state->d_checkpoint_mu_h,  state->d_checkpoint_scratch_mu_h);
+            SWAP_CP(state->d_checkpoint_var_h, state->d_checkpoint_scratch_var_h);
+            SWAP_CP(state->d_checkpoint_log_w, state->d_checkpoint_scratch_log_w);
+            SWAP_CP(state->d_checkpoint_ll,    state->d_checkpoint_scratch_ll);
+            #undef SWAP_CP
         }
 
         /* Rejuvenation */
@@ -2163,8 +2162,10 @@ float smc2_cuda_update_batch(SMC2StateCUDA* state, const float* y_batch, int n_o
                 t_checkpoint_use, cp_z, cp_mu, cp_var, cp_logw, cp_ll)
 
         for (int k = 0; k < state->K_rejuv; k++) {
-            int h_accepts = 0;
-            CUDA_CHECK(cudaMemcpy(state->d_accepts, &h_accepts, sizeof(int), cudaMemcpyHostToDevice));
+            if (k == 0) {
+                int zero = 0;
+                CUDA_CHECK(cudaMemcpy(state->d_accepts, &zero, sizeof(int), cudaMemcpyHostToDevice));
+            }
 
             noise_t* curr_noise = state->d_z_noise[state->noise_buf];
             noise_t* other_noise = state->d_z_noise[1 - state->noise_buf];
@@ -2184,11 +2185,13 @@ float smc2_cuda_update_batch(SMC2StateCUDA* state, const float* y_batch, int n_o
                 curr_noise, other_noise, curr_u0, other_u0,
                 state->d_swap_flags, state->N_theta, state->N_inner,
                 state->t_current, state->noise_capacity, t_start_commit);
-            CUDA_CHECK(cudaDeviceSynchronize());
-
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+        {
+            int h_accepts = 0;
             CUDA_CHECK(cudaMemcpy(&h_accepts, state->d_accepts, sizeof(int), cudaMemcpyDeviceToHost));
             state->n_rejuv_accepts += h_accepts;
-            state->n_rejuv_total += state->N_theta;
+            state->n_rejuv_total += state->K_rejuv * state->N_theta;
         }
         #undef DISPATCH_CPMMH_BATCH
 
@@ -2343,6 +2346,50 @@ float smc2_cuda_get_z_mean(SMC2StateCUDA* state) {
     free(h_weight);
     free(h_z);
     return z_global;
+}
+
+/*═══════════════════════════════════════════════════════════════════════════════
+ * Z range — min/max/mean across all inner particles (weighted by outer)
+ *
+ * Used by phased learning controller to determine when high-z regions
+ * have been explored, triggering ceiling/rate parameter unlocking.
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
+void smc2_cuda_get_z_range(SMC2StateCUDA* state,
+                            float* z_mean_out,
+                            float* z_min_out,
+                            float* z_max_out) {
+    int N_total = state->N_theta * state->N_inner;
+    float* h_weight = (float*)malloc(state->N_theta * sizeof(float));
+    float* h_z = (float*)malloc(N_total * sizeof(float));
+
+    CUDA_CHECK(cudaMemcpy(h_weight, state->d_particles.weight,
+                          state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_z, state->d_particles.inner_z,
+                          N_total * sizeof(float), cudaMemcpyDeviceToHost));
+
+    float z_global = 0.0f;
+    float z_min = 1e6f, z_max = -1e6f;
+
+    for (int j = 0; j < state->N_theta; j++) {
+        float z_sum = 0.0f;
+        int base = j * state->N_inner;
+        for (int i = 0; i < state->N_inner; i++) {
+            float zt = h_z[base + i];
+            float z = 1.5f * (1.0f + tanhf(zt));
+            z_sum += z;
+            if (z < z_min) z_min = z;
+            if (z > z_max) z_max = z;
+        }
+        z_global += h_weight[j] * (z_sum / state->N_inner);
+    }
+
+    free(h_weight);
+    free(h_z);
+
+    if (z_mean_out) *z_mean_out = z_global;
+    if (z_min_out)  *z_min_out  = z_min;
+    if (z_max_out)  *z_max_out  = z_max;
 }
 
 float smc2_cuda_get_outer_ess(SMC2StateCUDA* state) {
