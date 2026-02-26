@@ -112,6 +112,9 @@ typedef struct {
 
     /* EMA smoothing for z tracker */
     float z_ema_alpha;            /**< EMA decay (default: 0.1)                   */
+
+    /* ── Backward transition control ──────────────────────────────── */
+    int   enable_backward;        /**< 1=valve (bidir), 0=ratchet (one-way)       */
 } PhasedConfig;
 
 static inline PhasedConfig phased_default_config(void) {
@@ -133,6 +136,7 @@ static inline PhasedConfig phased_default_config(void) {
     c.learned_rates        = 0;
 
     c.z_ema_alpha          = 0.1f;
+    c.enable_backward      = 1;      /* Bidirectional by default */
     return c;
 }
 
@@ -388,7 +392,8 @@ static inline int phased_update(PhasedLearner* pl) {
         /* ── Backward: Phase 2 → 1 ────────────────────────────────── */
         /* z_max < threshold for N consecutive windows (calm returned)   */
         /* Save learned ceilings before locking                          */
-        else if (zt->calm_streak >= pl->config.ceiling_z_sustained) {
+        else if (pl->config.enable_backward &&
+                 zt->calm_streak >= pl->config.ceiling_z_sustained) {
             phased_save_and_lock_ceilings(pl);
             pl->phase = PHASE_1_FLOORS;
             phased_record_transition(pl, prev_phase, pl->phase);
@@ -400,7 +405,8 @@ static inline int phased_update(PhasedLearner* pl) {
         /* ── Backward: Phase 3 → 2 ────────────────────────────────── */
         /* z-range narrows for N consecutive windows                     */
         /* Save learned rates before locking                             */
-        if (zt->narrow_range_streak >= pl->config.rate_range_sustained) {
+        if (pl->config.enable_backward &&
+            zt->narrow_range_streak >= pl->config.rate_range_sustained) {
             phased_save_and_lock_rates(pl);
             pl->phase = PHASE_2_CEILINGS;
             phased_record_transition(pl, prev_phase, pl->phase);

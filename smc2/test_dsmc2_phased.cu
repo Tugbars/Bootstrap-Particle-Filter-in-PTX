@@ -17,10 +17,19 @@
  *   Segment 10: Crypto chaos             (4000 ticks)  — t-distributed shocks
  *   Segment 11: Final calm               (5000 ticks)  — parameter accuracy check
  *
- * Three configurations compared:
- *   A. phased   — dSMC² with phased learning (Phase 1→2→3 as data permits)
- *   B. fixed4   — SMC² locked to 4 params forever (no ceiling/rate learning)
- *   C. all8     — SMC² with all 8 params free from tick 0 (ridge problem)
+ * Four configurations compared:
+ *   A. ratchet  — dSMC² with phased learning (one-way: Phase 1→2→3 only)
+ *   B. valve    — dSMC² with bidirectional phased learning (can lock back)
+ *   C. fixed4   — SMC² locked to 4 params forever (no ceiling/rate learning)
+ *   D. all8     — SMC² with all 8 params free from tick 0 (ridge problem)
+ *
+ * Z source for phased controller:
+ *   The phased controller needs real z-range to trigger phase transitions.
+ *   The pipeline's internal phased_observe_z_from_smc2() reads z from RBPF
+ *   inner particles — wrong signal (depends on parameter quality, lags badly).
+ *   Instead, we steal the phased pointer and feed true DGP z from the test
+ *   loop, matching the OLD working code. When BPF goes 2D, this becomes
+ *   BpfResult.z_mean.
  *
  * Build:
  *   nvcc -O3 test_dsmc2_phased.cu smc2_rbpf_cuda.cu gpu_bpf_ptx_full.cu \
@@ -240,16 +249,18 @@ static SegmentMetrics compute_segment_metrics(
 /* ── Run modes ───────────────────────────────────────────────────────────── */
 
 enum TestMode {
-    MODE_PHASED,    /* dSMC² with phased learning */
-    MODE_FIXED4,    /* 4-param locked forever */
-    MODE_ALL8       /* All 8 from tick 0 */
+    MODE_PHASED,        /* dSMC² with phased learning (one-way ratchet) */
+    MODE_PHASED_BIDIR,  /* dSMC² with bidirectional valve */
+    MODE_FIXED4,        /* 4-param locked forever */
+    MODE_ALL8           /* All 8 from tick 0 */
 };
 
 static const char* mode_name(TestMode m) {
     switch (m) {
-        case MODE_PHASED: return "Phased";
-        case MODE_FIXED4: return "Fixed4";
-        case MODE_ALL8:   return "All8";
+        case MODE_PHASED:       return "Ratchet";
+        case MODE_PHASED_BIDIR: return "Valve";
+        case MODE_FIXED4:       return "Fixed4";
+        case MODE_ALL8:         return "All8";
     }
     return "?";
 }
@@ -337,24 +348,63 @@ static RunResult run_pipeline(
     SMC2BpfPipeline* pipe = pipeline_create(bpf, smc2, pc);
 
     /* Disable phased learning for non-phased modes */
-    if (mode != MODE_PHASED) {
+    if (mode != MODE_PHASED && mode != MODE_PHASED_BIDIR) {
         phased_destroy(pipe->phased);
         pipe->phased = NULL;
     }
+
+    /* ── Steal phased pointer — feed z from DGP, not RBPF ────────────
+     *
+     * The pipeline's internal phased_observe_z_from_smc2() reads z from
+     * RBPF inner particles — wrong signal (depends on parameter quality,
+     * lags badly early on). We steal the pointer so the pipeline doesn't
+     * call its broken path, and drive phased from here with true DGP z.
+     *
+     * When BPF goes 2D, this becomes BpfResult.z_mean.
+     * ──────────────────────────────────────────────────────────────── */
+    PhasedLearner* phased = pipe->phased;
+    pipe->phased = NULL;  /* prevent pipeline's broken smc2 z-read */
+
+    /* Set backward transition flag based on mode */
+    if (phased) {
+        phased->config.enable_backward = (mode == MODE_PHASED_BIDIR) ? 1 : 0;
+    }
+
+    float z_min_w = 1e6f, z_max_w = -1e6f;
+    double z_sum_w = 0.0; int z_cnt_w = 0;
+    int prev_pushes = 0;
 
     /* ── Run ─────────────────────────────────────────────────────────── */
     for (int t = 0; t < N; t++) {
         BpfResult r = pipeline_step(pipe, gd.returns[t]);
         result.est_h[t] = r.h_mean;
+
+        /* Accumulate true z for phased controller */
+        if (phased) {
+            float z = gd.true_z[t];
+            if (z < z_min_w) z_min_w = z;
+            if (z > z_max_w) z_max_w = z;
+            z_sum_w += z; z_cnt_w++;
+
+            /* Window boundary: pipeline just pushed → feed phased */
+            if (pipe->n_pushes > prev_pushes) {
+                phased_observe_z(phased, (float)(z_sum_w / z_cnt_w),
+                                 z_min_w, z_max_w);
+                phased_update(phased);
+                z_min_w = 1e6f; z_max_w = -1e6f;
+                z_sum_w = 0.0; z_cnt_w = 0;
+                prev_pushes = pipe->n_pushes;
+            }
+        }
     }
 
     /* ── Collect phase info ──────────────────────────────────────────── */
-    if (pipe->phased) {
-        result.final_phase = pipe->phased->phase;
-        result.phase2_tick = (pipe->phased->phase2_entered_at >= 0)
-            ? pipe->phased->phase2_entered_at * pc.stride : -1;
-        result.phase3_tick = (pipe->phased->phase3_entered_at >= 0)
-            ? pipe->phased->phase3_entered_at * pc.stride : -1;
+    if (phased) {
+        result.final_phase = phased->phase;
+        result.phase2_tick = (phased->phase2_entered_at >= 0)
+            ? phased->phase2_entered_at * pc.stride : -1;
+        result.phase3_tick = (phased->phase3_entered_at >= 0)
+            ? phased->phase3_entered_at * pc.stride : -1;
     }
 
     /* ── Compute per-segment metrics ─────────────────────────────────── */
@@ -379,7 +429,8 @@ static RunResult run_pipeline(
     }
     result.total_rmse = (count > 0) ? sqrt(sum_sq / count) : 999.0;
 
-    /* ── Cleanup ─────────────────────────────────────────────────────── */
+    /* ── Cleanup — put phased back so pipeline_destroy frees it ──────── */
+    pipe->phased = phased;
     pipeline_destroy(pipe);
     gpu_bpf_destroy(bpf);
     smc2_cuda_free(smc2);
@@ -452,15 +503,15 @@ int main(int argc, char** argv) {
     }
     printf("\n");
 
-    /* ── Run all three modes ──────────────────────────────────────────── */
-    TestMode modes[] = {MODE_PHASED, MODE_FIXED4, MODE_ALL8};
-    RunResult results[3];
+    /* ── Run all four modes ──────────────────────────────────────────── */
+    TestMode modes[] = {MODE_PHASED, MODE_PHASED_BIDIR, MODE_FIXED4, MODE_ALL8};
+    RunResult results[4];
 
-    for (int m = 0; m < 3; m++) {
+    for (int m = 0; m < 4; m++) {
         printf("  Running %s...\n", mode_name(modes[m]));
         results[m] = run_pipeline(gd, dgp, n_bpf, n_theta, n_inner, modes[m], seed);
         printf("    Total RMSE: %.4f", results[m].total_rmse);
-        if (modes[m] == MODE_PHASED) {
+        if (modes[m] == MODE_PHASED || modes[m] == MODE_PHASED_BIDIR) {
             printf("  (final phase: %d", results[m].final_phase);
             if (results[m].phase2_tick >= 0) printf(", P2 at tick %d", results[m].phase2_tick);
             if (results[m].phase3_tick >= 0) printf(", P3 at tick %d", results[m].phase3_tick);
@@ -471,78 +522,82 @@ int main(int argc, char** argv) {
 
     /* ── Per-segment comparison table ─────────────────────────────────── */
     printf("\n");
-    printf("  ════════════════════════════════════════════════════════════════════════════════════\n");
+    printf("  ════════════════════════════════════════════════════════════════════════════════════════════\n");
     printf("  Per-segment RMSE comparison\n");
-    printf("  ────────────────────────────────────────────────────────────────────────────────────\n");
-    printf("  %-25s %6s %6s %6s | %8s %8s %8s | Winner\n",
-           "Segment", "z_min", "z_max", "z_avg", "Phased", "Fixed4", "All8");
-    printf("  ─────────────────────── ────── ────── ────── | ──────── ──────── ──────── | ──────\n");
+    printf("  ────────────────────────────────────────────────────────────────────────────────────────────\n");
+    printf("  %-25s %6s %6s %6s | %8s %8s %8s %8s | Winner\n",
+           "Segment", "z_min", "z_max", "z_avg", "Ratchet", "Valve", "Fixed4", "All8");
+    printf("  ─────────────────────── ────── ────── ────── | ──────── ──────── ──────── ──────── | ──────\n");
 
-    int phased_wins = 0, fixed4_wins = 0, all8_wins = 0;
+    int wins[4] = {0, 0, 0, 0};
 
     for (int s = 0; s < n_seg; s++) {
-        SegmentMetrics* sm[3] = {
+        SegmentMetrics* sm[4] = {
             &results[0].seg_metrics[s],
             &results[1].seg_metrics[s],
-            &results[2].seg_metrics[s]
+            &results[2].seg_metrics[s],
+            &results[3].seg_metrics[s]
         };
 
         /* Find winner */
         int best = 0;
-        for (int m = 1; m < 3; m++) {
+        for (int m = 1; m < 4; m++) {
             if (sm[m]->rmse < sm[best]->rmse) best = m;
         }
-        if (best == 0) phased_wins++;
-        else if (best == 1) fixed4_wins++;
-        else all8_wins++;
+        wins[best]++;
 
-        const char* winner_names[] = {"Phased", "Fixed4", "All8"};
+        const char* winner_names[] = {"Ratchet", "Valve", "Fixed4", "All8"};
 
-        printf("  %-25s %6.2f %6.2f %6.2f | %8.4f %8.4f %8.4f | %s\n",
+        printf("  %-25s %6.2f %6.2f %6.2f | %8.4f %8.4f %8.4f %8.4f | %s\n",
                gd.segment_names[s].c_str(),
                sm[0]->z_min, sm[0]->z_max, sm[0]->z_mean,
-               sm[0]->rmse, sm[1]->rmse, sm[2]->rmse,
+               sm[0]->rmse, sm[1]->rmse, sm[2]->rmse, sm[3]->rmse,
                winner_names[best]);
     }
 
     /* ── Grand summary ───────────────────────────────────────────────── */
     printf("\n");
-    printf("  ════════════════════════════════════════════════════════════════════════════════════\n");
+    printf("  ════════════════════════════════════════════════════════════════════════════════════════════\n");
     printf("  GRAND SUMMARY\n");
-    printf("  ────────────────────────────────────────────────────────────────────────────────────\n");
-    printf("  %-20s %12s %12s %12s\n", "", "Phased", "Fixed4", "All8");
-    printf("  %-20s %12.4f %12.4f %12.4f\n", "Total RMSE",
-           results[0].total_rmse, results[1].total_rmse, results[2].total_rmse);
-    printf("  %-20s %12d %12d %12d\n", "Segment wins",
-           phased_wins, fixed4_wins, all8_wins);
+    printf("  ────────────────────────────────────────────────────────────────────────────────────────────\n");
+    printf("  %-20s %12s %12s %12s %12s\n", "", "Ratchet", "Valve", "Fixed4", "All8");
+    printf("  %-20s %12.4f %12.4f %12.4f %12.4f\n", "Total RMSE",
+           results[0].total_rmse, results[1].total_rmse,
+           results[2].total_rmse, results[3].total_rmse);
+    printf("  %-20s %12d %12d %12d %12d\n", "Segment wins",
+           wins[0], wins[1], wins[2], wins[3]);
 
-    printf("\n  Phased vs Fixed4:  %+.1f%% RMSE\n",
-           100.0 * (results[0].total_rmse / results[1].total_rmse - 1.0));
-    printf("  Phased vs All8:    %+.1f%% RMSE\n",
+    printf("\n  Key comparisons:\n");
+    printf("    Valve vs Ratchet:  %+.1f%% RMSE  (%s)\n",
+           100.0 * (results[1].total_rmse / results[0].total_rmse - 1.0),
+           results[1].total_rmse < results[0].total_rmse ? "valve helps" : "ratchet better");
+    printf("    Ratchet vs Fixed4: %+.1f%% RMSE\n",
            100.0 * (results[0].total_rmse / results[2].total_rmse - 1.0));
-    printf("  All8 vs Fixed4:    %+.1f%% RMSE\n",
-           100.0 * (results[2].total_rmse / results[1].total_rmse - 1.0));
+    printf("    Valve vs Fixed4:   %+.1f%% RMSE\n",
+           100.0 * (results[1].total_rmse / results[2].total_rmse - 1.0));
+    printf("    All8 vs Fixed4:    %+.1f%% RMSE\n",
+           100.0 * (results[3].total_rmse / results[2].total_rmse - 1.0));
 
-    if (results[0].phase2_tick >= 0) {
-        printf("\n  Phase transitions:\n");
-        printf("    Phase 1→2 (ceilings unlocked): tick %d  (segment: %s)\n",
-               results[0].phase2_tick,
-               results[0].phase2_tick < N ? "in-range" : "never");
-        if (results[0].phase3_tick >= 0) {
-            printf("    Phase 2→3 (rates unlocked):    tick %d\n",
-                   results[0].phase3_tick);
-        } else {
-            printf("    Phase 2→3: never reached (need more full cycles)\n");
+    /* Phase transition details for both phased modes */
+    for (int m = 0; m < 2; m++) {
+        printf("\n  %s transitions:\n", mode_name(modes[m]));
+        if (results[m].phase2_tick >= 0) {
+            printf("    Phase 1→2 (ceilings unlocked): tick %d\n", results[m].phase2_tick);
         }
+        if (results[m].phase3_tick >= 0) {
+            printf("    Phase 2→3 (rates unlocked):    tick %d\n", results[m].phase3_tick);
+        } else {
+            printf("    Phase 2→3: never reached\n");
+        }
+        printf("    Final phase: %d\n", results[m].final_phase);
     }
 
     printf("\n  Expected behavior:\n");
-    printf("    • Phased ≤ Fixed4 on calm segments (same params, no extra noise)\n");
-    printf("    • Phased < Fixed4 on crisis/recovery (ceilings adapt)\n");
-    printf("    • All8 worst on early segments (ridge problem, no identification)\n");
-    printf("    • All8 may recover late if ridge eventually resolves\n");
-    printf("    • Phased best overall (right params learned at right time)\n");
-    printf("  ════════════════════════════════════════════════════════════════════════════════════\n\n");
+    printf("    • Ratchet ≤ Fixed4 — phased learning adapts to regimes\n");
+    printf("    • Valve ≤ Ratchet on calm segments — locks out unidentifiable params\n");
+    printf("    • Valve final_phase < Ratchet final_phase — valve retreats during calm\n");
+    printf("    • All8 worst early — ridge degeneracy before identification\n");
+    printf("  ════════════════════════════════════════════════════════════════════════════════════════════\n\n");
 
     return 0;
 }
