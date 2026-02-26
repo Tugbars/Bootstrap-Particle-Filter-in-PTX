@@ -1,0 +1,1016 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Amnesiac SMC² + Kalman Stitching</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600&family=Outfit:wght@200;300;400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg-deep: #0a0e17;
+  --bg-card: #111827;
+  --bg-card-hover: #1a2332;
+  --border-subtle: rgba(255,255,255,0.06);
+  --text-primary: #e2e8f0;
+  --text-secondary: #94a3b8;
+  --text-dim: #475569;
+  --smc2-blue: #4da6ff;
+  --smc2-blue-glow: rgba(77,166,255,0.15);
+  --rbpf-pink: #e879a8;
+  --rbpf-pink-glow: rgba(232,121,168,0.15);
+  --cpmmh-coral: #f97316;
+  --kalman-green: #34d399;
+  --kalman-green-glow: rgba(52,211,153,0.15);
+  --danger-red: #ef4444;
+  --warn-amber: #f59e0b;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html { scroll-behavior: smooth; }
+
+body {
+  background: var(--bg-deep);
+  color: var(--text-primary);
+  font-family: 'Outfit', sans-serif;
+  font-weight: 300;
+  line-height: 1.7;
+  overflow-x: hidden;
+}
+
+/* ── Noise overlay ─────────────────────────────────── */
+body::before {
+  content: '';
+  position: fixed;
+  top: 0; left: 0; width: 100%; height: 100%;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
+  pointer-events: none;
+  z-index: 9999;
+}
+
+/* ── Hero ──────────────────────────────────────────── */
+.hero {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  text-align: center;
+  padding: 2rem;
+  position: relative;
+  overflow: hidden;
+}
+
+.hero::before {
+  content: '';
+  position: absolute;
+  top: 50%; left: 50%;
+  width: 800px; height: 800px;
+  transform: translate(-50%, -50%);
+  background: radial-gradient(ellipse, rgba(52,211,153,0.06) 0%, transparent 70%);
+  pointer-events: none;
+}
+
+.hero-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  letter-spacing: 0.3em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 2rem;
+  opacity: 0;
+  animation: fadeUp 0.8s ease 0.2s forwards;
+}
+
+.hero h1 {
+  font-weight: 800;
+  font-size: clamp(2.5rem, 6vw, 4.5rem);
+  line-height: 1.1;
+  margin-bottom: 0.5rem;
+  opacity: 0;
+  animation: fadeUp 0.8s ease 0.4s forwards;
+}
+
+.hero h1 .amnesiac { color: var(--smc2-blue); }
+.hero h1 .kalman { color: var(--kalman-green); }
+
+.hero h2 {
+  font-weight: 300;
+  font-size: clamp(1.5rem, 3vw, 2.2rem);
+  color: var(--text-secondary);
+  margin-bottom: 2rem;
+  opacity: 0;
+  animation: fadeUp 0.8s ease 0.6s forwards;
+}
+
+.hero-sub {
+  max-width: 640px;
+  color: var(--text-secondary);
+  font-size: 1.05rem;
+  line-height: 1.8;
+  opacity: 0;
+  animation: fadeUp 0.8s ease 0.8s forwards;
+}
+
+.hero-meta {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  margin-top: 3rem;
+  display: flex;
+  gap: 2.5rem;
+  flex-wrap: wrap;
+  justify-content: center;
+  opacity: 0;
+  animation: fadeUp 0.8s ease 1s forwards;
+}
+
+.hero-meta span { white-space: nowrap; }
+.hero-meta .hl-blue { color: var(--smc2-blue); }
+.hero-meta .hl-green { color: var(--kalman-green); }
+.hero-meta .hl-pink { color: var(--rbpf-pink); }
+
+/* ── Sections ─────────────────────────────────────── */
+.section {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 6rem 2rem;
+}
+
+.section-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  letter-spacing: 0.25em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 1rem;
+}
+
+.section h2 {
+  font-weight: 700;
+  font-size: 2rem;
+  margin-bottom: 1.5rem;
+  line-height: 1.2;
+}
+
+.section p {
+  color: var(--text-secondary);
+  font-size: 1rem;
+  margin-bottom: 1.5rem;
+  max-width: 720px;
+}
+
+/* ── Divider ──────────────────────────────────────── */
+.divider {
+  max-width: 900px;
+  margin: 0 auto;
+  height: 1px;
+  background: var(--border-subtle);
+}
+
+/* ── Problem animation ────────────────────────────── */
+.particle-demo {
+  display: flex;
+  gap: 1.5rem;
+  margin: 3rem 0;
+  flex-wrap: wrap;
+}
+
+.particle-box {
+  flex: 1;
+  min-width: 280px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  padding: 1.5rem;
+  position: relative;
+  overflow: hidden;
+}
+
+.particle-box h4 {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  margin-bottom: 0.5rem;
+}
+
+.particle-box .subtitle {
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  margin-bottom: 1rem;
+}
+
+.particle-box.bad { border-color: rgba(239,68,68,0.2); }
+.particle-box.bad h4 { color: var(--danger-red); }
+.particle-box.good { border-color: rgba(52,211,153,0.2); }
+.particle-box.good h4 { color: var(--kalman-green); }
+
+/* Particle field */
+.field {
+  width: 100%;
+  height: 180px;
+  position: relative;
+  background: rgba(0,0,0,0.3);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.particle {
+  position: absolute;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  opacity: 0.8;
+}
+
+/* Traveling: particles collapse to a line */
+.field.traveling .particle {
+  background: var(--danger-red);
+  animation: collapse 6s ease-in-out infinite;
+}
+
+/* Amnesiac: particles stay spread, periodic burst */
+.field.amnesiac .particle {
+  background: var(--kalman-green);
+  animation: refresh 3s ease-in-out infinite;
+}
+
+@keyframes collapse {
+  0% { opacity: 0.8; }
+  30% { opacity: 0.7; }
+  70% { opacity: 0.3; transform: translateY(0) scaleX(0.5); }
+  100% { opacity: 0.15; transform: translateY(0) scaleX(0.2); }
+}
+
+@keyframes refresh {
+  0% { opacity: 0.8; transform: scale(1); }
+  45% { opacity: 0.4; transform: scale(0.6); }
+  50% { opacity: 0; transform: scale(0); }
+  55% { opacity: 0.9; transform: scale(1.3); }
+  60% { opacity: 0.8; transform: scale(1); }
+  100% { opacity: 0.8; transform: scale(1); }
+}
+
+/* ── Architecture diagram ─────────────────────────── */
+.arch-flow {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  margin: 3rem 0;
+  position: relative;
+}
+
+.arch-window {
+  flex: 1;
+  background: var(--bg-card);
+  border: 1px solid rgba(77,166,255,0.2);
+  border-radius: 10px;
+  padding: 1.2rem;
+  text-align: center;
+  position: relative;
+  min-width: 0;
+}
+
+.arch-window .win-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  color: var(--smc2-blue);
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+}
+
+.arch-window .win-content {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  margin-top: 0.5rem;
+}
+
+.arch-window .theta-hat {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  color: var(--text-primary);
+  margin-top: 0.4rem;
+}
+
+.arch-arrow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 60px;
+  flex-shrink: 0;
+  position: relative;
+}
+
+.arch-arrow::before {
+  content: '';
+  width: 100%;
+  height: 2px;
+  background: linear-gradient(90deg, var(--smc2-blue), var(--kalman-green));
+  position: absolute;
+}
+
+.arch-arrow::after {
+  content: '▸';
+  color: var(--kalman-green);
+  font-size: 1.2rem;
+  position: absolute;
+  right: 0;
+}
+
+.arch-kalman {
+  background: var(--bg-card);
+  border: 1px solid rgba(52,211,153,0.3);
+  border-radius: 10px;
+  padding: 1.2rem;
+  text-align: center;
+  min-width: 120px;
+}
+
+.arch-kalman .k-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  color: var(--kalman-green);
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+}
+
+.arch-kalman .k-content {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  margin-top: 0.5rem;
+}
+
+/* Mobile: stack vertically */
+@media (max-width: 700px) {
+  .arch-flow { flex-direction: column; align-items: center; gap: 0.5rem; }
+  .arch-arrow { width: 40px; height: 40px; transform: rotate(90deg); }
+}
+
+/* ── Equation / highlight boxes ───────────────────── */
+.eq-box {
+  background: rgba(52,211,153,0.05);
+  border: 1px solid rgba(52,211,153,0.15);
+  border-radius: 10px;
+  padding: 1.5rem 2rem;
+  margin: 2rem 0;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85rem;
+  line-height: 2;
+  color: var(--text-primary);
+}
+
+.eq-box .dim { color: var(--text-dim); }
+.eq-box .hl { color: var(--kalman-green); }
+.eq-box .bl { color: var(--smc2-blue); }
+
+/* ── Results table ────────────────────────────────── */
+.results-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 2rem 0;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+}
+
+.results-table th {
+  text-align: left;
+  padding: 0.8rem 1rem;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-dim);
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-size: 0.65rem;
+}
+
+.results-table td {
+  padding: 0.8rem 1rem;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+}
+
+.results-table tr.winner td {
+  color: var(--kalman-green);
+  font-weight: 500;
+}
+
+.results-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* ── Stat cards ───────────────────────────────────── */
+.stat-row {
+  display: flex;
+  gap: 1rem;
+  margin: 2rem 0;
+  flex-wrap: wrap;
+}
+
+.stat-card {
+  flex: 1;
+  min-width: 160px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  padding: 1.2rem;
+  text-align: center;
+}
+
+.stat-card .stat-value {
+  font-size: 2rem;
+  font-weight: 700;
+  line-height: 1;
+  margin-bottom: 0.3rem;
+}
+
+.stat-card .stat-label {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  font-family: 'JetBrains Mono', monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.stat-card.green .stat-value { color: var(--kalman-green); }
+.stat-card.red .stat-value { color: var(--danger-red); }
+.stat-card.blue .stat-value { color: var(--smc2-blue); }
+.stat-card.amber .stat-value { color: var(--warn-amber); }
+
+/* ── Timeline ─────────────────────────────────────── */
+.timeline {
+  position: relative;
+  margin: 3rem 0;
+  padding-left: 2rem;
+}
+
+.timeline::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 2px;
+  background: linear-gradient(180deg,
+    var(--smc2-blue) 0%,
+    var(--kalman-green) 50%,
+    var(--rbpf-pink) 100%);
+}
+
+.timeline-item {
+  position: relative;
+  padding: 0 0 2.5rem 1.5rem;
+}
+
+.timeline-item::before {
+  content: '';
+  position: absolute;
+  left: -2rem;
+  top: 0.4rem;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--bg-deep);
+  border: 2px solid var(--smc2-blue);
+}
+
+.timeline-item:nth-child(2)::before { border-color: var(--kalman-green); }
+.timeline-item:nth-child(3)::before { border-color: var(--rbpf-pink); }
+.timeline-item:nth-child(4)::before { border-color: var(--kalman-green); }
+
+.timeline-item h4 {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin-bottom: 0.3rem;
+}
+
+.timeline-item p {
+  font-size: 0.85rem;
+  color: var(--text-dim);
+  margin: 0;
+}
+
+/* ── Inline code ──────────────────────────────────── */
+code {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85em;
+  background: rgba(255,255,255,0.05);
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+}
+
+/* ── Keyframes ────────────────────────────────────── */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(20px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes pulse-green {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(52,211,153,0.3); }
+  50% { box-shadow: 0 0 20px 4px rgba(52,211,153,0.15); }
+}
+
+/* ── Scroll animations ────────────────────────────── */
+.reveal {
+  opacity: 0;
+  transform: translateY(30px);
+  transition: opacity 0.7s ease, transform 0.7s ease;
+}
+
+.reveal.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* ── Bar chart ────────────────────────────────────── */
+.bar-chart {
+  margin: 2rem 0;
+}
+
+.bar-row {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-bottom: 0.8rem;
+}
+
+.bar-label {
+  width: 180px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  text-align: right;
+  flex-shrink: 0;
+}
+
+.bar-track {
+  flex: 1;
+  height: 28px;
+  background: rgba(255,255,255,0.03);
+  border-radius: 4px;
+  overflow: hidden;
+  position: relative;
+}
+
+.bar-fill {
+  height: 100%;
+  border-radius: 4px;
+  transition: width 1.5s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+  width: 0;
+  display: flex;
+  align-items: center;
+  padding-left: 0.6rem;
+}
+
+.bar-fill.animated { /* set via JS */ }
+
+.bar-fill span {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  color: white;
+  font-weight: 500;
+}
+
+.bar-fill.green { background: linear-gradient(90deg, rgba(52,211,153,0.8), rgba(52,211,153,0.5)); }
+.bar-fill.red { background: linear-gradient(90deg, rgba(239,68,68,0.7), rgba(239,68,68,0.4)); }
+.bar-fill.amber { background: linear-gradient(90deg, rgba(245,158,11,0.7), rgba(245,158,11,0.4)); }
+.bar-fill.blue { background: linear-gradient(90deg, rgba(77,166,255,0.7), rgba(77,166,255,0.4)); }
+
+/* ── Stitching animation ──────────────────────────── */
+.stitch-demo {
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  padding: 2rem;
+  margin: 3rem 0;
+  overflow: hidden;
+}
+
+.stitch-track {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 60px;
+  position: relative;
+}
+
+.stitch-window {
+  height: 100%;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  color: rgba(255,255,255,0.7);
+  position: relative;
+  overflow: hidden;
+}
+
+.stitch-window::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.05), transparent);
+  animation: shimmer 3s ease-in-out infinite;
+}
+
+@keyframes shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+.stitch-connector {
+  width: 2px;
+  height: 40px;
+  flex-shrink: 0;
+  position: relative;
+}
+
+.stitch-connector::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: var(--kalman-green);
+  animation: pulse-connector 2s ease-in-out infinite;
+}
+
+@keyframes pulse-connector {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 1; }
+}
+
+.stitch-label-row {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 0.8rem;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.6rem;
+  color: var(--text-dim);
+  letter-spacing: 0.05em;
+}
+
+/* ── Footer ───────────────────────────────────────── */
+.footer {
+  text-align: center;
+  padding: 4rem 2rem;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  font-family: 'JetBrains Mono', monospace;
+}
+</style>
+</head>
+<body>
+
+<!-- ══════════════ HERO ══════════════ -->
+<section class="hero">
+  <div class="hero-label">Architecture Note</div>
+  <h1>
+    <span class="amnesiac">Amnesiac</span> SMC² +<br>
+    <span class="kalman">Kalman</span> Stitching
+  </h1>
+  <h2>Cross-window parameter memory<br>without particle depletion</h2>
+  <p class="hero-sub">
+    SMC² particle clouds degenerate after ~3,000 ticks regardless of particle count. 
+    Rather than fighting genealogical collapse, we embrace it: run short amnesiac windows 
+    with fresh particles, then stitch their posteriors with a linear Kalman filter.
+  </p>
+  <div class="hero-meta">
+    <span>Sensor: <span class="hl-blue">SMC² × RBPF</span></span>
+    <span>Tracker: <span class="hl-green">8D Kalman</span></span>
+    <span>Push: <span class="hl-pink">RAW θ → BPF</span></span>
+    <span>Target: <span class="hl-blue">CUDA / RTX 5080</span></span>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ══════════════ THE PROBLEM ══════════════ -->
+<section class="section reveal">
+  <div class="section-label">01 — The Problem</div>
+  <h2>Genealogical collapse kills long windows</h2>
+  <p>
+    After enough resampling events, most θ-particles descend from a handful of ancestors. 
+    The cloud looks wide but explores nothing. With 1,024 outer particles, collapse occurs 
+    after ~3,000–4,000 ticks — and doubling to 2,048 doesn't help. The bottleneck is tree 
+    depth, not tree width.
+  </p>
+
+  <div class="stat-row">
+    <div class="stat-card red">
+      <div class="stat-value">83</div>
+      <div class="stat-label">Resampling events<br>in 12K ticks</div>
+    </div>
+    <div class="stat-card amber">
+      <div class="stat-value">~3K</div>
+      <div class="stat-label">Ticks until<br>collapse</div>
+    </div>
+    <div class="stat-card red">
+      <div class="stat-value">0%</div>
+      <div class="stat-label">Improvement from<br>doubling N<sub>θ</sub></div>
+    </div>
+  </div>
+
+  <div class="particle-demo">
+    <div class="particle-box bad">
+      <h4>Traveling Cloud</h4>
+      <div class="subtitle">Same particles for 12,000 ticks</div>
+      <div class="field traveling" id="field-travel"></div>
+    </div>
+    <div class="particle-box good">
+      <h4>Amnesiac Windows</h4>
+      <div class="subtitle">Fresh particles every 3,000 ticks</div>
+      <div class="field amnesiac" id="field-amnesia"></div>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ══════════════ THE SOLUTION ══════════════ -->
+<section class="section reveal">
+  <div class="section-label">02 — The Architecture</div>
+  <h2>Amnesiac windows, Kalman memory</h2>
+  <p>
+    Each SMC² window reinitializes from prior — full particle diversity, healthy ESS, 
+    genuine posterior exploration bounded to 3K ticks. The Kalman filter accumulates 
+    cross-window information without particles, without resampling, without genealogical 
+    trees. Just a mean and covariance, updated forever.
+  </p>
+
+  <div class="stitch-demo">
+    <div class="stitch-track">
+      <div class="stitch-window" style="flex:3; background: linear-gradient(135deg, rgba(77,166,255,0.15), rgba(77,166,255,0.05));">W₁</div>
+      <div class="stitch-connector"></div>
+      <div class="stitch-window" style="flex:3; background: linear-gradient(135deg, rgba(77,166,255,0.15), rgba(77,166,255,0.05));">W₂</div>
+      <div class="stitch-connector"></div>
+      <div class="stitch-window" style="flex:3; background: linear-gradient(135deg, rgba(77,166,255,0.15), rgba(77,166,255,0.05));">W₃</div>
+      <div class="stitch-connector"></div>
+      <div class="stitch-window" style="flex:3; background: linear-gradient(135deg, rgba(77,166,255,0.15), rgba(77,166,255,0.05));">W₄</div>
+      <div class="stitch-connector"></div>
+      <div class="stitch-window" style="flex:2; background: linear-gradient(135deg, rgba(52,211,153,0.15), rgba(52,211,153,0.05)); border: 1px solid rgba(52,211,153,0.2);">θ̂</div>
+    </div>
+    <div class="stitch-label-row">
+      <span>← each window: fresh particles, init from prior →</span>
+      <span style="color: var(--kalman-green);">kalman fused</span>
+    </div>
+  </div>
+
+  <div class="eq-box">
+    <span class="dim">State model:</span>&nbsp;&nbsp; <span class="hl">θ</span><sub>k+1</sub> = <span class="hl">θ</span><sub>k</sub> + w<sub>k</sub> &nbsp;&nbsp;&nbsp; w<sub>k</sub> ~ N(0, <span class="hl">Q</span>)<br>
+    <span class="dim">Measurement:</span>&nbsp;&nbsp; <span class="bl">z</span><sub>k</sub> = <span class="hl">θ</span><sub>k</sub> + v<sub>k</sub> &nbsp;&nbsp;&nbsp; v<sub>k</sub> ~ N(0, <span class="bl">Σ</span><sub>k</sub>)<br>
+    <br>
+    <span class="dim">Where</span> <span class="bl">z</span><sub>k</sub> = <span class="dim">SMC² posterior mean,</span> <span class="bl">Σ</span><sub>k</sub> = <span class="dim">SMC² posterior covariance</span><br>
+    <span class="dim">F = I, H = I — plain linear Kalman. Exact optimal for this model.</span>
+  </div>
+
+  <div class="timeline">
+    <div class="timeline-item">
+      <h4>Window k completes</h4>
+      <p>SMC² produces θ̂<sub>k</sub> (8D mean) and Σ<sub>k</sub> (8×8 covariance) from 3K ticks of data</p>
+    </div>
+    <div class="timeline-item">
+      <h4>Kalman predict</h4>
+      <p>P̄ = P + Q — uncertainty grows by one window's drift</p>
+    </div>
+    <div class="timeline-item">
+      <h4>Kalman update</h4>
+      <p>K = P̄(P̄ + Σ<sub>k</sub>)⁻¹ — if window reports tight Σ, trust it more. Wide Σ, mostly ignore.</p>
+    </div>
+    <div class="timeline-item">
+      <h4>Push to BPF</h4>
+      <p>Filtered θ̂ → production particle filter. RAW mu_base, no eval_curve.</p>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ══════════════ WHY IT WORKS ══════════════ -->
+<section class="section reveal">
+  <div class="section-label">03 — Why It Works</div>
+  <h2>Bounded depletion, unbounded memory</h2>
+  <p>
+    Particle depletion is exponential — it's a race against time that particles always lose. 
+    The Kalman filter sidesteps this entirely. It has no particles, no resampling, no 
+    genealogical tree. Information capacity is bounded only by numerical precision.
+  </p>
+
+  <table class="results-table">
+    <thead>
+      <tr>
+        <th>Property</th>
+        <th>Traveling Cloud</th>
+        <th>Amnesiac + Kalman</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Depletion window</td>
+        <td>Full run (50K+ ticks)</td>
+        <td style="color: var(--kalman-green);">3K ticks max</td>
+      </tr>
+      <tr>
+        <td>Cross-window memory</td>
+        <td>Particle ancestors (degrades)</td>
+        <td style="color: var(--kalman-green);">Kalman state (exact)</td>
+      </tr>
+      <tr>
+        <td>Per-window diversity</td>
+        <td style="color: var(--danger-red);">Decreasing</td>
+        <td style="color: var(--kalman-green);">Full prior each time</td>
+      </tr>
+      <tr>
+        <td>Outlier robustness</td>
+        <td>One bad window poisons the cloud</td>
+        <td style="color: var(--kalman-green);">Kalman gain ignores wide Σ</td>
+      </tr>
+      <tr>
+        <td>Compute per window</td>
+        <td>Same</td>
+        <td>Same + 8×8 matrix ops (~0μs)</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<div class="divider"></div>
+
+<!-- ══════════════ RESULTS ══════════════ -->
+<section class="section reveal">
+  <div class="section-label">04 — Empirical Results</div>
+  <h2>2×2 factor analysis confirms the design</h2>
+  <p>
+    Four modes isolating two independent factors: traveling vs amnesiac cloud, 
+    raw vs Kalman push. Multi-regime DGP with learning phase, 30K-tick calm, then 
+    scored crisis. Curve shape params fixed to truth, RAW push everywhere.
+  </p>
+
+  <div class="bar-chart" id="bar-chart">
+    <div class="bar-row">
+      <div class="bar-label">AMNESIA + KALMAN</div>
+      <div class="bar-track">
+        <div class="bar-fill green" data-width="58.6%" style="width: 0;"><span>0.5701</span></div>
+      </div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-label">AMNESIA + RAW</div>
+      <div class="bar-track">
+        <div class="bar-fill blue" data-width="59.9%" style="width: 0;"><span>0.5826</span></div>
+      </div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-label">TRAVEL + RAW</div>
+      <div class="bar-track">
+        <div class="bar-fill amber" data-width="87.6%" style="width: 0;"><span>0.8512</span></div>
+      </div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-label">TRAVEL + KALMAN</div>
+      <div class="bar-track">
+        <div class="bar-fill red" data-width="100%" style="width: 0;"><span>0.9719</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="stat-row">
+    <div class="stat-card green">
+      <div class="stat-value">41%</div>
+      <div class="stat-label">Amnesia+Kalman<br>vs Travel+Kalman</div>
+    </div>
+    <div class="stat-card green">
+      <div class="stat-value">48%</div>
+      <div class="stat-label">Improvement from<br>fixing obs transform</div>
+    </div>
+    <div class="stat-card blue">
+      <div class="stat-value">2.1%</div>
+      <div class="stat-label">Kalman benefit<br>on amnesiac cloud</div>
+    </div>
+    <div class="stat-card red">
+      <div class="stat-value">-14%</div>
+      <div class="stat-label">Kalman harm<br>on traveling cloud</div>
+    </div>
+  </div>
+
+  <p>
+    The interaction is the whole story. Kalman does nothing for a traveling cloud — it 
+    already has memory, Kalman just adds lag. But Kalman is transformative for amnesiac 
+    clouds — it's the only thing providing cross-window continuity. Traveling + Kalman 
+    is the worst mode: smoothing a degenerating cloud's noise with delay.
+  </p>
+</section>
+
+<div class="divider"></div>
+
+<!-- ══════════════ BUGS ══════════════ -->
+<section class="section reveal">
+  <div class="section-label">05 — Bugs That Masked the Design</div>
+  <h2>Two one-line fixes, months of confusion</h2>
+  <p>
+    Previous tests showed the Kalman architecture underperforming. The design was correct — 
+    two bugs in the test harness made it look broken.
+  </p>
+
+  <div class="particle-demo">
+    <div class="particle-box" style="border-color: rgba(245,158,11,0.3);">
+      <h4 style="color: var(--warn-amber);">Bug 1: Observation Transform</h4>
+      <div class="subtitle">SMC²/RBPF uses OCSN parameterization: y = log(r²)</div>
+      <p style="font-size:0.85rem; color: var(--text-secondary); margin-top: 0.5rem;">
+        Test fed raw returns (y ≈ 0.1) instead of log-squared (y ≈ −4.6). 
+        SMC² shifted mu_base by ~3 units to compensate.
+      </p>
+      <div style="margin-top:0.8rem; font-family:'JetBrains Mono',monospace; font-size:0.75rem;">
+        <span style="color:var(--danger-red)">✗</span> <code>smc2_update_batch(smc2, raw_returns, N)</code><br>
+        <span style="color:var(--kalman-green)">✓</span> <code>smc2_update_batch(smc2, log_returns_sq, N)</code>
+      </div>
+    </div>
+    <div class="particle-box" style="border-color: rgba(245,158,11,0.3);">
+      <h4 style="color: var(--warn-amber);">Bug 2: DGP Model Mismatch</h4>
+      <div class="subtitle">RBPF uses z-dependent θ(z) mean-reversion, not constant ρ</div>
+      <p style="font-size:0.85rem; color: var(--text-secondary); margin-top: 0.5rem;">
+        DGP used h = ρ·h + (1-ρ)·μ(z) but RBPF uses h = (1-θ(z))·h + θ(z)·μ(z). 
+        At high z, RBPF mean-reverts 5× faster — mu_base shifted ~1.5 units.
+      </p>
+      <div style="margin-top:0.8rem; font-family:'JetBrains Mono',monospace; font-size:0.75rem;">
+        <span style="color:var(--danger-red)">✗</span> <code>h = mu_z + rho * (h - mu_z) + ...</code><br>
+        <span style="color:var(--kalman-green)">✓</span> <code>h = phi*h + theta_z*mu_z + ...</code>
+      </div>
+    </div>
+  </div>
+</section>
+
+<div class="divider"></div>
+
+<!-- ══════════════ PRODUCTION ══════════════ -->
+<section class="section reveal">
+  <div class="section-label">06 — Production Stack</div>
+  <h2>The final architecture</h2>
+
+  <div class="eq-box" style="border-color: rgba(77,166,255,0.15); background: rgba(77,166,255,0.03);">
+    <span class="bl">SMC²</span>(1024 × 512) → amnesiac windows, W=3000, stride=2000<br>
+    &nbsp;&nbsp;↓ &nbsp;θ̂<sub>k</sub>, Σ<sub>k</sub> every 2 seconds<br>
+    <span class="hl">Kalman</span>(8×8) → fuse, smooth, accumulate<br>
+    &nbsp;&nbsp;↓ &nbsp;filtered θ̂<br>
+    <span style="color:var(--rbpf-pink)">BPF</span>(5K–30K particles) → per-tick vol estimation<br>
+    <br>
+    <span class="dim">Latency budget: ~1s compute per window on Linux</span><br>
+    <span class="dim">Stride 2000 @ 1ms ticks = 2s real time between updates</span><br>
+    <span class="dim">Margin: 100% — production viable</span>
+  </div>
+</section>
+
+<!-- ══════════════ FOOTER ══════════════ -->
+<div class="divider"></div>
+<div class="footer">
+  SMC² + RBPF + CPMMH · Kalman Stitching Architecture Note · 2025
+</div>
+
+<!-- ══════════════ SCRIPTS ══════════════ -->
+<script>
+// Particle generation
+function populateField(id, count) {
+  const field = document.getElementById(id);
+  if (!field) return;
+  for (let i = 0; i < count; i++) {
+    const p = document.createElement('div');
+    p.className = 'particle';
+    p.style.left = (Math.random() * 94 + 3) + '%';
+    p.style.top = (Math.random() * 85 + 7) + '%';
+    p.style.animationDelay = (Math.random() * 3) + 's';
+    p.style.animationDuration = (3 + Math.random() * 3) + 's';
+    field.appendChild(p);
+  }
+}
+
+populateField('field-travel', 80);
+populateField('field-amnesia', 80);
+
+// Scroll reveal
+const reveals = document.querySelectorAll('.reveal');
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(e => {
+    if (e.isIntersecting) {
+      e.target.classList.add('visible');
+    }
+  });
+}, { threshold: 0.15 });
+
+reveals.forEach(el => observer.observe(el));
+
+// Bar chart animation
+const barObserver = new IntersectionObserver((entries) => {
+  entries.forEach(e => {
+    if (e.isIntersecting) {
+      const fills = e.target.querySelectorAll('.bar-fill');
+      fills.forEach((fill, i) => {
+        setTimeout(() => {
+          fill.style.width = fill.dataset.width;
+        }, i * 200);
+      });
+      barObserver.unobserve(e.target);
+    }
+  });
+}, { threshold: 0.3 });
+
+const barChart = document.getElementById('bar-chart');
+if (barChart) barObserver.observe(barChart);
+</script>
+
+</body>
+</html>
