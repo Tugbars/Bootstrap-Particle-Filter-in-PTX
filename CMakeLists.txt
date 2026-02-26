@@ -572,6 +572,74 @@ if(TARGET ptx_cubin_full)
 endif()
 
 # ==============================================================================
+# Target: test_bidirectional_phased (Bidirectional valve memory preservation test)
+#
+# Crisis 1 (teach) → Long calm (degenerate) → Crisis 2 (score).
+# Compares: Bidirectional valve vs One-way ratchet vs Always-Phase-1 baseline.
+# Tests whether the valve preserves learned ceilings through calm periods.
+# ==============================================================================
+
+add_executable(test_bidirectional_phased smc2/test_bidirectional_phased.cu)
+
+target_link_libraries(test_bidirectional_phased PRIVATE
+    gpu_bpf_ptx_full
+    smc2_rbpf
+    CUDA::cuda_driver
+    CUDA::cudart
+    CUDA::curand
+)
+
+target_include_directories(test_bidirectional_phased PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/smc2
+    ${CMAKE_CURRENT_SOURCE_DIR}/gpu_bpf
+)
+
+set_target_properties(test_bidirectional_phased PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+if(TARGET ptx_cubin_full)
+    add_dependencies(test_bidirectional_phased ptx_cubin_full)
+endif()
+
+
+# ==============================================================================
+# Target: test_kalman_fair (2×2 factor analysis: traveling vs amnesiac × raw vs Kalman)
+#
+# Four modes isolating two independent factors:
+#   TRAVEL_RAW     — cloud carries forward, push mu_base directly
+#   TRAVEL_KALMAN  — cloud carries forward, Kalman smooths, push kalman mu_base
+#   AMNESIA_KALMAN — reinit each window, Kalman stitches, push kalman mu_base
+#   AMNESIA_RAW    — reinit each window, push raw mu_base (no memory baseline)
+# All pushes are RAW mu_base — NO eval_curve anywhere.
+# ==============================================================================
+
+add_executable(test_kalman_fair smc2/test_kalman_fair.cu)
+
+target_link_libraries(test_kalman_fair PRIVATE
+    gpu_bpf_ptx_full
+    smc2_rbpf
+    CUDA::cuda_driver
+    CUDA::cudart
+    CUDA::curand
+)
+
+target_include_directories(test_kalman_fair PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/smc2
+    ${CMAKE_CURRENT_SOURCE_DIR}/gpu_bpf
+)
+
+set_target_properties(test_kalman_fair PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+if(TARGET ptx_cubin_full)
+    add_dependencies(test_kalman_fair ptx_cubin_full)
+endif()
+
+# ==============================================================================
 # Print summary
 # ==============================================================================
 

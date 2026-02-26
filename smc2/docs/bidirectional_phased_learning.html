@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bidirectional Phased Learning</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #0a0e17;
+    color: #c8cdd8;
+    font-family: 'IBM Plex Sans', sans-serif;
+    padding: 40px 32px;
+    min-height: 100vh;
+  }
+
+  h1 {
+    font-size: 22px;
+    font-weight: 600;
+    color: #e8ecf4;
+    margin-bottom: 6px;
+    letter-spacing: -0.3px;
+  }
+
+  .subtitle {
+    font-size: 13px;
+    color: #6b7280;
+    margin-bottom: 40px;
+    font-weight: 300;
+  }
+
+  .main-diagram {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    max-width: 880px;
+    margin: 0 auto;
+  }
+
+  /* ── Z-axis visualization ── */
+  .z-axis-section {
+    position: relative;
+    height: 120px;
+    margin-bottom: 32px;
+    border-radius: 8px;
+    overflow: hidden;
+  }
+
+  .z-gradient {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(to right,
+      #0d1929 0%,
+      #12254a 20%,
+      #1a3a6e 40%,
+      #7c4a1a 55%,
+      #b84c1c 70%,
+      #d43520 85%,
+      #e82818 100%
+    );
+    opacity: 0.35;
+    border-radius: 8px;
+  }
+
+  .z-gradient-border {
+    position: absolute;
+    inset: 0;
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 8px;
+  }
+
+  .z-labels {
+    position: absolute;
+    bottom: 8px;
+    left: 0;
+    right: 0;
+    display: flex;
+    justify-content: space-between;
+    padding: 0 16px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: #8892a4;
+  }
+
+  .z-title {
+    position: absolute;
+    top: 10px;
+    left: 16px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: #5a6577;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+  }
+
+  .z-markers {
+    position: absolute;
+    top: 38px;
+    left: 0;
+    right: 0;
+    height: 50px;
+  }
+
+  .z-marker {
+    position: absolute;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    transform: translateX(-50%);
+  }
+
+  .z-marker-line {
+    width: 1px;
+    height: 28px;
+    background: rgba(255,255,255,0.15);
+  }
+
+  .z-marker-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    margin-top: 3px;
+  }
+
+  .z-marker-label {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+    margin-top: 4px;
+    white-space: nowrap;
+  }
+
+  /* ── Phase rows ── */
+  .phase-row {
+    display: grid;
+    grid-template-columns: 160px 1fr;
+    gap: 0;
+    margin-bottom: 2px;
+    min-height: 80px;
+  }
+
+  .phase-label {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    padding: 12px 16px;
+    background: rgba(255,255,255,0.02);
+    border-right: 1px solid rgba(255,255,255,0.06);
+  }
+
+  .phase-name {
+    font-weight: 600;
+    font-size: 14px;
+    color: #e0e4ec;
+    margin-bottom: 2px;
+  }
+
+  .phase-desc {
+    font-size: 11px;
+    color: #5e6878;
+    line-height: 1.4;
+  }
+
+  .phase-params {
+    display: flex;
+    align-items: center;
+    padding: 12px 20px;
+    gap: 10px;
+    background: rgba(255,255,255,0.015);
+    flex-wrap: wrap;
+  }
+
+  .param-chip {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 10px;
+    border-radius: 4px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 12px;
+    font-weight: 500;
+    transition: all 0.2s;
+  }
+
+  .param-free {
+    background: rgba(52, 211, 153, 0.12);
+    color: #34d399;
+    border: 1px solid rgba(52, 211, 153, 0.2);
+  }
+
+  .param-locked {
+    background: rgba(107, 114, 128, 0.1);
+    color: #4b5563;
+    border: 1px solid rgba(107, 114, 128, 0.15);
+    text-decoration: line-through;
+    text-decoration-color: rgba(107, 114, 128, 0.4);
+  }
+
+  .param-locked-saved {
+    background: rgba(251, 191, 36, 0.1);
+    color: #a88420;
+    border: 1px solid rgba(251, 191, 36, 0.15);
+  }
+
+  .lock-icon {
+    font-size: 9px;
+    opacity: 0.7;
+  }
+
+  /* ── Transition arrows ── */
+  .transition-row {
+    display: grid;
+    grid-template-columns: 160px 1fr;
+    gap: 0;
+    min-height: 52px;
+  }
+
+  .transition-spacer {
+    background: rgba(255,255,255,0.01);
+    border-right: 1px solid rgba(255,255,255,0.06);
+  }
+
+  .transition-content {
+    display: flex;
+    align-items: center;
+    padding: 6px 20px;
+    gap: 20px;
+  }
+
+  .transition-arrow {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+  }
+
+  .arrow-down, .arrow-up {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .arrow-down .arrow-shaft,
+  .arrow-up .arrow-shaft {
+    width: 1.5px;
+    height: 14px;
+  }
+
+  .arrow-down .arrow-shaft { background: #34d399; }
+  .arrow-up .arrow-shaft { background: #f59e0b; }
+
+  .arrow-down .arrow-head { color: #34d399; font-size: 10px; line-height: 1; }
+  .arrow-up .arrow-head { color: #f59e0b; font-size: 10px; line-height: 1; }
+
+  .transition-trigger {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    padding: 4px 10px;
+    border-radius: 3px;
+    line-height: 1.5;
+  }
+
+  .trigger-unlock {
+    color: #34d399;
+    background: rgba(52, 211, 153, 0.06);
+    border: 1px solid rgba(52, 211, 153, 0.1);
+  }
+
+  .trigger-lock {
+    color: #f59e0b;
+    background: rgba(245, 158, 11, 0.06);
+    border: 1px solid rgba(245, 158, 11, 0.1);
+  }
+
+  .trigger-sep {
+    color: #3b4252;
+    font-size: 13px;
+  }
+
+  /* ── Legend ── */
+  .legend {
+    display: flex;
+    gap: 24px;
+    margin-top: 36px;
+    padding: 14px 18px;
+    background: rgba(255,255,255,0.02);
+    border: 1px solid rgba(255,255,255,0.05);
+    border-radius: 6px;
+    flex-wrap: wrap;
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+  }
+
+  .legend-chip {
+    width: 12px;
+    height: 12px;
+    border-radius: 2px;
+  }
+
+  /* ── Timeline section ── */
+  .timeline-section {
+    margin-top: 44px;
+  }
+
+  .timeline-title {
+    font-size: 15px;
+    font-weight: 600;
+    color: #e0e4ec;
+    margin-bottom: 20px;
+  }
+
+  .timeline {
+    position: relative;
+    padding-left: 28px;
+  }
+
+  .timeline::before {
+    content: '';
+    position: absolute;
+    left: 6px;
+    top: 4px;
+    bottom: 4px;
+    width: 1.5px;
+    background: rgba(255,255,255,0.08);
+  }
+
+  .tl-event {
+    position: relative;
+    margin-bottom: 20px;
+    padding-left: 16px;
+  }
+
+  .tl-dot {
+    position: absolute;
+    left: -25px;
+    top: 5px;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+  }
+
+  .tl-dot-calm { background: #3b82f6; box-shadow: 0 0 8px rgba(59,130,246,0.3); }
+  .tl-dot-stress { background: #f59e0b; box-shadow: 0 0 8px rgba(245,158,11,0.3); }
+  .tl-dot-crisis { background: #ef4444; box-shadow: 0 0 8px rgba(239,68,68,0.3); }
+  .tl-dot-lock { background: #f59e0b; border: 2px solid #0a0e17; box-shadow: 0 0 8px rgba(245,158,11,0.3); }
+
+  .tl-header {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin-bottom: 3px;
+  }
+
+  .tl-phase {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 3px;
+  }
+
+  .tl-phase-1 { background: rgba(59,130,246,0.15); color: #60a5fa; }
+  .tl-phase-2 { background: rgba(245,158,11,0.15); color: #fbbf24; }
+  .tl-phase-3 { background: rgba(239,68,68,0.15); color: #f87171; }
+
+  .tl-label {
+    font-size: 13px;
+    font-weight: 500;
+    color: #d1d5e0;
+  }
+
+  .tl-detail {
+    font-size: 12px;
+    color: #6b7280;
+    line-height: 1.5;
+  }
+
+  .tl-params {
+    display: flex;
+    gap: 6px;
+    margin-top: 5px;
+    flex-wrap: wrap;
+  }
+
+  .tl-param {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 3px;
+  }
+
+  .tl-free { background: rgba(52,211,153,0.1); color: #34d399; }
+  .tl-saved { background: rgba(251,191,36,0.1); color: #a88420; }
+</style>
+</head>
+<body>
+
+<h1>Bidirectional Phased Learning</h1>
+<p class="subtitle">z-range within SMC² window controls which params the cloud explores</p>
+
+<div class="main-diagram">
+
+  <!-- Z-axis -->
+  <div class="z-axis-section">
+    <div class="z-gradient"></div>
+    <div class="z-gradient-border"></div>
+    <div class="z-title">Stress Level z</div>
+    <div class="z-markers">
+      <div class="z-marker" style="left: 3%">
+        <div class="z-marker-line"></div>
+        <div class="z-marker-dot" style="background: #3b82f6;"></div>
+        <div class="z-marker-label" style="color: #60a5fa;">z ≈ 0</div>
+      </div>
+      <div class="z-marker" style="left: 17%">
+        <div class="z-marker-line"></div>
+        <div class="z-marker-dot" style="background: #6366f1;"></div>
+        <div class="z-marker-label" style="color: #818cf8;">z = 0.5</div>
+      </div>
+      <div class="z-marker" style="left: 50%">
+        <div class="z-marker-line"></div>
+        <div class="z-marker-dot" style="background: #d97706;"></div>
+        <div class="z-marker-label" style="color: #fbbf24;">z = 1.5</div>
+      </div>
+      <div class="z-marker" style="left: 83%">
+        <div class="z-marker-line"></div>
+        <div class="z-marker-dot" style="background: #dc2626;"></div>
+        <div class="z-marker-label" style="color: #f87171;">z = 2.5</div>
+      </div>
+      <div class="z-marker" style="left: 97%">
+        <div class="z-marker-line"></div>
+        <div class="z-marker-dot" style="background: #e82818;"></div>
+        <div class="z-marker-label" style="color: #fca5a5;">z = 3.0</div>
+      </div>
+    </div>
+    <div class="z-labels">
+      <span>CALM — μ(z) ≈ μ_base</span>
+      <span>TRANSITION — curve shape matters</span>
+      <span>CRISIS — μ(z) ≈ μ_base + μ_scale</span>
+    </div>
+  </div>
+
+  <!-- Phase 1 -->
+  <div class="phase-row">
+    <div class="phase-label">
+      <div class="phase-name">Phase 1</div>
+      <div class="phase-desc">Floors only<br>4 free params</div>
+    </div>
+    <div class="phase-params">
+      <div class="param-chip param-free">ρ</div>
+      <div class="param-chip param-free">σ_total</div>
+      <div class="param-chip param-free">r_split</div>
+      <div class="param-chip param-free">μ_base</div>
+      <div class="param-chip param-locked"><span class="lock-icon">🔒</span> μ_scale</div>
+      <div class="param-chip param-locked"><span class="lock-icon">🔒</span> μ_rate</div>
+      <div class="param-chip param-locked"><span class="lock-icon">🔒</span> σ_scale</div>
+      <div class="param-chip param-locked"><span class="lock-icon">🔒</span> σ_rate</div>
+    </div>
+  </div>
+
+  <!-- Transition 1↔2 -->
+  <div class="transition-row">
+    <div class="transition-spacer"></div>
+    <div class="transition-content">
+      <div class="transition-arrow">
+        <div class="arrow-down">
+          <div class="arrow-shaft"></div>
+          <div class="arrow-head">▼</div>
+        </div>
+      </div>
+      <div class="transition-trigger trigger-unlock">z_max &gt; 2.5 for N windows → UNLOCK ceilings</div>
+      <span class="trigger-sep">│</span>
+      <div class="transition-arrow">
+        <div class="arrow-up">
+          <div class="arrow-head">▲</div>
+          <div class="arrow-shaft"></div>
+        </div>
+      </div>
+      <div class="transition-trigger trigger-lock">z_max &lt; 2.5 for N windows → LOCK ceilings to posterior mean</div>
+    </div>
+  </div>
+
+  <!-- Phase 2 -->
+  <div class="phase-row">
+    <div class="phase-label">
+      <div class="phase-name">Phase 2</div>
+      <div class="phase-desc">+ Ceilings<br>6 free params</div>
+    </div>
+    <div class="phase-params">
+      <div class="param-chip param-free">ρ</div>
+      <div class="param-chip param-free">σ_total</div>
+      <div class="param-chip param-free">r_split</div>
+      <div class="param-chip param-free">μ_base</div>
+      <div class="param-chip param-free">μ_scale</div>
+      <div class="param-chip param-free">σ_scale</div>
+      <div class="param-chip param-locked"><span class="lock-icon">🔒</span> μ_rate</div>
+      <div class="param-chip param-locked"><span class="lock-icon">🔒</span> σ_rate</div>
+    </div>
+  </div>
+
+  <!-- Transition 2↔3 -->
+  <div class="transition-row">
+    <div class="transition-spacer"></div>
+    <div class="transition-content">
+      <div class="transition-arrow">
+        <div class="arrow-down">
+          <div class="arrow-shaft"></div>
+          <div class="arrow-head">▼</div>
+        </div>
+      </div>
+      <div class="transition-trigger trigger-unlock">z_range spans [low, high] for N cycles → UNLOCK rates</div>
+      <span class="trigger-sep">│</span>
+      <div class="transition-arrow">
+        <div class="arrow-up">
+          <div class="arrow-head">▲</div>
+          <div class="arrow-shaft"></div>
+        </div>
+      </div>
+      <div class="transition-trigger trigger-lock">z_range narrows for N windows → LOCK rates to posterior mean</div>
+    </div>
+  </div>
+
+  <!-- Phase 3 -->
+  <div class="phase-row">
+    <div class="phase-label">
+      <div class="phase-name">Phase 3</div>
+      <div class="phase-desc">All free<br>8 params</div>
+    </div>
+    <div class="phase-params">
+      <div class="param-chip param-free">ρ</div>
+      <div class="param-chip param-free">σ_total</div>
+      <div class="param-chip param-free">r_split</div>
+      <div class="param-chip param-free">μ_base</div>
+      <div class="param-chip param-free">μ_scale</div>
+      <div class="param-chip param-free">μ_rate</div>
+      <div class="param-chip param-free">σ_scale</div>
+      <div class="param-chip param-free">σ_rate</div>
+    </div>
+  </div>
+
+  <!-- Legend -->
+  <div class="legend">
+    <div class="legend-item">
+      <div class="legend-chip" style="background: rgba(52,211,153,0.2); border: 1px solid rgba(52,211,153,0.3);"></div>
+      <span>Free — cloud explores</span>
+    </div>
+    <div class="legend-item">
+      <div class="legend-chip" style="background: rgba(107,114,128,0.15); border: 1px solid rgba(107,114,128,0.2);"></div>
+      <span>Locked — prior default</span>
+    </div>
+    <div class="legend-item">
+      <div class="legend-chip" style="background: rgba(251,191,36,0.15); border: 1px solid rgba(251,191,36,0.2);"></div>
+      <span>Locked — saved from posterior (learned value preserved)</span>
+    </div>
+  </div>
+
+  <!-- Timeline example -->
+  <div class="timeline-section">
+    <div class="timeline-title">Example: Full Market Cycle</div>
+    <div class="timeline">
+
+      <div class="tl-event">
+        <div class="tl-dot tl-dot-calm"></div>
+        <div class="tl-header">
+          <span class="tl-phase tl-phase-1">P1</span>
+          <span class="tl-label">Market opens calm, z ≈ 0</span>
+        </div>
+        <div class="tl-detail">Cloud learns ρ, σ_total, r_split, μ_base at the floor</div>
+        <div class="tl-params">
+          <span class="tl-param tl-free">ρ ✓</span>
+          <span class="tl-param tl-free">σ_total ✓</span>
+          <span class="tl-param tl-free">r_split ✓</span>
+          <span class="tl-param tl-free">μ_base ✓</span>
+        </div>
+      </div>
+
+      <div class="tl-event">
+        <div class="tl-dot tl-dot-crisis"></div>
+        <div class="tl-header">
+          <span class="tl-phase tl-phase-2">P2</span>
+          <span class="tl-label">Crisis hits — z > 2.5 sustained</span>
+        </div>
+        <div class="tl-detail">Valve opens → unlock μ_scale, σ_scale. Cloud identifies ceilings.</div>
+        <div class="tl-params">
+          <span class="tl-param tl-free">μ_scale ✓</span>
+          <span class="tl-param tl-free">σ_scale ✓</span>
+        </div>
+      </div>
+
+      <div class="tl-event">
+        <div class="tl-dot tl-dot-stress"></div>
+        <div class="tl-header">
+          <span class="tl-phase tl-phase-3">P3</span>
+          <span class="tl-label">Full cycle observed — z spans [low, high]</span>
+        </div>
+        <div class="tl-detail">Valve opens further → unlock μ_rate, σ_rate. Full curve identifiable.</div>
+        <div class="tl-params">
+          <span class="tl-param tl-free">μ_rate ✓</span>
+          <span class="tl-param tl-free">σ_rate ✓</span>
+        </div>
+      </div>
+
+      <div class="tl-event">
+        <div class="tl-dot tl-dot-calm"></div>
+        <div class="tl-header">
+          <span class="tl-phase tl-phase-2">P3 → P2</span>
+          <span class="tl-label">Markets calm down — z narrows</span>
+        </div>
+        <div class="tl-detail">Valve closes → lock μ_rate, σ_rate to learned values. Diversity preserved.</div>
+        <div class="tl-params">
+          <span class="tl-param tl-saved">μ_rate = 0.48 saved</span>
+          <span class="tl-param tl-saved">σ_rate = 0.31 saved</span>
+        </div>
+      </div>
+
+      <div class="tl-event">
+        <div class="tl-dot tl-dot-calm"></div>
+        <div class="tl-header">
+          <span class="tl-phase tl-phase-1">P2 → P1</span>
+          <span class="tl-label">Long calm — z stays near 0</span>
+        </div>
+        <div class="tl-detail">Valve closes further → lock μ_scale, σ_scale to learned values. Cloud focuses on floors.</div>
+        <div class="tl-params">
+          <span class="tl-param tl-saved">μ_scale = 2.95 saved</span>
+          <span class="tl-param tl-saved">σ_scale = 0.52 saved</span>
+          <span class="tl-param tl-saved">μ_rate = 0.48 saved</span>
+          <span class="tl-param tl-saved">σ_rate = 0.31 saved</span>
+        </div>
+      </div>
+
+      <div class="tl-event">
+        <div class="tl-dot tl-dot-crisis"></div>
+        <div class="tl-header">
+          <span class="tl-phase tl-phase-2">P1 → P2</span>
+          <span class="tl-label">Next crisis — z spikes again</span>
+        </div>
+        <div class="tl-detail">Valve opens → unlock ceilings. Starting from saved values, not prior. Cloud adapts fast.</div>
+        <div class="tl-params">
+          <span class="tl-param tl-free">μ_scale starts at 2.95</span>
+          <span class="tl-param tl-free">σ_scale starts at 0.52</span>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+</div>
+
+</body>
+</html>
