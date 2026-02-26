@@ -59,9 +59,10 @@ static inline float prng_randn(PRNG* p) {
 /* ── DGP ─────────────────────────────────────────────────────────────────── */
 
 struct TrueDGP {
-    float rho, sigma_z;
-    float mu_base, mu_scale, mu_rate;
-    float sigma_h_base, sigma_h_scale, sigma_h_rate;
+    float rho, sigma_z;                               /* z̃ dynamics only */
+    float mu_base, mu_scale, mu_rate;                  /* μ(z) curve */
+    float sigma_h_base, sigma_h_scale, sigma_h_rate;   /* σ_h(z) curve */
+    float theta_base, theta_scale, theta_rate;          /* θ(z) mean-reversion speed */
 };
 
 static inline float sat_exp(float base, float scale, float rate, float z) {
@@ -73,6 +74,11 @@ static TrueDGP default_dgp() {
     d.rho = 0.98f;  d.sigma_z = 0.15f;
     d.mu_base = -4.5f;  d.mu_scale = 3.0f;  d.mu_rate = 0.5f;
     d.sigma_h_base = 0.10f;  d.sigma_h_scale = 0.50f;  d.sigma_h_rate = 0.30f;
+    /* θ(z) curve — matches smc2->theta_curve for model consistency.
+     * h dynamics: h = (1-θ(z))·h + θ(z)·μ(z) + σ_h(z)·ε
+     * At z=0: θ=0.02 → φ=0.98 (slow mean-reversion)
+     * At z=3: θ≈0.10 → φ=0.90 (faster under stress) */
+    d.theta_base = 0.02f;  d.theta_scale = 0.08f;  d.theta_rate = 1.5f;
     return d;
 }
 
@@ -109,12 +115,21 @@ static GeneratedData generate_data(const TrueDGP& dgp,
             gd.score_start = (int)gd.returns.size();
 
         for (int t = 0; t < seg.ticks; t++) {
+            /* z̃ dynamics: AR(1) with constant ρ */
             z_tilde = dgp.rho * z_tilde + dgp.sigma_z * prng_randn(rng)
                       + seg.z_bias * (1.0f - dgp.rho);
             float z = 1.5f * (1.0f + tanhf(z_tilde));
+
+            /* Curves evaluated at z */
             float mu_z    = sat_exp(dgp.mu_base, dgp.mu_scale, dgp.mu_rate, z);
             float sigma_h = sat_exp(dgp.sigma_h_base, dgp.sigma_h_scale, dgp.sigma_h_rate, z);
-            h = mu_z + dgp.rho * (h - mu_z) + sigma_h * prng_randn(rng);
+            float theta_z = sat_exp(dgp.theta_base, dgp.theta_scale, dgp.theta_rate, z);
+
+            /* h dynamics: matches RBPF inner model exactly
+             * h = (1-θ(z))·h + θ(z)·μ(z) + σ_h(z)·ε */
+            float phi = 1.0f - theta_z;
+            h = phi * h + theta_z * mu_z + sigma_h * prng_randn(rng);
+
             float y = expf(h * 0.5f) * prng_randn(rng);
             gd.returns.push_back(y);
             gd.true_h.push_back(h);
@@ -270,6 +285,11 @@ static RunResult run_mode(
     smc2->prior.sigma_scale_std  = 0.3f;
     smc2->prior.sigma_rate_mean  = dgp.sigma_h_rate;
     smc2->prior.sigma_rate_std   = 0.2f;
+
+    /* θ(z) curve must match DGP exactly */
+    smc2->theta_curve.base  = dgp.theta_base;
+    smc2->theta_curve.scale = dgp.theta_scale;
+    smc2->theta_curve.rate  = dgp.theta_rate;
 
     /* Fix curve shape params — same as previous tests */
     {
