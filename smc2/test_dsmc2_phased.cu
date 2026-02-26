@@ -4,16 +4,16 @@
  *
  * Generates a ~60K tick multi-regime DGP that exercises all 3 phases:
  *
- *   Segment 0: Calm warmup              (5000 ticks)  — Phase 1 learns floors
+ *   Segment 0: Calm warmup              (5000 ticks)  — Phase 1, low z
  *   Segment 1: Moderate stress           (3000 ticks)  — z rises
  *   Segment 2: Recovery                  (4000 ticks)  — z falls back
- *   Segment 3: FIRST CRISIS              (3000 ticks)  — z spikes, Phase 2 trigger
- *   Segment 4: Recovery                  (5000 ticks)  — ceilings being learned
- *   Segment 5: Calm plateau              (5000 ticks)  — Phase 2 converges
- *   Segment 6: Spike gauntlet            (2000 ticks)  — rapid vol spikes
+ *   Segment 3: FIRST CRISIS              (3000 ticks)  — z spikes, Phase 2→3
+ *   Segment 4: Deep calm 1               (5000 ticks)  — valve should lock back
+ *   Segment 5: Calm plateau              (5000 ticks)  — valve stays locked
+ *   Segment 6: Spike gauntlet            (2000 ticks)  — rapid vol spikes, re-unlock
  *   Segment 7: SECOND CRISIS (deeper)    (4000 ticks)  — tests ceiling at extremes
- *   Segment 8: Slow recovery             (6000 ticks)  — full transition observed
- *   Segment 9: Calm                      (5000 ticks)  — Phase 3 trigger possible
+ *   Segment 8: Post-crisis calm          (6000 ticks)  — valve locks again
+ *   Segment 9: Dead calm                 (5000 ticks)  — VIX-at-12 territory
  *   Segment 10: Crypto chaos             (4000 ticks)  — t-distributed shocks
  *   Segment 11: Final calm               (5000 ticks)  — parameter accuracy check
  *
@@ -456,18 +456,18 @@ int main(int argc, char** argv) {
     /*                                                                    */
     std::vector<Segment> segments = {
         /* name               ticks  rho   sig_z  z_bias nu_s nu_o spk  mag */
-        {"Calm warmup",        5000, -1,   -1,    0.0f,  0,   0,   0,   0  },
+        {"Calm warmup",       10000, -1,    0.08f,-0.5f,  0,   0,   0,   0  },
         {"Moderate stress",    3000, -1,   -1,    1.0f,  0,   0,   0,   0  },
         {"Recovery 1",         4000, -1,   -1,    0.0f,  0,   0,   0,   0  },
         {"CRISIS 1",           3000, -1,    0.25f, 2.5f, 0,   0,   2,   1.5f},
-        {"Recovery 2",         5000, -1,   -1,    0.0f,  0,   0,   0,   0  },
-        {"Calm plateau",       5000, -1,   -1,   -0.2f,  0,   0,   0,   0  },
+        {"Deep calm 1",       10000, -1,    0.06f,-1.5f,  0,   0,   0,   0  },
+        {"Calm plateau",       8000, -1,    0.06f,-1.0f,  0,   0,   0,   0  },
         {"Spike gauntlet",     2000, -1,    0.20f, 0.5f, 0,   0,   8,   2.0f},
         {"CRISIS 2 (deep)",    4000, -1,    0.30f, 3.0f, 0,   0,   3,   1.0f},
-        {"Slow recovery",      6000, -1,   -1,    0.0f,  0,   0,   0,   0  },
-        {"Calm (post-cycle)",  5000, -1,   -1,    0.0f,  0,   0,   0,   0  },
+        {"Post-crisis calm",  10000, -1,    0.06f,-1.5f,  0,   0,   0,   0  },
+        {"Dead calm",          8000, -1,    0.04f,-2.0f,  0,   0,   0,   0  },
         {"Crypto chaos",       4000, -1,    0.25f, 1.5f, 3,   3,   5,   2.5f},
-        {"Final calm",         5000, -1,   -1,    0.0f,  0,   0,   0,   0  },
+        {"Final calm",         8000, -1,    0.06f,-1.0f,  0,   0,   0,   0  },
     };
 
     GeneratedData gd = generate_multregime(dgp, segments);

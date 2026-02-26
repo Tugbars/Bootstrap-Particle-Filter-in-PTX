@@ -90,13 +90,17 @@ typedef struct {
 /* ── Configuration ──────────────────────────────────────────────────────── */
 
 typedef struct {
-    /* ── Phase 1 ↔ 2 triggers (symmetric) ─────────────────────────────── */
-    float ceiling_z_threshold;    /**< z_max threshold for unlock/lock (def: 2.0) */
-    int   ceiling_z_sustained;    /**< Consecutive windows needed (def: 3)        */
+    /* ── Forward triggers (unlock) ────────────────────────────────────── */
+    float ceiling_z_threshold;    /**< z_max must exceed this to unlock (def: 2.0)  */
+    int   ceiling_z_sustained;    /**< Consecutive windows needed (def: 3)          */
+    float rate_z_range_threshold; /**< z_range must exceed this to unlock (def: 1.5)*/
+    int   rate_range_sustained;   /**< Consecutive windows needed (def: 3)          */
 
-    /* ── Phase 2 ↔ 3 triggers (symmetric) ─────────────────────────────── */
-    float rate_z_range_threshold; /**< z_max - z_min threshold (def: 1.5)         */
-    int   rate_range_sustained;   /**< Consecutive windows needed (def: 3)        */
+    /* ── Backward triggers (lock) ─────────────────────────────────────── */
+    float calm_z_threshold;       /**< z_max below this → calm (def: 2.5)           */
+    int   calm_z_sustained;       /**< Consecutive calm windows to lock (def: 3)    */
+    float narrow_range_threshold; /**< z_range below this → narrow (def: 2.0)       */
+    int   narrow_range_sustained; /**< Consecutive narrow windows to lock (def: 3)  */
 
     /* ── Fixed values for locked parameters ───────────────────────────── */
     /* These start as prior defaults, then get overwritten with learned    */
@@ -120,11 +124,17 @@ typedef struct {
 static inline PhasedConfig phased_default_config(void) {
     PhasedConfig c;
 
-    /* Symmetric thresholds */
-    c.ceiling_z_threshold   = 2.0f;
-    c.ceiling_z_sustained   = 3;
+    /* Forward thresholds */
+    c.ceiling_z_threshold    = 2.0f;
+    c.ceiling_z_sustained    = 3;
     c.rate_z_range_threshold = 1.5f;
-    c.rate_range_sustained  = 3;
+    c.rate_range_sustained   = 3;
+
+    /* Backward thresholds (higher = easier to trigger lock-back) */
+    c.calm_z_threshold       = 2.5f;
+    c.calm_z_sustained       = 3;
+    c.narrow_range_threshold = 2.0f;
+    c.narrow_range_sustained = 3;
 
     /* Prior defaults (used until first learning) */
     c.fixed_mu_scale       = 2.0f;   /* Moderate ceiling-floor gap */
@@ -321,22 +331,34 @@ static inline void phased_observe_z(
 
     /* ── Forward streaks (unlock triggers) ────────────────────────────── */
 
-    /* High-z streak: z_max above ceiling threshold */
+    /* High-z streak: z_max above ceiling threshold → unlock ceilings */
     if (z_max > pl->config.ceiling_z_threshold) {
         zt->high_z_streak++;
-        zt->calm_streak = 0;          /* Reset backward counter */
     } else {
         zt->high_z_streak = 0;
-        zt->calm_streak++;             /* Build backward counter */
     }
 
-    /* Wide-range streak: z_range above rate threshold */
+    /* Wide-range streak: z_range above rate threshold → unlock rates */
     if (z_range > pl->config.rate_z_range_threshold) {
         zt->wide_range_streak++;
-        zt->narrow_range_streak = 0;   /* Reset backward counter */
     } else {
         zt->wide_range_streak = 0;
-        zt->narrow_range_streak++;     /* Build backward counter */
+    }
+
+    /* ── Backward streaks (lock triggers) ─────────────────────────────── */
+
+    /* Calm streak: z_max below calm threshold → lock ceilings */
+    if (z_max < pl->config.calm_z_threshold) {
+        zt->calm_streak++;
+    } else {
+        zt->calm_streak = 0;
+    }
+
+    /* Narrow-range streak: z_range below narrow threshold → lock rates */
+    if (z_range < pl->config.narrow_range_threshold) {
+        zt->narrow_range_streak++;
+    } else {
+        zt->narrow_range_streak = 0;
     }
 
     zt->n_windows++;
@@ -393,7 +415,7 @@ static inline int phased_update(PhasedLearner* pl) {
         /* z_max < threshold for N consecutive windows (calm returned)   */
         /* Save learned ceilings before locking                          */
         else if (pl->config.enable_backward &&
-                 zt->calm_streak >= pl->config.ceiling_z_sustained) {
+                 zt->calm_streak >= pl->config.calm_z_sustained) {
             phased_save_and_lock_ceilings(pl);
             pl->phase = PHASE_1_FLOORS;
             phased_record_transition(pl, prev_phase, pl->phase);
@@ -406,7 +428,7 @@ static inline int phased_update(PhasedLearner* pl) {
         /* z-range narrows for N consecutive windows                     */
         /* Save learned rates before locking                             */
         if (pl->config.enable_backward &&
-            zt->narrow_range_streak >= pl->config.rate_range_sustained) {
+            zt->narrow_range_streak >= pl->config.narrow_range_sustained) {
             phased_save_and_lock_rates(pl);
             pl->phase = PHASE_2_CEILINGS;
             phased_record_transition(pl, prev_phase, pl->phase);
@@ -414,7 +436,7 @@ static inline int phased_update(PhasedLearner* pl) {
 
             /* Check if we should also retreat to Phase 1 immediately.   */
             /* This can happen if both range AND z_max dropped together. */
-            if (zt->calm_streak >= pl->config.ceiling_z_sustained) {
+            if (zt->calm_streak >= pl->config.calm_z_sustained) {
                 LearningPhase mid = pl->phase;
                 phased_save_and_lock_ceilings(pl);
                 pl->phase = PHASE_1_FLOORS;
@@ -498,16 +520,20 @@ static inline void phased_print_status(const PhasedLearner* pl) {
     printf("  z_ema:            %.3f\n", zt->z_ema);
 
     printf("  ── Forward (unlock) ──\n");
-    printf("    high_z_streak:    %d / %d\n",
-           zt->high_z_streak, pl->config.ceiling_z_sustained);
-    printf("    wide_range_streak:%d / %d\n",
-           zt->wide_range_streak, pl->config.rate_range_sustained);
+    printf("    high_z_streak:    %d / %d  (z_max > %.1f)\n",
+           zt->high_z_streak, pl->config.ceiling_z_sustained,
+           pl->config.ceiling_z_threshold);
+    printf("    wide_range_streak:%d / %d  (range > %.1f)\n",
+           zt->wide_range_streak, pl->config.rate_range_sustained,
+           pl->config.rate_z_range_threshold);
 
     printf("  ── Backward (lock) ──\n");
-    printf("    calm_streak:      %d / %d\n",
-           zt->calm_streak, pl->config.ceiling_z_sustained);
-    printf("    narrow_streak:    %d / %d\n",
-           zt->narrow_range_streak, pl->config.rate_range_sustained);
+    printf("    calm_streak:      %d / %d  (z_max < %.1f)\n",
+           zt->calm_streak, pl->config.calm_z_sustained,
+           pl->config.calm_z_threshold);
+    printf("    narrow_streak:    %d / %d  (range < %.1f)\n",
+           zt->narrow_range_streak, pl->config.narrow_range_sustained,
+           pl->config.narrow_range_threshold);
 
     printf("  ── Saved values ──\n");
     printf("    μ_scale:  %.4f  %s\n", pl->config.fixed_mu_scale,
