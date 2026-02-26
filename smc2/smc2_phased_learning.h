@@ -340,9 +340,17 @@ static inline void phased_observe_z(
 
 /* ── Feed z range from inner particles ──────────────────────────────────── */
 
+/* ── Feed z range from inner particles (ROBUST version) ────────────────────── */
+
 static inline void phased_observe_z_from_smc2(PhasedLearner* pl) {
     float z_mean, z_min, z_max;
-    smc2_cuda_get_z_range(pl->smc2, &z_mean, &z_min, &z_max);
+    /* Use robust version: per-θ means, then min/max of those.
+     * Raw smc2_cuda_get_z_range() takes min/max across ALL N_theta × N_inner
+     * inner particles — a single outlier at z>2.0 prevents calm_streak from
+     * ever accumulating, so the backward valve (Phase 3→2→1) never fires.
+     * The robust version computes z̄ per θ-particle first, then min/max of
+     * those 1024 means. One outlier inner particle is diluted by N_inner-1. */
+    smc2_cuda_get_z_range_robust(pl->smc2, &z_mean, &z_min, &z_max);
     phased_observe_z(pl, z_mean, z_min, z_max);
 }
 

@@ -640,6 +640,13 @@ float smc2_cuda_get_outer_ess(SMC2StateCUDA* state);
 /** @brief Internal: update adaptive proposal covariance from particle cloud */
 void smc2_update_adaptive_covariance(SMC2StateCUDA* state);
 
+/** Get z min/max/mean using per-θ means (robust to inner-particle outliers).
+ *  Used by phased learning controller instead of raw smc2_cuda_get_z_range. */
+void smc2_cuda_get_z_range_robust(SMC2StateCUDA* state,
+                                   float* z_mean_out,
+                                   float* z_min_out,
+                                   float* z_max_out);
+
 #ifdef __cplusplus
 }
 #endif

@@ -79,6 +79,9 @@ struct TrueDGP {
     float sigma_h_base;
     float sigma_h_scale;
     float sigma_h_rate;
+    float theta_base;      /* θ(z) mean-reversion speed curve */
+    float theta_scale;
+    float theta_rate;
 };
 
 static inline float sat_exp(float base, float scale, float rate, float z) {
@@ -95,6 +98,11 @@ static TrueDGP default_dgp() {
     d.sigma_h_base   = 0.10f;
     d.sigma_h_scale  = 0.50f;
     d.sigma_h_rate   = 0.30f;
+    /* θ(z) curve — must match smc2->theta_curve for model consistency.
+     * h dynamics: h = (1-θ(z))·h + θ(z)·μ(z) + σ_h(z)·ε */
+    d.theta_base     = 0.02f;
+    d.theta_scale    = 0.08f;
+    d.theta_rate     = 1.5f;
     return d;
 }
 
@@ -110,7 +118,8 @@ struct Segment {
 /* ── Generated data ──────────────────────────────────────────────────────── */
 
 struct GeneratedData {
-    std::vector<float> returns;
+    std::vector<float> returns;        /* raw r_t — for production BPF */
+    std::vector<float> log_returns_sq; /* log(r_t²) — for SMC²/RBPF (OCSN) */
     std::vector<float> true_h;
     std::vector<float> true_z;
     std::vector<int>   segment_starts;
@@ -140,19 +149,27 @@ static GeneratedData generate_data(const TrueDGP& dgp,
             gd.score_start = start;
 
         for (int t = 0; t < seg.ticks; t++) {
+            /* z̃ dynamics: AR(1) with constant ρ */
             float eps = prng_randn(rng);
             z_tilde = dgp.rho * z_tilde + dgp.sigma_z * eps
                       + seg.z_bias * (1.0f - dgp.rho);
 
             float z = 1.5f * (1.0f + tanhf(z_tilde));
 
+            /* Curves evaluated at z */
             float mu_z    = sat_exp(dgp.mu_base,      dgp.mu_scale,      dgp.mu_rate,      z);
             float sigma_h = sat_exp(dgp.sigma_h_base,  dgp.sigma_h_scale, dgp.sigma_h_rate, z);
+            float theta_z = sat_exp(dgp.theta_base,    dgp.theta_scale,   dgp.theta_rate,   z);
 
-            h = mu_z + dgp.rho * (h - mu_z) + sigma_h * prng_randn(rng);
+            /* h dynamics: matches RBPF inner model exactly
+             * h = (1-θ(z))·h + θ(z)·μ(z) + σ_h(z)·ε */
+            float phi = 1.0f - theta_z;
+            h = phi * h + theta_z * mu_z + sigma_h * prng_randn(rng);
+
             float y = expf(h * 0.5f) * prng_randn(rng);
 
             gd.returns.push_back(y);
+            gd.log_returns_sq.push_back(logf(y * y + 1e-20f));
             gd.true_h.push_back(h);
             gd.true_z.push_back(z);
         }
@@ -279,6 +296,11 @@ static RunResult run_mode(
     smc2->prior.sigma_rate_mean  = dgp.sigma_h_rate;
     smc2->prior.sigma_rate_std   = 0.2f;
 
+    /* θ(z) curve must match DGP exactly */
+    smc2->theta_curve.base  = dgp.theta_base;
+    smc2->theta_curve.scale = dgp.theta_scale;
+    smc2->theta_curve.rate  = dgp.theta_rate;
+
     /* ── Create phased controller ────────────────────────────────────── */
     PhasedConfig pc = phased_default_config();
     PhasedLearner* pl = NULL;
@@ -296,7 +318,7 @@ static RunResult run_mode(
         pl = phased_create(smc2, pc);
     }
 
-    /* ── Circular buffer for observations ────────────────────────────── */
+    /* ── Observation buffer (log(r²) for SMC²/RBPF/OCSN) ────────────── */
     smc2_cuda_init_from_prior(smc2);
 
     std::vector<float> obs_buffer;
@@ -307,10 +329,10 @@ static RunResult run_mode(
     int next_window = window_size;
 
     for (int t = 0; t < N; t++) {
-        /* 1. Accumulate observation */
-        obs_buffer.push_back(gd.returns[t]);
+        /* 1. Accumulate log(r²) for SMC² */
+        obs_buffer.push_back(gd.log_returns_sq[t]);
 
-        /* 2. Run BPF */
+        /* 2. Run BPF on raw returns */
         BpfResult r = gpu_bpf_step(bpf, gd.returns[t]);
         result.est_h[t] = r.h_mean;
 
@@ -397,7 +419,7 @@ int main(int argc, char** argv) {
     int n_inner = 512;
 
     int window_size = 3000;
-    int stride      = 2000;
+    int stride      = 1500;
 
     TrueDGP dgp = default_dgp();
 

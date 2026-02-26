@@ -2397,3 +2397,66 @@ float smc2_cuda_get_outer_ess(SMC2StateCUDA* state) {
     CUDA_CHECK(cudaMemcpy(&h_ess, state->d_ess, sizeof(float), cudaMemcpyDeviceToHost));
     return h_ess;
 }
+
+
+/*═══════════════════════════════════════════════════════════════════════════════
+ * Robust Z range — per-θ means, then min/max of those
+ *
+ * Unlike smc2_cuda_get_z_range() which takes raw min/max across all N_theta ×
+ * N_inner particles (easily corrupted by a single outlier), this computes:
+ *
+ *   1. z̄_j = (1/N_inner) Σ_i z_tilde_to_z(z̃_{i,j})   for each θ-particle j
+ *   2. z_min = min_j(z̄_j),  z_max = max_j(z̄_j)
+ *   3. z_mean = Σ_j w_j · z̄_j                          (outer-weighted)
+ *
+ * This is the correct quantity for the phased learning controller:
+ *   - z_max reflects whether ANY plausible θ-particle sees high stress
+ *   - z_min reflects whether ANY plausible θ-particle sees calm
+ *   - z_range = z_max - z_min reflects within-window diversity
+ *   - One outlier inner particle is diluted by N_inner-1 others
+ *
+ * Used by: phased_observe_z_from_smc2() in smc2_phased_learning.h
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
+void smc2_cuda_get_z_range_robust(SMC2StateCUDA* state,
+                                   float* z_mean_out,
+                                   float* z_min_out,
+                                   float* z_max_out) {
+    int N_total = state->N_theta * state->N_inner;
+    float* h_weight = (float*)malloc(state->N_theta * sizeof(float));
+    float* h_z = (float*)malloc(N_total * sizeof(float));
+
+    CUDA_CHECK(cudaMemcpy(h_weight, state->d_particles.weight,
+                          state->N_theta * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_z, state->d_particles.inner_z,
+                          N_total * sizeof(float), cudaMemcpyDeviceToHost));
+
+    float z_global = 0.0f;
+    float z_min = 1e6f, z_max = -1e6f;
+
+    for (int j = 0; j < state->N_theta; j++) {
+        /* Per-θ mean z across inner particles */
+        float z_sum = 0.0f;
+        int base = j * state->N_inner;
+        for (int i = 0; i < state->N_inner; i++) {
+            float zt = h_z[base + i];
+            float z = 1.5f * (1.0f + tanhf(zt));
+            z_sum += z;
+        }
+        float z_mean_j = z_sum / state->N_inner;
+
+        /* Min/max of θ-level means (not raw inner particles) */
+        if (z_mean_j < z_min) z_min = z_mean_j;
+        if (z_mean_j > z_max) z_max = z_mean_j;
+
+        /* Outer-weighted global mean */
+        z_global += h_weight[j] * z_mean_j;
+    }
+
+    free(h_weight);
+    free(h_z);
+
+    if (z_mean_out) *z_mean_out = z_global;
+    if (z_min_out)  *z_min_out  = z_min;
+    if (z_max_out)  *z_max_out  = z_max;
+}
