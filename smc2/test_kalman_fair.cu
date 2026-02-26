@@ -92,7 +92,9 @@ struct Segment {
 };
 
 struct GeneratedData {
-    std::vector<float> returns, true_h, true_z;
+    std::vector<float> returns;        /* raw r_t — for production BPF */
+    std::vector<float> log_returns_sq; /* log(r_t²) — for SMC²/RBPF (OCSN) */
+    std::vector<float> true_h, true_z;
     std::vector<int> segment_starts;
     std::vector<const char*> segment_names;
     std::vector<int> segment_score;
@@ -132,6 +134,7 @@ static GeneratedData generate_data(const TrueDGP& dgp,
 
             float y = expf(h * 0.5f) * prng_randn(rng);
             gd.returns.push_back(y);
+            gd.log_returns_sq.push_back(logf(y * y + 1e-20f));
             gd.true_h.push_back(h);
             gd.true_z.push_back(z);
         }
@@ -308,7 +311,7 @@ static RunResult run_mode(
     /* ── Create Kalman (only used if use_kalman) ─────────────────────── */
     KalmanState kalman = kalman_create();
 
-    /* ── Observation buffer ──────────────────────────────────────────── */
+    /* ── Observation buffer (log(r²) for SMC²/RBPF/OCSN) ────────────── */
     std::vector<float> obs_buffer;
     obs_buffer.reserve(N);
 
@@ -317,7 +320,7 @@ static RunResult run_mode(
     int next_window = window_size;
 
     for (int t = 0; t < N; t++) {
-        obs_buffer.push_back(gd.returns[t]);
+        obs_buffer.push_back(gd.log_returns_sq[t]);
 
         BpfResult r = gpu_bpf_step(bpf, gd.returns[t]);
         result.est_h[t] = r.h_mean;

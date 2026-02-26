@@ -2,11 +2,103 @@
  * @file smc2_bpf_pipeline.h
  * @brief Wiring between dBPF (per-tick vol estimator) and SMC² (parameter learner)
  *
- * Architecture:
- *   - dBPF runs every tick on stream_bpf (~microseconds per tick)
- *   - SMC² runs sliding windows on stream_smc2 (~2 seconds per window)
- *   - SMC² pushes posterior parameter estimates to dBPF at window boundaries
- *   - dBPF's Kalman tracker resets P→P0 on param push, re-adapts from new baseline
+ * Architecture (v2 — with Kalman parameter tracker):
+ *
+ *   ┌──────────────────────────────────────────────────────────────────────┐
+ *   │  Per-tick loop                                                       │
+ *   │    1. Feed y_t into ParamTracker's circular buffer                  │
+ *   │    2. Run dBPF on y_t → BpfResult (microseconds)                   │
+ *   │    3. At window boundary:                                            │
+ *   │       a. ParamTracker runs SMC² on last W observations              │
+ *   │       b. Kalman filter fuses SMC² posterior with history            │
+ *   │       c. Evaluate curves at z̄ → μ(z̄), σ_h(z̄)                     │
+ *   │       d. Push Kalman-smoothed params to dBPF                        │
+ *   └──────────────────────────────────────────────────────────────────────┘
+ *
+ * ═════════════════════════════════════════════════════════════════════════════
+ * CRITICAL: OBSERVATION TRANSFORM — TWO DIFFERENT OBSERVATION MODELS
+ * ═════════════════════════════════════════════════════════════════════════════
+ *
+ * The production BPF and the SMC²/RBPF operate on DIFFERENT observation
+ * spaces. Getting this wrong causes SMC² to learn completely wrong
+ * parameters (e.g. mu_base = -1.5 instead of -4.5).
+ *
+ *   ┌─────────────┬────────────────────┬────────────────────────────────┐
+ *   │ Component    │ Expects            │ Observation equation           │
+ *   ├─────────────┼────────────────────┼────────────────────────────────┤
+ *   │ Production  │ Raw returns r_t    │ r_t = exp(h/2) · ε_t          │
+ *   │ dBPF        │                    │ ε_t ~ N(0,1)                   │
+ *   │             │                    │ Direct particle filter on h    │
+ *   ├─────────────┼────────────────────┼────────────────────────────────┤
+ *   │ SMC²/RBPF   │ y_t = log(r_t²)   │ y_t = h_t + log(χ²(1))        │
+ *   │ (OCSN       │ (transformed)      │ ≈ h_t + OCSN 10-component mix │
+ *   │  Kalman)    │                    │ Rao-Blackwellized Kalman on h  │
+ *   └─────────────┴────────────────────┴────────────────────────────────┘
+ *
+ * The OCSN (Omori-Chib-Shephard-Nakajima 2007) mixture approximates
+ * log(χ²(1)) as a 10-component Gaussian mixture, which restores linear-
+ * Gaussian structure for the Kalman update on h. This is what makes
+ * Rao-Blackwellization possible — the key to SMC²'s clean likelihood
+ * signal for parameter learning.
+ *
+ * The production BPF works directly with raw returns because it uses
+ * a standard bootstrap particle filter with exp(h/2) observation density,
+ * no OCSN mixture needed.
+ *
+ * PIPELINE RESPONSIBILITY:
+ *   - pipeline_step() receives raw returns y_t
+ *   - It feeds raw y_t to gpu_bpf_step() — correct for BPF
+ *   - It transforms to log(y²) before feeding to param_tracker_feed()
+ *     because ParamTracker does NOT apply the transform internally —
+ *     it stores observations as-is and passes them to SMC² verbatim
+ *   - If feeding SMC² directly (bypassing ParamTracker), YOU must
+ *     apply the transform: log_y = logf(y * y + 1e-20f)
+ *
+ * ═════════════════════════════════════════════════════════════════════════════
+ * CRITICAL: DGP/MODEL CONSISTENCY — h DYNAMICS MUST MATCH RBPF
+ * ═════════════════════════════════════════════════════════════════════════════
+ *
+ * The RBPF inner filter models h with z-DEPENDENT mean-reversion speed:
+ *
+ *   θ(z) = θ_base + θ_scale · (1 - exp(-θ_rate · z))
+ *   φ(z) = 1 - θ(z)
+ *   h_{t+1} = φ(z) · h_t + θ(z) · μ(z) + σ_h(z) · ε_t
+ *
+ * At z=0 (calm):   θ≈0.02, φ≈0.98 — slow mean-reversion
+ * At z=3 (crisis):  θ≈0.10, φ≈0.90 — faster mean-reversion
+ *
+ * This is NOT the same as a constant-ρ AR(1):
+ *   h_{t+1} = ρ · h_t + (1-ρ) · μ(z) + σ_h(z) · ε_t     ← WRONG for DGP
+ *
+ * If the data-generating process uses constant ρ but the RBPF uses θ(z),
+ * SMC² will shift mu_base to compensate for the model mismatch — at high z,
+ * the RBPF mean-reverts ~5× faster than the DGP, so SMC² moves the target
+ * closer to where h already is. This causes a ~3-unit bias in mu_base.
+ *
+ * The θ(z) curve is set via smc2->theta_curve = {base, scale, rate} and
+ * is held FIXED (not learned) during SMC² — it's derived offline from
+ * φ-based sufficient statistics.
+ *
+ * When writing test DGPs, ALWAYS use the RBPF's h dynamics:
+ *   float theta_z = sat_exp(theta_base, theta_scale, theta_rate, z);
+ *   float phi = 1.0f - theta_z;
+ *   h = phi * h + theta_z * mu_z + sigma_h * noise;
+ *
+ * In production, the data IS the data — there's no DGP mismatch because
+ * the model parameters are what they are. This only matters for testing.
+ *
+ * ═════════════════════════════════════════════════════════════════════════════
+ *
+ * Key change from v1:
+ *   v1: pipeline_push_params() called smc2_cuda_get_theta_mean() directly
+ *       and pushed mu_base (the curve FLOOR) to the BPF. During crises
+ *       where z > 0, the true μ(z) is much higher than mu_base — this was
+ *       a bug that made the BPF see ~10% vol when the market was at ~47%.
+ *
+ *   v2: ParamTracker owns SMC² and the Kalman filter. It produces a
+ *       ParamSnapshot with snap.mu = eval_curve(mu_base, mu_scale, mu_rate, z̄),
+ *       which is the correct curve-evaluated, Kalman-smoothed μ at the
+ *       current stress level.
  *
  * Two modes:
  *   SYNC  — dBPF blocks at window boundary until SMC² finishes. Deterministic.
@@ -14,7 +106,7 @@
  *
  * No threads. No mutexes. Two CUDA streams handle all concurrency.
  *
- * Build: Include alongside gpu_bpf_full.cuh and smc2_rbpf_batch.cuh
+ * Build: Include alongside gpu_bpf_full.cuh and smc2_param_tracker.cuh
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 #ifndef SMC2_BPF_PIPELINE_H
