@@ -2,11 +2,9 @@
 # CMakeLists.txt — BPF PTX Project
 #
 # Directory layout:
-#   gpu_bpf/          — PTX BPF library (delegated)
-#   ptx_assembly/     — Hand-written PTX kernels and pre-compiled cubins
-#   smc2/             — SMC² RBPF parameter learner (delegated)
-#   tests/            — BPF test harnesses and diagnostics
-#   csv_bank/         — Data files
+#   gpu_bpf/              — PTX BPF library + PTX assembly + BPF tests
+#   smc2/                 — SMC² RBPF parameter learner + SMC² tests
+#   csv_bank/             — Data files
 #
 # Cross-platform: auto-detects MSVC (Windows) vs ICX/GCC (Linux)
 # Device compiler: NVCC (CUDA Toolkit 13.x+)
@@ -78,40 +76,6 @@ endif()
 find_package(CUDAToolkit REQUIRED)
 
 # ==============================================================================
-# PTX compilation (ahead-of-time PTX -> cubin)
-# ==============================================================================
-
-find_program(PTXAS_EXECUTABLE ptxas
-    HINTS ${CUDAToolkit_BIN_DIR} ENV CUDA_PATH
-    PATH_SUFFIXES bin
-)
-
-if(PTXAS_EXECUTABLE)
-    message(STATUS "Found ptxas: ${PTXAS_EXECUTABLE}")
-else()
-    message(WARNING "ptxas not found — cubin will not be pre-compiled.")
-endif()
-
-# --- Full PTX (14 kernels) ---
-set(PTX_FULL_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/ptx_assembly/bpf_kernels_full.ptx")
-set(CUBIN_FULL_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/bpf_kernels_full.cubin")
-
-if(PTXAS_EXECUTABLE AND EXISTS "${PTX_FULL_SOURCE}")
-    add_custom_command(
-        OUTPUT  "${CUBIN_FULL_OUTPUT}"
-        COMMAND "${PTXAS_EXECUTABLE}" -arch=sm_120 -o "${CUBIN_FULL_OUTPUT}" "${PTX_FULL_SOURCE}" --verbose
-        DEPENDS "${PTX_FULL_SOURCE}"
-        COMMENT "Compiling bpf_kernels_full.ptx -> cubin (SM_120)"
-        VERBATIM
-    )
-    add_custom_target(ptx_cubin_full ALL DEPENDS "${CUBIN_FULL_OUTPUT}")
-endif()
-
-if(EXISTS "${PTX_FULL_SOURCE}")
-    configure_file("${PTX_FULL_SOURCE}" "${CMAKE_CURRENT_BINARY_DIR}/bpf_kernels_full.ptx" COPYONLY)
-endif()
-
-# ==============================================================================
 # Subdirectories
 # ==============================================================================
 
@@ -119,58 +83,16 @@ add_subdirectory(gpu_bpf)
 add_subdirectory(smc2)
 
 # ==============================================================================
-# BPF tests (live in tests/)
-# ==============================================================================
-
-# Helper for BPF tests
-function(bpf_add_test TARGET_NAME SOURCE)
-    add_executable(${TARGET_NAME} ${SOURCE})
-    target_link_libraries(${TARGET_NAME} PRIVATE
-        gpu_bpf_ptx_full CUDA::cuda_driver CUDA::cudart CUDA::curand
-    )
-    target_include_directories(${TARGET_NAME} PRIVATE
-        ${CMAKE_SOURCE_DIR}/gpu_bpf
-    )
-    set_target_properties(${TARGET_NAME} PROPERTIES
-        CUDA_SEPARABLE_COMPILATION OFF
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
-    )
-    if(TARGET ptx_cubin_full)
-        add_dependencies(${TARGET_NAME} ptx_cubin_full)
-    endif()
-endfunction()
-
-bpf_add_test(test_bpf_ptx_full       tests/test_bpf_matched_dgp.cu)
-bpf_add_test(test_bpf_ptx_stress     tests/test_bpf_ptx_stress.cu)
-bpf_add_test(test_jump_bands         tests/test_jump_bands.cu)
-
-# bench_particle_scaling needs USE_PTX_FULL define
-bpf_add_test(bench_particle_scaling   tests/bench_particle_scaling.cu)
-target_compile_definitions(bench_particle_scaling PRIVATE USE_PTX_FULL=1)
-
-# Tests that also need smc2_rbpf
-bpf_add_test(test_bpf_adaptive_stress tests/test_bpf_adaptive_stress.cu)
-target_link_libraries(test_bpf_adaptive_stress PRIVATE smc2_rbpf)
-
-bpf_add_test(test_jump_stress         tests/test_jump_stress.cu)
-target_link_libraries(test_jump_stress PRIVATE smc2_rbpf)
-
-bpf_add_test(bench_grad_overhead      tests/bench_grad_overhead.cu)
-target_link_libraries(bench_grad_overhead PRIVATE smc2_rbpf)
-target_include_directories(bench_grad_overhead PRIVATE ${CMAKE_SOURCE_DIR}/include)
-
-# ==============================================================================
 # Print summary
 # ==============================================================================
 
 message(STATUS "-------------------------------------------")
-message(STATUS "BPF PTX Project Configuration")
+message(STATUS "BPF PTX Project")
 message(STATUS "  Platform:          ${CMAKE_SYSTEM_NAME}")
 message(STATUS "  Host C++ compiler: ${CMAKE_CXX_COMPILER_ID}")
 message(STATUS "  CUDA architectures:${CMAKE_CUDA_ARCHITECTURES}")
 message(STATUS "  Build type:        ${CMAKE_BUILD_TYPE}")
 message(STATUS "")
-message(STATUS "  Libraries:")
-message(STATUS "    gpu_bpf_ptx_full  — PTX BPF (14 kernels, via gpu_bpf/)")
-message(STATUS "    smc2_rbpf         — SMC² RBPF (8-param, via smc2/)")
+message(STATUS "  gpu_bpf/  — PTX BPF library + tests")
+message(STATUS "  smc2/     — SMC² RBPF library + tests")
 message(STATUS "-------------------------------------------")
