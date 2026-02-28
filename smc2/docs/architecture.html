@@ -1,0 +1,2334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SMC² + RBPF + CPMMH — Architecture Documentation</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500&family=JetBrains+Mono:wght@400;500&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
+<style>
+/* ═══════════════════════════════════════════════════════════════
+   CSS Variables
+   ═══════════════════════════════════════════════════════════════ */
+:root {
+    --bg-deep:      #0a0e1a;
+    --bg-surface:   #111827;
+    --bg-card:      #1a2236;
+    --bg-elevated:  #212b42;
+
+    --text-primary:   #e2e8f0;
+    --text-secondary: #94a3b8;
+    --text-muted:     #64748b;
+    --text-dim:       #475569;
+
+    --accent-smc2:    #60a5fa;
+    --accent-rbpf:    #f87171;
+    --accent-cpmmh:   #c084fc;
+    --accent-kalman:  #fbbf24;
+    --accent-bpf:     #34d399;
+    --accent-phased:  #fb923c;
+
+    --border-subtle:  rgba(148, 163, 184, 0.08);
+    --border-accent:  rgba(148, 163, 184, 0.15);
+
+    --font-display: 'Cormorant Garamond', Georgia, serif;
+    --font-body:    'DM Sans', system-ui, sans-serif;
+    --font-mono:    'JetBrains Mono', 'Consolas', monospace;
+
+    --max-w: 860px;
+    --gutter: 2rem;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Reset & Base
+   ═══════════════════════════════════════════════════════════════ */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html {
+    font-size: 17px;
+    scroll-behavior: smooth;
+    -webkit-font-smoothing: antialiased;
+}
+
+body {
+    background: var(--bg-deep);
+    color: var(--text-primary);
+    font-family: var(--font-body);
+    font-weight: 400;
+    line-height: 1.75;
+    overflow-x: hidden;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Layout
+   ═══════════════════════════════════════════════════════════════ */
+.container {
+    max-width: var(--max-w);
+    margin: 0 auto;
+    padding: 0 var(--gutter);
+}
+
+section {
+    padding: 5rem 0 3rem;
+    border-bottom: 1px solid var(--border-subtle);
+}
+
+section:last-of-type { border-bottom: none; }
+
+/* ═══════════════════════════════════════════════════════════════
+   Typography
+   ═══════════════════════════════════════════════════════════════ */
+h1, h2, h3 {
+    font-family: var(--font-display);
+    font-weight: 600;
+    letter-spacing: -0.01em;
+}
+
+h2 {
+    font-size: 2.4rem;
+    margin-bottom: 0.4rem;
+    color: var(--text-primary);
+    line-height: 1.2;
+}
+
+h3 {
+    font-size: 1.45rem;
+    margin: 2.5rem 0 0.7rem;
+    color: var(--text-primary);
+    font-weight: 500;
+}
+
+.section-label {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    margin-bottom: 0.6rem;
+    display: block;
+}
+
+p {
+    margin-bottom: 1.2rem;
+    color: var(--text-secondary);
+}
+
+p strong { color: var(--text-primary); font-weight: 600; }
+
+a { color: var(--accent-smc2); text-decoration: none; }
+
+code, .mono {
+    font-family: var(--font-mono);
+    font-size: 0.85em;
+}
+
+.inline-code {
+    background: var(--bg-elevated);
+    padding: 0.15em 0.45em;
+    border-radius: 4px;
+    font-size: 0.82em;
+    color: var(--text-primary);
+}
+
+/* Colored terms */
+.t-smc2   { color: var(--accent-smc2);   font-weight: 600; }
+.t-rbpf   { color: var(--accent-rbpf);   font-weight: 600; }
+.t-cpmmh  { color: var(--accent-cpmmh);  font-weight: 600; }
+.t-kalman { color: var(--accent-kalman); font-weight: 600; }
+.t-bpf    { color: var(--accent-bpf);    font-weight: 600; }
+.t-phased { color: var(--accent-phased); font-weight: 600; }
+
+/* ═══════════════════════════════════════════════════════════════
+   Hero
+   ═══════════════════════════════════════════════════════════════ */
+.hero {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    text-align: center;
+    padding: 4rem var(--gutter);
+    position: relative;
+    border-bottom: 1px solid var(--border-subtle);
+    background:
+        radial-gradient(ellipse 80% 60% at 50% 40%, rgba(96,165,250,0.04) 0%, transparent 70%),
+        radial-gradient(ellipse 60% 50% at 30% 70%, rgba(200,132,252,0.03) 0%, transparent 70%),
+        var(--bg-deep);
+}
+
+.hero-overline {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.25em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    margin-bottom: 2.5rem;
+}
+
+.hero h1 {
+    font-size: clamp(2.8rem, 5.5vw, 4.5rem);
+    line-height: 1.1;
+    margin-bottom: 1.8rem;
+    font-weight: 700;
+}
+
+.hero h1 .line-components {
+    display: block;
+    margin-bottom: 0.25em;
+}
+
+.hero h1 .line-title {
+    display: block;
+    color: var(--text-primary);
+    font-size: 0.65em;
+}
+
+.hero-subtitle {
+    max-width: 640px;
+    font-size: 1.05rem;
+    line-height: 1.7;
+    color: var(--text-secondary);
+    margin-bottom: 3.5rem;
+}
+
+.hero-meta {
+    display: flex;
+    gap: 2.5rem;
+    flex-wrap: wrap;
+    justify-content: center;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--text-dim);
+    letter-spacing: 0.05em;
+}
+
+.hero-meta span strong {
+    color: var(--text-muted);
+    font-weight: 500;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Diagrams — Shared
+   ═══════════════════════════════════════════════════════════════ */
+.diagram {
+    background: var(--bg-surface);
+    border: 1px solid var(--border-accent);
+    border-radius: 12px;
+    padding: 2.5rem 2rem;
+    margin: 2rem 0;
+    overflow-x: auto;
+}
+
+.diagram-caption {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--text-dim);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    text-align: center;
+    margin-top: 1.2rem;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Architecture Tier Diagram
+   ═══════════════════════════════════════════════════════════════ */
+.arch-tiers {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0;
+}
+
+.tier {
+    position: relative;
+    padding: 1.8rem 2rem;
+    border-left: 3px solid;
+    transition: background 0.2s;
+}
+
+.tier:hover { background: rgba(255,255,255,0.015); }
+
+.tier-sensor  { border-left-color: var(--accent-smc2); }
+.tier-tracker { border-left-color: var(--accent-kalman); }
+.tier-reflex  { border-left-color: var(--accent-bpf); }
+
+.tier-name {
+    font-family: var(--font-display);
+    font-size: 1.4rem;
+    font-weight: 600;
+    margin-bottom: 0.25rem;
+}
+
+.tier-role {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    margin-bottom: 0.6rem;
+}
+
+.tier-desc {
+    color: var(--text-secondary);
+    font-size: 0.92rem;
+    line-height: 1.6;
+}
+
+.tier-specs {
+    margin-top: 0.6rem;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    color: var(--text-dim);
+}
+
+.tier-arrow {
+    text-align: center;
+    padding: 0.5rem 0;
+    color: var(--text-dim);
+    font-size: 0.9rem;
+    user-select: none;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Parameter Table
+   ═══════════════════════════════════════════════════════════════ */
+.param-table-wrap {
+    overflow-x: auto;
+    margin: 1.5rem 0;
+}
+
+table.param-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.88rem;
+}
+
+table.param-table th {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    text-align: left;
+    padding: 0.7rem 1rem;
+    border-bottom: 1px solid var(--border-accent);
+    font-weight: 500;
+}
+
+table.param-table td {
+    padding: 0.65rem 1rem;
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+    vertical-align: top;
+}
+
+table.param-table tr:last-child td { border-bottom: none; }
+
+table.param-table td:first-child {
+    font-family: var(--font-mono);
+    font-size: 0.82rem;
+    color: var(--text-primary);
+    white-space: nowrap;
+}
+
+.speed-badge {
+    display: inline-block;
+    padding: 0.15em 0.55em;
+    border-radius: 3px;
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+}
+
+.speed-fast   { background: rgba(248,113,113,0.15); color: #fca5a5; }
+.speed-medium { background: rgba(251,191,36,0.15);  color: #fcd34d; }
+.speed-slow   { background: rgba(96,165,250,0.15);  color: #93c5fd; }
+
+/* ═══════════════════════════════════════════════════════════════
+   Flow Diagram (Dual Timescale)
+   ═══════════════════════════════════════════════════════════════ */
+.flow-dual {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 2rem;
+}
+
+@media (max-width: 700px) {
+    .flow-dual { grid-template-columns: 1fr; }
+}
+
+.flow-lane {
+    padding: 1.5rem;
+    border-radius: 8px;
+    background: var(--bg-card);
+}
+
+.flow-lane-title {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    margin-bottom: 0.3rem;
+}
+
+.flow-lane-freq {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    margin-bottom: 1.2rem;
+}
+
+.flow-step {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.8rem;
+    margin-bottom: 1rem;
+    font-size: 0.88rem;
+    color: var(--text-secondary);
+    line-height: 1.5;
+}
+
+.flow-step:last-child { margin-bottom: 0; }
+
+.flow-num {
+    flex-shrink: 0;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+    font-weight: 600;
+    margin-top: 2px;
+}
+
+.lane-fast .flow-lane-title { color: var(--accent-bpf); }
+.lane-fast .flow-num { background: rgba(52,211,153,0.15); color: var(--accent-bpf); }
+
+.lane-slow .flow-lane-title { color: var(--accent-smc2); }
+.lane-slow .flow-num { background: rgba(96,165,250,0.15); color: var(--accent-smc2); }
+
+/* ═══════════════════════════════════════════════════════════════
+   Info Cards (for algorithm boxes)
+   ═══════════════════════════════════════════════════════════════ */
+.algo-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-accent);
+    border-radius: 10px;
+    padding: 2rem;
+    margin: 1.5rem 0;
+}
+
+.algo-card-title {
+    font-family: var(--font-display);
+    font-size: 1.3rem;
+    font-weight: 600;
+    margin-bottom: 0.4rem;
+}
+
+.algo-card-sub {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--text-dim);
+    letter-spacing: 0.08em;
+    margin-bottom: 1rem;
+}
+
+.algo-card p {
+    font-size: 0.92rem;
+    margin-bottom: 0.8rem;
+}
+
+.algo-card p:last-child { margin-bottom: 0; }
+
+/* ═══════════════════════════════════════════════════════════════
+   Equation blocks
+   ═══════════════════════════════════════════════════════════════ */
+.eq-block {
+    background: var(--bg-surface);
+    border-left: 3px solid var(--border-accent);
+    padding: 1.2rem 1.6rem;
+    margin: 1.5rem 0;
+    border-radius: 0 8px 8px 0;
+    overflow-x: auto;
+}
+
+.eq-block code {
+    color: var(--text-primary);
+    font-size: 0.88rem;
+    line-height: 1.9;
+    display: block;
+    white-space: pre;
+}
+
+.eq-label {
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+    color: var(--text-dim);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    margin-bottom: 0.5rem;
+    display: block;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Comparison table (decisions)
+   ═══════════════════════════════════════════════════════════════ */
+.decision-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    margin: 1.5rem 0;
+}
+
+@media (max-width: 600px) {
+    .decision-grid { grid-template-columns: 1fr; }
+}
+
+.decision-card {
+    padding: 1.4rem 1.5rem;
+    border-radius: 8px;
+    border: 1px solid var(--border-subtle);
+}
+
+.decision-card.adopted {
+    background: rgba(52,211,153,0.05);
+    border-color: rgba(52,211,153,0.2);
+}
+
+.decision-card.rejected {
+    background: rgba(248,113,113,0.03);
+    border-color: rgba(248,113,113,0.12);
+}
+
+.decision-verdict {
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    margin-bottom: 0.4rem;
+}
+
+.adopted .decision-verdict { color: var(--accent-bpf); }
+.rejected .decision-verdict { color: var(--accent-rbpf); }
+
+.decision-name {
+    font-family: var(--font-display);
+    font-size: 1.15rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 0.4rem;
+}
+
+.decision-reason {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    line-height: 1.55;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Phase ratchet visualization
+   ═══════════════════════════════════════════════════════════════ */
+.phase-track {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    margin: 2rem 0;
+    padding: 0 0.5rem;
+}
+
+.phase-node {
+    flex-shrink: 0;
+    width: 140px;
+    padding: 1rem;
+    text-align: center;
+    border-radius: 8px;
+    border: 1.5px solid;
+    position: relative;
+}
+
+.phase-node.p1 {
+    border-color: var(--accent-smc2);
+    background: rgba(96,165,250,0.06);
+}
+.phase-node.p2 {
+    border-color: var(--accent-kalman);
+    background: rgba(251,191,36,0.06);
+}
+.phase-node.p3 {
+    border-color: var(--accent-bpf);
+    background: rgba(52,211,153,0.06);
+}
+
+.phase-label {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    margin-bottom: 0.3rem;
+}
+
+.phase-params {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+    line-height: 1.5;
+}
+
+.p1 .phase-label { color: var(--accent-smc2); }
+.p2 .phase-label { color: var(--accent-kalman); }
+.p3 .phase-label { color: var(--accent-bpf); }
+
+.phase-arrow {
+    flex-shrink: 0;
+    width: 50px;
+    text-align: center;
+    color: var(--text-dim);
+    font-size: 1.1rem;
+    position: relative;
+}
+
+.phase-arrow::after {
+    content: '';
+    display: block;
+    height: 1px;
+    background: var(--border-accent);
+    position: absolute;
+    top: 50%;
+    left: 8px;
+    right: 8px;
+}
+
+.phase-arrow span {
+    position: relative;
+    z-index: 1;
+    background: var(--bg-surface);
+    padding: 0 0.3rem;
+    font-size: 0.75rem;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Pipeline summary (bottom)
+   ═══════════════════════════════════════════════════════════════ */
+.stack-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin: 2rem 0 1rem;
+}
+
+.stack-chip {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    padding: 0.4em 0.9em;
+    border-radius: 5px;
+    border: 1px solid;
+    letter-spacing: 0.03em;
+}
+
+.stack-arrow {
+    color: var(--text-dim);
+    font-size: 0.85rem;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Notation reference (compact, unnumbered)
+   ═══════════════════════════════════════════════════════════════ */
+.notation-section {
+    padding: 3rem 0 2rem;
+    border-bottom: 1px solid var(--border-subtle);
+}
+
+.notation-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 0.15rem 2.5rem;
+    margin: 1.2rem 0 0;
+}
+
+.notation-entry {
+    display: flex;
+    align-items: baseline;
+    gap: 0.7rem;
+    padding: 0.35rem 0;
+    font-size: 0.86rem;
+    border-bottom: 1px solid var(--border-subtle);
+}
+
+.notation-entry:last-child { border-bottom: none; }
+
+.notation-sym {
+    font-family: var(--font-mono);
+    font-size: 0.84rem;
+    color: var(--text-primary);
+    min-width: 65px;
+    flex-shrink: 0;
+    font-weight: 500;
+}
+
+.notation-def {
+    color: var(--text-secondary);
+    font-size: 0.84rem;
+    line-height: 1.45;
+}
+
+.notation-title {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    margin-bottom: 0.4rem;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Model equations (larger, centered)
+   ═══════════════════════════════════════════════════════════════ */
+.model-eq {
+    background: var(--bg-surface);
+    border: 1px solid var(--border-accent);
+    border-radius: 10px;
+    padding: 2rem 2.2rem;
+    margin: 1.8rem 0;
+}
+
+.model-eq-group {
+    margin-bottom: 1.6rem;
+}
+
+.model-eq-group:last-child { margin-bottom: 0; }
+
+.model-eq-label {
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    margin-bottom: 0.5rem;
+    display: block;
+}
+
+.model-eq-label.l-state   { color: var(--accent-smc2); }
+.model-eq-label.l-obs     { color: var(--accent-rbpf); }
+.model-eq-label.l-curve   { color: var(--accent-kalman); }
+.model-eq-label.l-reparam { color: var(--accent-cpmmh); }
+.model-eq-label.l-transform { color: var(--accent-bpf); }
+
+.model-eq code {
+    font-family: var(--font-mono);
+    font-size: 0.9rem;
+    color: var(--text-primary);
+    line-height: 2.0;
+    display: block;
+    white-space: pre;
+}
+
+/* Prior table */
+.prior-table-wrap {
+    overflow-x: auto;
+    margin: 1.5rem 0;
+}
+
+table.prior-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+}
+
+table.prior-table th {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    text-align: left;
+    padding: 0.6rem 0.8rem;
+    border-bottom: 1px solid var(--border-accent);
+    font-weight: 500;
+}
+
+table.prior-table td {
+    padding: 0.5rem 0.8rem;
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+    vertical-align: top;
+    font-size: 0.84rem;
+}
+
+table.prior-table tr:last-child td { border-bottom: none; }
+
+table.prior-table td:first-child {
+    font-family: var(--font-mono);
+    font-size: 0.82rem;
+    color: var(--text-primary);
+    white-space: nowrap;
+}
+
+table.prior-table td:nth-child(2) {
+    font-family: var(--font-mono);
+    font-size: 0.82rem;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Interface table
+   ═══════════════════════════════════════════════════════════════ */
+.iface-table-wrap {
+    overflow-x: auto;
+    margin: 1.5rem 0;
+}
+
+table.iface-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+}
+
+table.iface-table th {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    text-align: left;
+    padding: 0.7rem 0.8rem;
+    border-bottom: 1px solid var(--border-accent);
+    font-weight: 500;
+}
+
+table.iface-table td {
+    padding: 0.6rem 0.8rem;
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+    vertical-align: top;
+    line-height: 1.5;
+}
+
+table.iface-table tr:last-child td { border-bottom: none; }
+
+table.iface-table .fn-name {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    color: var(--text-primary);
+    white-space: nowrap;
+}
+
+table.iface-table .data-tag {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    padding: 0.1em 0.45em;
+    border-radius: 3px;
+    margin: 1px 2px;
+    white-space: nowrap;
+}
+
+.tag-struct  { background: rgba(96,165,250,0.12); color: #93c5fd; }
+.tag-scalar  { background: rgba(52,211,153,0.12); color: #6ee7b7; }
+.tag-array   { background: rgba(251,191,36,0.12); color: #fcd34d; }
+.tag-flag    { background: rgba(200,132,252,0.12); color: #d8b4fe; }
+
+/* Direction arrows for interface */
+.dir-arrow {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    padding: 0.1em 0.3em;
+    border-radius: 3px;
+    font-weight: 600;
+}
+
+.dir-down  { color: var(--accent-smc2); }
+.dir-up    { color: var(--accent-bpf); }
+.dir-both  { color: var(--accent-kalman); }
+
+/* ═══════════════════════════════════════════════════════════════
+   Activity diagram
+   ═══════════════════════════════════════════════════════════════ */
+.activity-diagram {
+    position: relative;
+    padding: 1rem 0;
+}
+
+.activity-lanes {
+    display: grid;
+    grid-template-columns: 140px 1fr 1fr 1fr;
+    gap: 0;
+    position: relative;
+}
+
+@media (max-width: 800px) {
+    .activity-lanes {
+        grid-template-columns: 100px 1fr 1fr 1fr;
+    }
+}
+
+.lane-header {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    padding: 0.8rem 0.5rem;
+    text-align: center;
+    border-bottom: 2px solid;
+    font-weight: 600;
+}
+
+.lane-h-time  { color: var(--text-dim); border-color: var(--border-accent); }
+.lane-h-bpf   { color: var(--accent-bpf); border-color: rgba(52,211,153,0.3); }
+.lane-h-smc2  { color: var(--accent-smc2); border-color: rgba(96,165,250,0.3); }
+.lane-h-kalman { color: var(--accent-kalman); border-color: rgba(251,191,36,0.3); }
+
+.activity-row {
+    display: contents;
+}
+
+.activity-row > div {
+    padding: 0.5rem 0.4rem;
+    min-height: 48px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-bottom: 1px solid var(--border-subtle);
+    position: relative;
+}
+
+.time-label {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--text-dim);
+    justify-content: flex-end;
+    padding-right: 1rem;
+}
+
+.act-node {
+    font-size: 0.76rem;
+    padding: 0.4em 0.7em;
+    border-radius: 6px;
+    text-align: center;
+    line-height: 1.35;
+    max-width: 100%;
+    position: relative;
+    z-index: 1;
+}
+
+.act-bpf {
+    background: rgba(52,211,153,0.1);
+    border: 1px solid rgba(52,211,153,0.25);
+    color: #a7f3d0;
+}
+
+.act-smc2 {
+    background: rgba(96,165,250,0.1);
+    border: 1px solid rgba(96,165,250,0.25);
+    color: #bfdbfe;
+}
+
+.act-kalman {
+    background: rgba(251,191,36,0.1);
+    border: 1px solid rgba(251,191,36,0.25);
+    color: #fde68a;
+}
+
+.act-cpmmh {
+    background: rgba(200,132,252,0.1);
+    border: 1px solid rgba(200,132,252,0.25);
+    color: #e9d5ff;
+}
+
+.act-phased {
+    background: rgba(251,146,60,0.1);
+    border: 1px solid rgba(251,146,60,0.25);
+    color: #fed7aa;
+}
+
+.act-empty {
+    /* empty lane cell */
+}
+
+/* Vertical connector lines in activity diagram */
+.act-connector {
+    position: absolute;
+    width: 1px;
+    background: var(--border-accent);
+    left: 50%;
+    z-index: 0;
+}
+
+/* Horizontal data flow arrows */
+.data-flow {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    width: 100%;
+    justify-content: center;
+}
+
+.data-flow-line {
+    height: 1px;
+    flex: 1;
+    max-width: 30px;
+}
+
+.data-flow-label {
+    font-family: var(--font-mono);
+    font-size: 0.6rem;
+    color: var(--text-dim);
+    white-space: nowrap;
+    padding: 0 0.3rem;
+}
+
+/* Spanning cells for activity diagram */
+.act-span-2 {
+    grid-column: span 2;
+}
+
+.act-span-3 {
+    grid-column: span 3;
+}
+
+/* Message passing arrow (horizontal) */
+.msg-arrow {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.3rem;
+    font-family: var(--font-mono);
+    font-size: 0.62rem;
+    color: var(--text-dim);
+    padding: 0.2rem 0;
+}
+
+.msg-arrow .msg-line {
+    height: 1px;
+    width: 20px;
+    display: inline-block;
+}
+
+.msg-bpf   .msg-line { background: var(--accent-bpf); }
+.msg-smc2  .msg-line { background: var(--accent-smc2); }
+.msg-kalman .msg-line { background: var(--accent-kalman); }
+
+/* Shared data card */
+.shared-data-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    margin: 1.5rem 0;
+}
+
+@media (max-width: 650px) {
+    .shared-data-grid { grid-template-columns: 1fr; }
+}
+
+.shared-data-card {
+    padding: 1.3rem 1.4rem;
+    border-radius: 8px;
+    background: var(--bg-card);
+    border-left: 3px solid;
+}
+
+.shared-data-card h4 {
+    font-family: var(--font-display);
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 0.2rem;
+}
+
+.shared-data-card .sd-route {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.06em;
+    margin-bottom: 0.7rem;
+}
+
+.shared-data-card .sd-fields {
+    font-size: 0.82rem;
+    color: var(--text-secondary);
+    line-height: 1.6;
+}
+
+.shared-data-card .sd-fields code {
+    font-size: 0.78rem;
+    color: var(--text-primary);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Footer
+   ═══════════════════════════════════════════════════════════════ */
+footer {
+    padding: 4rem 0;
+    text-align: center;
+    color: var(--text-dim);
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    letter-spacing: 0.08em;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Animations
+   ═══════════════════════════════════════════════════════════════ */
+@keyframes fadeUp {
+    from { opacity: 0; transform: translateY(20px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+.hero h1, .hero-subtitle, .hero-meta, .hero-overline {
+    animation: fadeUp 0.8s ease-out backwards;
+}
+.hero-overline   { animation-delay: 0.1s; }
+.hero h1         { animation-delay: 0.25s; }
+.hero-subtitle   { animation-delay: 0.45s; }
+.hero-meta       { animation-delay: 0.6s; }
+</style>
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     HERO
+     ═══════════════════════════════════════════════════════════════ -->
+<header class="hero">
+    <div class="hero-overline">Architecture Documentation</div>
+    <h1>
+        <span class="line-components">
+            <span class="t-smc2">SMC²</span> +
+            <span class="t-rbpf">RBPF</span> +
+            <span class="t-cpmmh">CPMMH</span>
+        </span>
+        <span class="line-title">Online Parameter Learning<br>for Stochastic Volatility</span>
+    </h1>
+    <p class="hero-subtitle">
+        A GPU-accelerated algorithm for real-time joint estimation of latent
+        volatility states and model parameters, featuring a novel (σ<sub>total</sub>, r)
+        reparameterization that breaks the identification ridge inherent in
+        multi-channel vol-of-vol models.
+    </p>
+    <div class="hero-meta">
+        <span>Architecture: <strong>Sensor → Tracker → Reflex</strong></span>
+        <span>Params: <strong>8 learned · 3 derived · 0 fixed</strong></span>
+        <span>Target: <strong>CUDA / RTX 5080</strong></span>
+    </div>
+</header>
+
+<main>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     NOTATION REFERENCE
+     ═══════════════════════════════════════════════════════════════ -->
+<div class="notation-section">
+<div class="container">
+    <div class="notation-title">Notation</div>
+    <div class="notation-grid">
+        <div class="notation-entry">
+            <span class="notation-sym">y<sub>t</sub></span>
+            <span class="notation-def">Observed log-return at tick t</span>
+        </div>
+        <div class="notation-entry">
+            <span class="notation-sym">h<sub>t</sub></span>
+            <span class="notation-def">Latent log-volatility state</span>
+        </div>
+        <div class="notation-entry">
+            <span class="notation-sym">z̃<sub>t</sub></span>
+            <span class="notation-def">Latent stress state (unbounded)</span>
+        </div>
+        <div class="notation-entry">
+            <span class="notation-sym">z<sub>t</sub></span>
+            <span class="notation-def">Mapped stress ∈ [0, 3], via tanh</span>
+        </div>
+        <div class="notation-entry">
+            <span class="notation-sym">θ</span>
+            <span class="notation-def">8D parameter vector</span>
+        </div>
+        <div class="notation-entry">
+            <span class="notation-sym">θ̂<sub>k</sub></span>
+            <span class="notation-def">Posterior mean from window k</span>
+        </div>
+        <div class="notation-entry">
+            <span class="notation-sym">Σ<sub>k</sub></span>
+            <span class="notation-def">Posterior covariance from window k</span>
+        </div>
+        <div class="notation-entry">
+            <span class="notation-sym">W</span>
+            <span class="notation-def">Window length in ticks (default 3000)</span>
+        </div>
+        <div class="notation-entry">
+            <span class="notation-sym">P</span>
+            <span class="notation-def">Kalman state covariance (8×8)</span>
+        </div>
+        <div class="notation-entry">
+            <span class="notation-sym">Q</span>
+            <span class="notation-def">Kalman process noise (diagonal)</span>
+        </div>
+        <div class="notation-entry">
+            <span class="notation-sym">K</span>
+            <span class="notation-def">Kalman gain matrix</span>
+        </div>
+        <div class="notation-entry">
+            <span class="notation-sym">μ(z)</span>
+            <span class="notation-def">Log-vol mean curve, function of stress</span>
+        </div>
+        <div class="notation-entry">
+            <span class="notation-sym">σ<sub>h</sub>(z)</span>
+            <span class="notation-def">Log-vol innovation std, function of stress</span>
+        </div>
+        <div class="notation-entry">
+            <span class="notation-sym">θ<sub>speed</sub></span>
+            <span class="notation-def">Mean-reversion speed for h (derived)</span>
+        </div>
+        <div class="notation-entry">
+            <span class="notation-sym">σ<sub>z</sub></span>
+            <span class="notation-def">Innovation std of z̃ (derived)</span>
+        </div>
+        <div class="notation-entry">
+            <span class="notation-sym">σ<sub>base</sub></span>
+            <span class="notation-def">Baseline h-innovation std (derived)</span>
+        </div>
+        <div class="notation-entry">
+            <span class="notation-sym">N<sub>θ</sub></span>
+            <span class="notation-def">Outer θ-particles in SMC² (1024)</span>
+        </div>
+        <div class="notation-entry">
+            <span class="notation-sym">N<sub>inner</sub></span>
+            <span class="notation-def">Inner z̃-particles in RBPF (512)</span>
+        </div>
+        <div class="notation-entry">
+            <span class="notation-sym">N<sub>bpf</sub></span>
+            <span class="notation-def">BPF 2D particles (5000)</span>
+        </div>
+        <div class="notation-entry">
+            <span class="notation-sym">ESS</span>
+            <span class="notation-def">Effective sample size</span>
+        </div>
+    </div>
+</div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     §1 — THE MODEL
+     ═══════════════════════════════════════════════════════════════ -->
+<section id="model">
+<div class="container">
+    <span class="section-label">§1</span>
+    <h2>The Model</h2>
+    <p>
+        The system estimates a two-factor stochastic volatility model with
+        regime-dependent dynamics. A latent stress process z̃<sub>t</sub> modulates
+        both the level and the volatility-of-volatility of log-volatility
+        h<sub>t</sub> through nonlinear curves. Returns are conditionally
+        Gaussian given h<sub>t</sub>.
+    </p>
+
+    <div class="model-eq">
+        <div class="model-eq-group">
+            <span class="model-eq-label l-state">State: stress dynamics</span>
+            <code>z̃_t  =  ρ · z̃_{t-1}  +  σ_z · ε_z,t          ε_z ~ N(0, 1)</code>
+        </div>
+
+        <div class="model-eq-group">
+            <span class="model-eq-label l-state">State: log-volatility dynamics</span>
+            <code>h_t  =  μ(z_t)  +  θ_speed · (h_{t-1} − μ(z_{t-1}))  +  σ_h(z_t) · ε_h,t
+
+                                                            ε_h ~ N(0, 1)</code>
+        </div>
+
+        <div class="model-eq-group">
+            <span class="model-eq-label l-obs">Observation</span>
+            <code>y_t  =  exp(h_t / 2) · ε_y,t                  ε_y ~ N(0, 1)</code>
+        </div>
+
+        <div class="model-eq-group">
+            <span class="model-eq-label l-transform">Stress mapping</span>
+            <code>z_t  =  1.5 · (1 + tanh(z̃_t))                z ∈ [0, 3]</code>
+        </div>
+    </div>
+
+    <p>
+        The stress z̃<sub>t</sub> is an AR(1) process in unbounded space. The
+        <code class="inline-code">tanh</code> mapping compresses it to [0, 3]
+        before it enters the curves. This ensures the curves are bounded and
+        monotone — μ(z) rises from a floor to a ceiling as stress increases,
+        and σ<sub>h</sub>(z) does the same.
+    </p>
+
+    <h3>Curve Definitions</h3>
+    <p>
+        Both curves share the same saturating-exponential form, parameterized by
+        a base (floor), scale (ceiling − floor), and rate (curvature):
+    </p>
+
+    <div class="model-eq">
+        <div class="model-eq-group">
+            <span class="model-eq-label l-curve">Mean curve: level of log-volatility</span>
+            <code>μ(z)    =  μ_base   +  μ_scale   · (1 − exp(−μ_rate   · z))</code>
+        </div>
+
+        <div class="model-eq-group">
+            <span class="model-eq-label l-curve">Vol-of-vol curve: h-innovation amplitude</span>
+            <code>σ_h(z)  =  σ_base   +  σ_scale   · (1 − exp(−σ_rate   · z))</code>
+        </div>
+    </div>
+
+    <p>
+        At z = 0 (calm), μ(0) = μ<sub>base</sub> and σ<sub>h</sub>(0) = σ<sub>base</sub>
+        — the floor parameters control all dynamics. As stress rises, the curves
+        saturate at μ<sub>base</sub> + μ<sub>scale</sub> and
+        σ<sub>base</sub> + σ<sub>scale</sub>. The rate parameters control how
+        quickly the ceiling is reached.
+    </p>
+
+    <h3>Reparameterization</h3>
+    <p>
+        The model has two independent volatility channels: σ<sub>z</sub> (stress
+        innovation) and σ<sub>base</sub> (h-innovation floor). In the natural
+        parameterization, the likelihood constrains only their total energy
+        σ<sub>z</sub>² + σ<sub>base</sub>² — creating a ridge the sampler
+        cannot escape efficiently. The reparameterization rotates this:
+    </p>
+
+    <div class="model-eq">
+        <div class="model-eq-group">
+            <span class="model-eq-label l-reparam">Polar reparameterization</span>
+            <code>σ_total  =  √(σ_z² + σ_base²)       total vol-of-vol energy
+r        =  σ_z / σ_total             channel split ratio  ∈ (0, 1)
+
+Inverse:
+σ_z      =  r · σ_total
+σ_base   =  √(1 − r²) · σ_total</code>
+        </div>
+    </div>
+
+    <p>
+        The 8 learned parameters are therefore:
+        (ρ, σ<sub>total</sub>, r, μ<sub>base</sub>, μ<sub>scale</sub>,
+        μ<sub>rate</sub>, σ<sub>scale</sub>, σ<sub>rate</sub>). The 3 derived
+        quantities (σ<sub>z</sub>, σ<sub>base</sub>, θ<sub>speed</sub>) are
+        computed from the learned parameters before being pushed to the BPF.
+        θ<sub>speed</sub> is derived from ρ and σ<sub>z</sub> to match the
+        effective mean-reversion timescale of the discretized system.
+    </p>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     §2 — INITIALIZATION
+     ═══════════════════════════════════════════════════════════════ -->
+<section id="initialization">
+<div class="container">
+    <span class="section-label">§2</span>
+    <h2>Initialization</h2>
+    <p>
+        At cold start (t = 0), no data has been observed and no windows have
+        completed. The system initializes in a conservative state that produces
+        reasonable filtering immediately, then self-corrects as the Kalman
+        accumulates window posteriors.
+    </p>
+
+    <h3>Priors</h3>
+    <p>
+        Each SMC² window initializes θ-particles from independent priors.
+        These are chosen to be weakly informative — centered on typical
+        equity-index values with enough spread to cover the plausible range.
+        Parameters are sampled in constrained space and transformed internally.
+    </p>
+
+    <div class="prior-table-wrap">
+    <table class="prior-table">
+    <thead>
+        <tr>
+            <th>Parameter</th>
+            <th>Prior</th>
+            <th>Support</th>
+            <th>Rationale</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>ρ</td>
+            <td>Beta(8, 2)</td>
+            <td>(0, 1)</td>
+            <td>Peaked near 0.8 — stress is persistent</td>
+        </tr>
+        <tr>
+            <td>σ<sub>total</sub></td>
+            <td>Half-N(0, 0.5²)</td>
+            <td>(0, ∞)</td>
+            <td>Positive, moderate total vol-of-vol</td>
+        </tr>
+        <tr>
+            <td>r</td>
+            <td>Beta(2, 2)</td>
+            <td>(0, 1)</td>
+            <td>Symmetric — no prior preference for channel split</td>
+        </tr>
+        <tr>
+            <td>μ<sub>base</sub></td>
+            <td>N(−10, 2²)</td>
+            <td>(−∞, ∞)</td>
+            <td>Typical log-vol for equity indices: exp(−10) ≈ 0.005</td>
+        </tr>
+        <tr>
+            <td>μ<sub>scale</sub></td>
+            <td>Half-N(0, 3²)</td>
+            <td>(0, ∞)</td>
+            <td>Ceiling is above base; wide to cover crises</td>
+        </tr>
+        <tr>
+            <td>μ<sub>rate</sub></td>
+            <td>Exp(1)</td>
+            <td>(0, ∞)</td>
+            <td>Curvature — uninformative, learned from stressed data</td>
+        </tr>
+        <tr>
+            <td>σ<sub>scale</sub></td>
+            <td>Half-N(0, 1²)</td>
+            <td>(0, ∞)</td>
+            <td>Vol-of-vol ceiling increase under stress</td>
+        </tr>
+        <tr>
+            <td>σ<sub>rate</sub></td>
+            <td>Exp(1)</td>
+            <td>(0, ∞)</td>
+            <td>Curvature — uninformative</td>
+        </tr>
+    </tbody>
+    </table>
+    </div>
+
+    <h3>Kalman Cold Start</h3>
+    <p>
+        The Kalman tracker initializes with:
+    </p>
+
+    <div class="eq-block">
+        <span class="eq-label">Kalman initial state</span>
+        <code>x₀  =  prior mean of each parameter
+P₀  =  diag(prior variance)         large — low confidence
+Q   =  diag(drift rates)            per-param, from slow/fast classification</code>
+    </div>
+
+    <p>
+        With P₀ large, the Kalman gain after the first window is near 1.0 —
+        the first SMC² posterior essentially overwrites the prior. This is
+        correct: before any data, the Kalman should trust the first measurement
+        completely.
+    </p>
+
+    <h3>BPF Before First Window</h3>
+    <p>
+        The BPF begins filtering immediately at t = 0 using the prior means
+        as initial parameters. These values are approximate but functional —
+        the BPF produces usable h-estimates even with imprecise parameters,
+        because particle filtering is robust to moderate parameter misspecification
+        (particles adjust their spread to accommodate the mismatch).
+    </p>
+    <p>
+        After the first SMC² window completes (t = 3000 at stride 1500, covering
+        ticks 0–2999), the Kalman updates and pushes corrected parameters to
+        the BPF. From this point forward, the system is in its normal
+        operating mode. Convergence to accurate parameters typically requires
+        3–5 windows (4500–7500 ticks), depending on signal richness.
+    </p>
+
+    <h3>Phased Learning at Start</h3>
+    <p>
+        The system always starts in <span class="t-phased">Phase 1</span> (4
+        free parameters: ρ, σ<sub>total</sub>, r, μ<sub>base</sub>). The curve
+        parameters (scale, rate) are locked to their prior means. This is correct
+        because early data is likely calm (no stress observed yet), and attempting
+        to learn curve ceilings from flat data wastes particles. As the market
+        enters its first stressed period and z<sub>max</sub> rises, the ratchet
+        promotes to Phase 2 and then Phase 3 automatically.
+    </p>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     §3 — ARCHITECTURE OVERVIEW
+     ═══════════════════════════════════════════════════════════════ -->
+<section id="architecture">
+<div class="container">
+    <span class="section-label">§3</span>
+    <h2>Three-Tier Architecture</h2>
+    <p>
+        The system separates concerns into three layers operating at different timescales.
+        The <span class="t-smc2">Sensor</span> learns parameters from windowed data.
+        The <span class="t-kalman">Tracker</span> fuses estimates across windows.
+        The <span class="t-bpf">Reflex</span> filters volatility tick-by-tick
+        using the tracked parameters.
+    </p>
+
+    <div class="diagram">
+        <div class="arch-tiers">
+
+            <div class="tier tier-sensor">
+                <div class="tier-name"><span class="t-smc2">Sensor</span></div>
+                <div class="tier-role" style="color: var(--accent-smc2);">SMC² + RBPF + CPMMH</div>
+                <div class="tier-desc">
+                    Runs on sliding windows of W observations. Each window produces
+                    an independent posterior: mean θ̂<sub>k</sub> (8D) and covariance Σ<sub>k</sub> (8×8).
+                    Amnesiac — reinitializes from prior each window. No particle degeneration.
+                </div>
+                <div class="tier-specs">1024 θ-particles × 512 inner RBPF · W = 3000 ticks · every 1500 ticks</div>
+            </div>
+
+            <div class="tier-arrow">↓ &nbsp; θ̂<sub>k</sub> , Σ<sub>k</sub></div>
+
+            <div class="tier tier-tracker">
+                <div class="tier-name"><span class="t-kalman">Tracker</span></div>
+                <div class="tier-role" style="color: var(--accent-kalman);">Kalman Filter (8D)</div>
+                <div class="tier-desc">
+                    Treats each window's posterior as a noisy measurement of slowly-drifting
+                    true parameters. Linear Kalman with H = I, F = I. Process noise Q encodes
+                    per-parameter drift rates. Informative windows (tight Σ) get high gain;
+                    uninformative ones are downweighted automatically.
+                </div>
+                <div class="tier-specs">θ<sub>k+1</sub> = θ<sub>k</sub> + w<sub>k</sub> , &nbsp; z<sub>k</sub> = θ<sub>k</sub> + v<sub>k</sub> · Host-side 8×8 Cholesky</div>
+            </div>
+
+            <div class="tier-arrow">↓ &nbsp; μ(z̄), σ<sub>h</sub>(z̄), θ(z̄), σ<sub>z</sub></div>
+
+            <div class="tier tier-reflex">
+                <div class="tier-name"><span class="t-bpf">Reflex</span></div>
+                <div class="tier-role" style="color: var(--accent-bpf);">Bootstrap Particle Filter (2D PTX)</div>
+                <div class="tier-desc">
+                    Per-tick filtering of latent log-volatility h<sub>t</sub> and stress z̃<sub>t</sub>.
+                    Hand-written PTX kernels. Receives scalar parameters from the Tracker
+                    evaluated at the current stress level z̄. Returns h-estimate to the
+                    trading system and z-mean to the phased learning controller.
+                </div>
+                <div class="tier-specs">5000 particles · &lt;100μs/tick · 14 PTX kernels · PCG32 PRNG</div>
+            </div>
+        </div>
+        <div class="diagram-caption">Fig. 1 — Three-tier pipeline: Sensor → Tracker → Reflex</div>
+    </div>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     §4 — THE EIGHT PARAMETERS
+     ═══════════════════════════════════════════════════════════════ -->
+<section id="parameters">
+<div class="container">
+    <span class="section-label">§4</span>
+    <h2>The Eight Parameters</h2>
+    <p>
+        The stochastic volatility model is parameterized by eight quantities that
+        control the dynamics of latent log-volatility h<sub>t</sub> and its coupling
+        to the stress factor z̃<sub>t</sub>. Parameters are grouped by their
+        characteristic timescale — how quickly they drift in practice.
+    </p>
+
+    <div class="param-table-wrap">
+    <table class="param-table">
+    <thead>
+        <tr>
+            <th>Parameter</th>
+            <th>Symbol</th>
+            <th>Role</th>
+            <th>Drift</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>rho</td>
+            <td>ρ</td>
+            <td>AR(1) persistence of z̃ — controls stress memory</td>
+            <td><span class="speed-badge speed-medium">medium</span></td>
+        </tr>
+        <tr>
+            <td>sigma_total</td>
+            <td>σ<sub>total</sub></td>
+            <td>Total vol-of-vol: √(σ<sub>z</sub>² + σ<sub>base</sub>²)</td>
+            <td><span class="speed-badge speed-medium">medium</span></td>
+        </tr>
+        <tr>
+            <td>r_split</td>
+            <td>r</td>
+            <td>Channel split: σ<sub>z</sub> = r · σ<sub>total</sub></td>
+            <td><span class="speed-badge speed-medium">medium</span></td>
+        </tr>
+        <tr>
+            <td>mu_base</td>
+            <td>μ<sub>base</sub></td>
+            <td>Baseline log-vol level — tracks market regime</td>
+            <td><span class="speed-badge speed-fast">fast</span></td>
+        </tr>
+        <tr>
+            <td>mu_scale</td>
+            <td>μ<sub>scale</sub></td>
+            <td>μ(z) curve ceiling: how much stress lifts log-vol</td>
+            <td><span class="speed-badge speed-slow">slow</span></td>
+        </tr>
+        <tr>
+            <td>mu_rate</td>
+            <td>μ<sub>rate</sub></td>
+            <td>μ(z) curve curvature: how fast the ceiling is reached</td>
+            <td><span class="speed-badge speed-slow">slow</span></td>
+        </tr>
+        <tr>
+            <td>sigma_scale</td>
+            <td>σ<sub>scale</sub></td>
+            <td>σ<sub>h</sub>(z) curve ceiling: stress amplifies h-innovation noise</td>
+            <td><span class="speed-badge speed-slow">slow</span></td>
+        </tr>
+        <tr>
+            <td>sigma_rate</td>
+            <td>σ<sub>rate</sub></td>
+            <td>σ<sub>h</sub>(z) curve curvature</td>
+            <td><span class="speed-badge speed-slow">slow</span></td>
+        </tr>
+    </tbody>
+    </table>
+    </div>
+
+    <h3>The (σ<sub>total</sub>, r) Reparameterization</h3>
+    <p>
+        The natural parameterization (σ<sub>z</sub>, σ<sub>base</sub>) creates a
+        <strong>severe identification ridge</strong> — the likelihood constrains
+        σ<sub>z</sub>² + σ<sub>base</sub>² (total energy) but not the individual
+        components. MCMC samplers and particle filters waste iterations sliding
+        along this ridge without improving estimates.
+    </p>
+    <p>
+        The reparameterization σ<sub>total</sub> = √(σ<sub>z</sub>² + σ<sub>base</sub>²)
+        and r = σ<sub>z</sub> / σ<sub>total</sub> decorrelates the two: σ<sub>total</sub>
+        is pinned by total volatility magnitude (identifiable from any data),
+        while r controls the split between the observable and latent channels.
+        This collapses the ridge into an axis-aligned posterior, dramatically
+        improving mixing and convergence.
+    </p>
+
+    <div class="eq-block">
+        <span class="eq-label">Curve evaluation</span>
+        <code>f(z) = base + scale · (1 − exp(−rate · z))
+
+μ(z)   = μ_base   + μ_scale   · (1 − exp(−μ_rate   · z))
+σ_h(z) = σ_base   + σ_scale   · (1 − exp(−σ_rate   · z))
+
+where z = 1.5 · (1 + tanh(z̃))  ∈  [0, 3]</code>
+    </div>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     §5 — DUAL-TIMESCALE DATA FLOW
+     ═══════════════════════════════════════════════════════════════ -->
+<section id="dataflow">
+<div class="container">
+    <span class="section-label">§5</span>
+    <h2>Dual-Timescale Data Flow</h2>
+    <p>
+        Two loops operate concurrently. The <strong>fast path</strong> runs every tick
+        (~microseconds) for real-time volatility filtering. The <strong>slow path</strong>
+        runs every 1500 ticks (~milliseconds) for parameter learning. They communicate
+        through the Kalman snapshot — a struct of scalar parameters evaluated at
+        the current stress level.
+    </p>
+
+    <div class="diagram">
+        <div class="flow-dual">
+            <div class="flow-lane lane-fast">
+                <div class="flow-lane-title">Fast Path</div>
+                <div class="flow-lane-freq">Every tick · &lt;100μs</div>
+                <div class="flow-step">
+                    <div class="flow-num">1</div>
+                    <div>Observe return y<sub>t</sub></div>
+                </div>
+                <div class="flow-step">
+                    <div class="flow-num">2</div>
+                    <div><span class="t-bpf">BPF 2D</span> propagates (h, z̃) particles using current Kalman params</div>
+                </div>
+                <div class="flow-step">
+                    <div class="flow-num">3</div>
+                    <div>Reweight by p(y<sub>t</sub> | h<sub>t</sub>), resample if ESS low</div>
+                </div>
+                <div class="flow-step">
+                    <div class="flow-num">4</div>
+                    <div>Emit h-estimate → trading system, z-mean → phased controller</div>
+                </div>
+            </div>
+
+            <div class="flow-lane lane-slow">
+                <div class="flow-lane-title">Slow Path</div>
+                <div class="flow-lane-freq">Every 1500 ticks · ~ms</div>
+                <div class="flow-step">
+                    <div class="flow-num">1</div>
+                    <div>Extract window y<sub>t-W:t</sub> from circular buffer</div>
+                </div>
+                <div class="flow-step">
+                    <div class="flow-num">2</div>
+                    <div><span class="t-smc2">SMC²</span> runs from prior on window → θ̂<sub>k</sub>, Σ<sub>k</sub></div>
+                </div>
+                <div class="flow-step">
+                    <div class="flow-num">3</div>
+                    <div><span class="t-kalman">Kalman</span> predict+update → filtered θ, P</div>
+                </div>
+                <div class="flow-step">
+                    <div class="flow-num">4</div>
+                    <div>Evaluate curves at z̄ → push scalar params to <span class="t-bpf">BPF</span></div>
+                </div>
+            </div>
+        </div>
+        <div class="diagram-caption">Fig. 2 — Dual-timescale pipeline: fast path (per-tick) and slow path (per-window)</div>
+    </div>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     §6 — INTERFACES & SHARED DATA
+     ═══════════════════════════════════════════════════════════════ -->
+<section id="interfaces">
+<div class="container">
+    <span class="section-label">§6</span>
+    <h2>Interfaces &amp; Shared Data</h2>
+    <p>
+        Each tier communicates through well-defined function calls and data structures.
+        The interfaces are deliberately narrow — the Sensor knows nothing about the BPF,
+        and the BPF knows nothing about SMC². The Kalman Tracker mediates all
+        parameter flow.
+    </p>
+
+    <h3>Shared Data Structures</h3>
+
+    <div class="shared-data-grid">
+        <div class="shared-data-card" style="border-left-color: var(--accent-kalman);">
+            <h4>ParamSnapshot</h4>
+            <div class="sd-route" style="color: var(--accent-kalman);">Kalman → BPF · pushed every window</div>
+            <div class="sd-fields">
+                <code>theta[8]</code> — filtered parameter vector<br>
+                <code>P_diag[8]</code> — Kalman uncertainty per param<br>
+                <code>mu</code>, <code>sigma_h</code>, <code>theta_speed</code> — curves at z̄<br>
+                <code>sigma_z</code>, <code>sigma_base</code> — derived from (σ<sub>total</sub>, r)<br>
+                <code>z_mean</code> — posterior stress level
+            </div>
+        </div>
+
+        <div class="shared-data-card" style="border-left-color: var(--accent-smc2);">
+            <h4>SMC² Posterior</h4>
+            <div class="sd-route" style="color: var(--accent-smc2);">SMC² → Kalman · one measurement per window</div>
+            <div class="sd-fields">
+                <code>θ̂_k[8]</code> — weighted posterior mean<br>
+                <code>Σ_k[8×8]</code> — posterior covariance (full matrix)<br>
+                <code>z̄_k</code> — posterior mean stress from RBPF<br>
+                <code>ESS</code> — effective sample size (diagnostic)<br>
+                <code>accept_rate</code> — CPMMH acceptance (diagnostic)
+            </div>
+        </div>
+
+        <div class="shared-data-card" style="border-left-color: var(--accent-bpf);">
+            <h4>BpfResult</h4>
+            <div class="sd-route" style="color: var(--accent-bpf);">BPF 2D → Pipeline · every tick</div>
+            <div class="sd-fields">
+                <code>h_mean</code> — filtered log-volatility E[h<sub>t</sub>]<br>
+                <code>h_var</code> — filtering variance Var[h<sub>t</sub>]<br>
+                <code>z_mean</code> — filtered stress E[z̃<sub>t</sub>]<br>
+                <code>log_likelihood</code> — p(y<sub>t</sub> | y<sub>1:t-1</sub>)<br>
+                <code>ess</code> — particle ESS after resampling
+            </div>
+        </div>
+
+        <div class="shared-data-card" style="border-left-color: var(--accent-phased);">
+            <h4>PhasedConfig</h4>
+            <div class="sd-route" style="color: var(--accent-phased);">Phased Controller → SMC² · per window</div>
+            <div class="sd-fields">
+                <code>fixed_mask[8]</code> — 1 = locked, 0 = free<br>
+                <code>fixed_values[8]</code> — values for locked params<br>
+                <code>current_phase</code> — 1, 2, or 3<br>
+                <code>ceiling_z_threshold</code> — trigger for Phase 1→2<br>
+                <code>rate_z_range_threshold</code> — trigger for Phase 2→3
+            </div>
+        </div>
+    </div>
+
+    <h3>Function Interfaces</h3>
+
+    <div class="iface-table-wrap">
+    <table class="iface-table">
+    <thead>
+        <tr>
+            <th>From</th>
+            <th>To</th>
+            <th>Function / Call</th>
+            <th>Data Exchanged</th>
+            <th>When</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><span class="t-bpf">Pipeline</span></td>
+            <td><span class="t-kalman">Tracker</span></td>
+            <td class="fn-name">param_tracker_feed(t, y)</td>
+            <td><span class="data-tag tag-scalar">float y_obs</span></td>
+            <td>Every tick</td>
+        </tr>
+        <tr>
+            <td><span class="t-kalman">Tracker</span></td>
+            <td><span class="t-smc2">SMC²</span></td>
+            <td class="fn-name">smc2_cuda_init_from_prior(s)</td>
+            <td><span class="data-tag tag-flag">fixed_mask[8]</span> <span class="data-tag tag-array">prior</span></td>
+            <td>Window start</td>
+        </tr>
+        <tr>
+            <td><span class="t-kalman">Tracker</span></td>
+            <td><span class="t-smc2">SMC²</span></td>
+            <td class="fn-name">smc2_cuda_update_batch(s, y, W)</td>
+            <td><span class="data-tag tag-array">float y_buf[W]</span></td>
+            <td>Window run</td>
+        </tr>
+        <tr>
+            <td><span class="t-smc2">SMC²</span></td>
+            <td><span class="t-kalman">Tracker</span></td>
+            <td class="fn-name">smc2_cuda_get_theta_cov(s, θ̂, Σ)</td>
+            <td><span class="data-tag tag-array">θ̂[8]</span> <span class="data-tag tag-struct">Σ[8×8]</span></td>
+            <td>Window end</td>
+        </tr>
+        <tr>
+            <td><span class="t-smc2">SMC²</span></td>
+            <td><span class="t-kalman">Tracker</span></td>
+            <td class="fn-name">smc2_cuda_get_z_mean(s)</td>
+            <td><span class="data-tag tag-scalar">float z̄</span></td>
+            <td>Window end</td>
+        </tr>
+        <tr>
+            <td><span class="t-kalman">Tracker</span></td>
+            <td>(internal)</td>
+            <td class="fn-name">kalman_update(t, θ̂, Σ)</td>
+            <td><span class="data-tag tag-struct">P̄, S, K</span></td>
+            <td>Window end</td>
+        </tr>
+        <tr>
+            <td><span class="t-kalman">Tracker</span></td>
+            <td><span class="t-bpf">BPF</span></td>
+            <td class="fn-name">param_tracker_get_snapshot(t, &amp;snap)</td>
+            <td><span class="data-tag tag-struct">ParamSnapshot</span></td>
+            <td>After Kalman update</td>
+        </tr>
+        <tr>
+            <td><span class="t-bpf">BPF 2D</span></td>
+            <td><span class="t-phased">Phased</span></td>
+            <td class="fn-name">phased_observe_z(ph, z̄, z_min, z_max)</td>
+            <td><span class="data-tag tag-scalar">z̄</span> <span class="data-tag tag-scalar">z_min</span> <span class="data-tag tag-scalar">z_max</span></td>
+            <td>Each window boundary</td>
+        </tr>
+        <tr>
+            <td><span class="t-phased">Phased</span></td>
+            <td><span class="t-smc2">SMC²</span></td>
+            <td class="fn-name">phased_apply_mask(ph, s)</td>
+            <td><span class="data-tag tag-flag">fixed_mask[8]</span> <span class="data-tag tag-array">fixed_values[8]</span></td>
+            <td>After phase check</td>
+        </tr>
+        <tr>
+            <td><span class="t-smc2">RBPF inner</span></td>
+            <td><span class="t-cpmmh">CPMMH</span></td>
+            <td class="fn-name">cpmmh_rejuvenate(s, K)</td>
+            <td><span class="data-tag tag-array">corr. noise ρ=0.95</span> <span class="data-tag tag-struct">Cholesky L</span></td>
+            <td>When outer ESS &lt; 50%</td>
+        </tr>
+    </tbody>
+    </table>
+    </div>
+
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     §7 — ACTIVITY DIAGRAM
+     ═══════════════════════════════════════════════════════════════ -->
+<section id="activity">
+<div class="container">
+    <span class="section-label">§7</span>
+    <h2>Runtime Activity</h2>
+    <p>
+        The following diagram shows the sequence of operations over one full cycle:
+        1500 ticks of fast-path filtering, followed by a background SMC² window,
+        Kalman update, and parameter push. The three lanes run at different frequencies
+        but synchronize at window boundaries.
+    </p>
+
+    <div class="diagram" style="padding: 1.5rem 1rem;">
+
+        <!-- Swimlane activity diagram -->
+        <div class="activity-lanes">
+            <!-- Headers -->
+            <div class="lane-header lane-h-time">Time</div>
+            <div class="lane-header lane-h-bpf">BPF 2D (Reflex)</div>
+            <div class="lane-header lane-h-smc2">SMC² + RBPF (Sensor)</div>
+            <div class="lane-header lane-h-kalman">Kalman (Tracker)</div>
+
+            <!-- Row 1: Tick-by-tick -->
+            <div class="activity-row">
+                <div class="time-label">t = 0</div>
+                <div><span class="act-node act-bpf">Receive y<sub>0</sub><br>Propagate particles</span></div>
+                <div class="act-empty"></div>
+                <div class="act-empty"></div>
+            </div>
+
+            <div class="activity-row">
+                <div class="time-label">t = 1…</div>
+                <div><span class="act-node act-bpf">Reweight, resample<br>Emit h, z_mean</span></div>
+                <div class="act-empty" style="display:flex; align-items:center; justify-content:center;"><span class="msg-arrow"><span class="msg-line" style="background: var(--accent-bpf);"></span><span style="color: var(--text-dim);">y<sub>t</sub> → buffer</span></span></div>
+                <div class="act-empty"></div>
+            </div>
+
+            <div class="activity-row">
+                <div class="time-label" style="font-style: italic;">⋮ ticks</div>
+                <div style="opacity:0.5;"><span class="act-node act-bpf" style="opacity:0.6; border-style: dashed;">… 1500 ticks …<br>per-tick filtering</span></div>
+                <div class="act-empty"></div>
+                <div class="act-empty"></div>
+            </div>
+
+            <!-- Row: Stride reached -->
+            <div class="activity-row">
+                <div class="time-label" style="color: var(--accent-smc2);">t = 1500<br><span style="font-size:0.6rem;">stride</span></div>
+                <div><span class="act-node act-bpf">Continue filtering<br>(non-blocking)</span></div>
+                <div><span class="act-node act-smc2">Extract y_buf[W]<br>Init from prior</span></div>
+                <div class="act-empty"></div>
+            </div>
+
+            <!-- Row: Phased mask -->
+            <div class="activity-row">
+                <div class="time-label"></div>
+                <div><span class="act-node act-phased" style="font-size:0.72rem;">Feed z_min, z_max<br>→ Phased controller</span></div>
+                <div><span class="act-node act-phased" style="font-size:0.72rem;">Apply fixed_mask<br>from current phase</span></div>
+                <div class="act-empty"></div>
+            </div>
+
+            <!-- Row: SMC² running -->
+            <div class="activity-row">
+                <div class="time-label"></div>
+                <div style="opacity:0.5;"><span class="act-node act-bpf" style="opacity:0.6; border-style: dashed;">… filtering …</span></div>
+                <div><span class="act-node act-smc2">Process W ticks<br>RBPF likelihood<br>per θ-particle</span></div>
+                <div class="act-empty"></div>
+            </div>
+
+            <!-- Row: ESS check -->
+            <div class="activity-row">
+                <div class="time-label"></div>
+                <div class="act-empty"></div>
+                <div><span class="act-node act-smc2" style="font-size:0.72rem;">Check outer ESS<br>ESS &lt; 50%?</span></div>
+                <div class="act-empty"></div>
+            </div>
+
+            <!-- Row: CPMMH -->
+            <div class="activity-row">
+                <div class="time-label"></div>
+                <div class="act-empty"></div>
+                <div><span class="act-node act-cpmmh">CPMMH rejuvenate<br>K rounds, ρ=0.95<br>adaptive Cholesky</span></div>
+                <div class="act-empty"></div>
+            </div>
+
+            <!-- Row: Extract posterior -->
+            <div class="activity-row">
+                <div class="time-label"></div>
+                <div class="act-empty"></div>
+                <div><span class="act-node act-smc2">Extract θ̂<sub>k</sub>, Σ<sub>k</sub>, z̄<br>from weighted particles</span></div>
+                <div class="act-empty" style="display:flex; align-items:center;"><span class="msg-arrow" style="color: var(--text-dim);"><span style="font-size:0.6rem;">θ̂, Σ →</span></span></div>
+            </div>
+
+            <!-- Row: Kalman update -->
+            <div class="activity-row">
+                <div class="time-label" style="color: var(--accent-kalman);">window<br><span style="font-size:0.6rem;">done</span></div>
+                <div class="act-empty"></div>
+                <div class="act-empty"></div>
+                <div><span class="act-node act-kalman">Predict: P̄ = P + Q<br>Update: K·(θ̂ − x)<br>Symmetrize P</span></div>
+            </div>
+
+            <!-- Row: Curve eval + push -->
+            <div class="activity-row">
+                <div class="time-label"></div>
+                <div class="act-empty" style="display:flex; align-items:center; justify-content:center;"><span class="msg-arrow" style="color: var(--text-dim);"><span style="font-size:0.6rem;">← snap</span></span></div>
+                <div class="act-empty"></div>
+                <div><span class="act-node act-kalman">eval_curve(θ, z̄)<br>→ ParamSnapshot</span></div>
+            </div>
+
+            <!-- Row: BPF receives params -->
+            <div class="activity-row">
+                <div class="time-label" style="color: var(--accent-bpf);">t = 1501</div>
+                <div><span class="act-node act-bpf">Receive new params<br>μ(z̄), σ<sub>h</sub>(z̄), σ<sub>z</sub><br>Continue filtering</span></div>
+                <div class="act-empty"></div>
+                <div class="act-empty"></div>
+            </div>
+
+            <!-- Row: Next cycle -->
+            <div class="activity-row">
+                <div class="time-label" style="font-style: italic;">⋮ next<br><span style="font-size:0.6rem;">window</span></div>
+                <div style="opacity:0.4;"><span class="act-node act-bpf" style="opacity:0.6; border-style:dashed;">… cycle repeats …</span></div>
+                <div style="opacity:0.4;"><span class="act-node act-smc2" style="opacity:0.6; border-style:dashed;">… next window …</span></div>
+                <div style="opacity:0.4;"><span class="act-node act-kalman" style="opacity:0.6; border-style:dashed;">… next update …</span></div>
+            </div>
+        </div>
+
+        <div class="diagram-caption">Fig. 3 — Swimlane activity diagram: one full window cycle (1500 ticks)</div>
+    </div>
+
+    <h3>Key Observations</h3>
+    <p>
+        The <span class="t-bpf">BPF</span> never blocks — it continues per-tick
+        filtering throughout the SMC² window computation. Parameter updates are
+        <strong>atomic snapshots</strong>: the BPF reads the latest ParamSnapshot
+        at its next tick, with no synchronization overhead. The SMC² window runs
+        on a background CUDA stream, overlapping with BPF kernel launches on the
+        default stream.
+    </p>
+    <p>
+        The <span class="t-phased">Phased controller</span> operates at the window
+        boundary — it receives z-statistics accumulated during the previous 1500 ticks,
+        checks phase transition triggers, and updates the <code class="inline-code">fixed_mask</code>
+        before SMC² initializes. This means the mask change takes effect
+        <strong>within the same window</strong> that triggered it.
+    </p>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     §8 — SMC² SENSOR
+     ═══════════════════════════════════════════════════════════════ -->
+<section id="smc2">
+<div class="container">
+    <span class="section-label">§8</span>
+    <h2><span class="t-smc2">SMC²</span> — The Sensor</h2>
+    <p>
+        Sequential Monte Carlo squared (<span class="t-smc2">SMC²</span>) is a
+        particle filter over <em>parameters</em>. Each of the 1024 θ-particles
+        proposes a complete parameter vector. For each θ, an inner
+        <span class="t-rbpf">RBPF</span> evaluates how well that parameter
+        explains the observed data — producing a marginal likelihood that
+        determines the particle's weight.
+    </p>
+
+    <div class="algo-card">
+        <div class="algo-card-title">Amnesiac Windows</div>
+        <div class="algo-card-sub">Why reinitialize from prior every window</div>
+        <p>
+            A traveling particle cloud — carried forward across windows — degenerates
+            after ~3000 ticks regardless of particle count. Weight collapse concentrates
+            mass on a few particles, and no amount of rejuvenation recovers diversity
+            in 8 dimensions.
+        </p>
+        <p>
+            The amnesiac design reinitializes all θ-particles from the prior each window.
+            Every window is an independent measurement of the parameter posterior. This
+            eliminates degeneration entirely, at the cost of discarding inter-window
+            memory. The <span class="t-kalman">Kalman tracker</span> recovers that
+            memory by fusing the independent posteriors.
+        </p>
+        <p>
+            Tested: <strong>AMNESIA+KALMAN achieves 0.57 RMSE</strong> vs 0.97 for
+            traveling cloud — a <strong>41% improvement</strong>.
+        </p>
+    </div>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     §9 — RBPF INNER FILTER
+     ═══════════════════════════════════════════════════════════════ -->
+<section id="rbpf">
+<div class="container">
+    <span class="section-label">§9</span>
+    <h2><span class="t-rbpf">RBPF</span> — Rao-Blackwellized Likelihood</h2>
+    <p>
+        For each θ-particle, 512 inner particles track the latent state z̃<sub>t</sub>
+        by particle filtering, while the log-volatility h<sub>t</sub> is integrated out
+        analytically via a Kalman filter conditional on z̃. This
+        <strong>Rao-Blackwellization</strong> dramatically reduces the variance of the
+        marginal likelihood estimate — essential for SMC² to discriminate between
+        θ-particles.
+    </p>
+
+    <h3>OCSN Approximation</h3>
+    <p>
+        The observation model y<sub>t</sub> = exp(h<sub>t</sub>/2) · ε<sub>t</sub> is
+        non-Gaussian in h. The standard trick: transform to log y² = h + log ε²,
+        where log ε² follows a log-χ²(1) distribution. This is approximated by a
+        <strong>10-component Gaussian mixture</strong> (Kim, Shephard & Chib, 1998),
+        enabling closed-form Kalman updates for h conditioned on each mixture component.
+    </p>
+    <p>
+        The RBPF's job is not to produce the best h-estimate — that's the production
+        BPF's role. Its job is to produce <strong>low-variance marginal likelihoods</strong>
+        so SMC² can learn good parameters. The slight approximation from OCSN is
+        acceptable because it's the teacher, not the student.
+    </p>
+
+    <div class="eq-block">
+        <span class="eq-label">RBPF likelihood (per θ-particle)</span>
+        <code>p(y₁:T | θ) = ∏ₜ p(y_t | y₁:t₋₁, θ)
+
+            ≈ ∏ₜ [ (1/N) Σᵢ  Σⱼ  π_j · N(log y²_t ; μ_h,i + m_j, σ²_h,i + v_j) ]
+
+where i indexes z̃-particles, j indexes OCSN mixture components,
+and (μ_h,i, σ²_h,i) is the Kalman posterior for h given z̃_i</code>
+    </div>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     §10 — CPMMH REJUVENATION
+     ═══════════════════════════════════════════════════════════════ -->
+<section id="cpmmh">
+<div class="container">
+    <span class="section-label">§10</span>
+    <h2><span class="t-cpmmh">CPMMH</span> — Rejuvenation</h2>
+    <p>
+        When the outer ESS drops below threshold (typically 50%), θ-particles are
+        resampled and then <strong>rejuvenated</strong> via Correlated Pseudo-Marginal
+        Metropolis-Hastings. Each rejuvenation step proposes a perturbation θ′ near
+        the current θ, replays the window using correlated noise
+        (ρ<sub>CPMMH</sub> ≈ 0.95), and accepts or rejects via the PMMH ratio.
+    </p>
+    <p>
+        Noise correlation is critical: without it, the proposed trajectory would
+        be independent of the current one, making acceptance rates near zero in
+        high dimensions. The correlated construction ensures the proposed likelihood
+        tracks the current one closely, achieving 20–40% acceptance in 8D.
+    </p>
+    <p>
+        Proposals use an <strong>adaptive Cholesky factorization</strong> of the
+        empirical θ-covariance, scaled by 2.38²/d as per optimal random-walk
+        Metropolis theory. The Cholesky is updated after each resampling event.
+    </p>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     §11 — KALMAN STITCHING
+     ═══════════════════════════════════════════════════════════════ -->
+<section id="kalman">
+<div class="container">
+    <span class="section-label">§11</span>
+    <h2><span class="t-kalman">Kalman</span> Stitching</h2>
+    <p>
+        Each amnesiac SMC² window produces an independent measurement (θ̂<sub>k</sub>, Σ<sub>k</sub>).
+        The Kalman filter treats these as observations of slowly-drifting true parameters.
+        With H = I and F = I, the Kalman equations reduce to:
+    </p>
+
+    <div class="eq-block">
+        <span class="eq-label">Kalman predict + update</span>
+        <code>Predict:   P̄ = P + Q
+Innovate:  S = P̄ + Σ_k
+Gain:      K = P̄ · S⁻¹
+Update:    x ← x + K · (θ̂_k − x)
+           P ← (I − K) · P̄</code>
+    </div>
+
+    <p>
+        The key insight: the Kalman <strong>automatically downweights uninformative
+        windows</strong>. When SMC² reports wide Σ<sub>k</sub> (e.g. during calm periods
+        with no signal), S grows large, K shrinks, and the update barely moves x.
+        When Σ<sub>k</sub> is tight (crisis, rich signal), the update is aggressive.
+        No tuning required — the information content of each window is encoded in
+        its covariance.
+    </p>
+
+    <h3>Process Noise Q</h3>
+    <p>
+        Q encodes expected parameter drift per window. Fast parameters
+        (μ<sub>base</sub>: Q = 10⁻³) get large Q, allowing rapid tracking.
+        Slow curve parameters (μ<sub>scale</sub>, σ<sub>rate</sub>: Q = 10⁻⁷)
+        get tiny Q, accumulating information over many windows. This dual-timescale
+        design matches the economic reality: market level shifts weekly,
+        curve shapes shift over months.
+    </p>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     §12 — PHASED LEARNING
+     ═══════════════════════════════════════════════════════════════ -->
+<section id="phased">
+<div class="container">
+    <span class="section-label">§12</span>
+    <h2><span class="t-phased">Phased</span> Learning</h2>
+    <p>
+        Not all eight parameters are identifiable from all data. During calm periods
+        (z ≈ 0), only the floor parameters (ρ, σ<sub>total</sub>, r, μ<sub>base</sub>)
+        are identifiable — curve ceilings and rates require high-stress data to pin down.
+        Trying to learn all 8 from calm data wastes particles exploring the
+        unidentifiable ridge.
+    </p>
+    <p>
+        <strong>Phased learning</strong> uses a ratchet mechanism that progressively
+        unlocks parameters as the observed z-range widens. The ratchet never locks
+        back — once unlocked, parameters stay free. This is correct for the amnesiac
+        architecture because each window starts fresh, and the Kalman handles
+        calm-period uncertainty automatically (wide Σ → low gain).
+    </p>
+
+    <div class="diagram" style="background: var(--bg-surface); padding: 2rem;">
+        <div class="phase-track">
+            <div class="phase-node p1">
+                <div class="phase-label">Phase 1</div>
+                <div class="phase-params">
+                    ρ &nbsp; σ<sub>t</sub> &nbsp; r &nbsp; μ<sub>b</sub>
+                    <br><em style="font-size: 0.65rem; color: var(--text-dim);">floors only</em>
+                </div>
+            </div>
+            <div class="phase-arrow"><span>→</span></div>
+            <div class="phase-node p2">
+                <div class="phase-label">Phase 2</div>
+                <div class="phase-params">
+                    + μ<sub>scale</sub> &nbsp; σ<sub>scale</sub>
+                    <br><em style="font-size: 0.65rem; color: var(--text-dim);">+ ceilings</em>
+                </div>
+            </div>
+            <div class="phase-arrow"><span>→</span></div>
+            <div class="phase-node p3">
+                <div class="phase-label">Phase 3</div>
+                <div class="phase-params">
+                    + μ<sub>rate</sub> &nbsp; σ<sub>rate</sub>
+                    <br><em style="font-size: 0.65rem; color: var(--text-dim);">+ curvature</em>
+                </div>
+            </div>
+        </div>
+        <div class="diagram-caption">Fig. 4 — Ratchet: one-way phase progression as z-range widens</div>
+    </div>
+
+    <p>
+        <strong>Trigger conditions:</strong> Phase 1→2 fires when z<sub>max</sub> exceeds
+        2.0 for 3 consecutive windows (ceilings become identifiable). Phase 2→3 fires
+        when z-range exceeds 1.5 for 3 consecutive windows (curvature becomes identifiable,
+        requiring data at multiple z-levels).
+    </p>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     §13 — DESIGN DECISIONS
+     ═══════════════════════════════════════════════════════════════ -->
+<section id="decisions">
+<div class="container">
+    <span class="section-label">§13</span>
+    <h2>Design Decisions</h2>
+    <p>
+        Several architectural alternatives were implemented and tested before
+        arriving at the current design. Each was evaluated on multi-regime
+        synthetic data spanning calm, crisis, and recovery periods.
+    </p>
+
+    <div class="decision-grid">
+        <div class="decision-card adopted">
+            <div class="decision-verdict">Adopted</div>
+            <div class="decision-name">Amnesiac + Kalman</div>
+            <div class="decision-reason">
+                0.57 RMSE vs 0.97 traveling cloud (−41%). Each window is an independent
+                sensor. Kalman fuses them optimally. No particle degeneration.
+            </div>
+        </div>
+
+        <div class="decision-card rejected">
+            <div class="decision-verdict">Rejected</div>
+            <div class="decision-name">Traveling Cloud</div>
+            <div class="decision-reason">
+                Weight collapse after ~3K ticks. Rejuvenation cannot recover diversity
+                in 8D. Degenerates regardless of particle count.
+            </div>
+        </div>
+
+        <div class="decision-card adopted">
+            <div class="decision-verdict">Adopted</div>
+            <div class="decision-name">Ratchet (One-Way)</div>
+            <div class="decision-reason">
+                0.60 RMSE, 10/12 segment wins. Stays at Phase 3 continuously.
+                Calm-period cost is just wider posteriors, which Kalman absorbs.
+            </div>
+        </div>
+
+        <div class="decision-card rejected">
+            <div class="decision-verdict">Rejected</div>
+            <div class="decision-name">Bidirectional Valve</div>
+            <div class="decision-reason">
+                +23% RMSE vs ratchet. Re-unlock latency after calm periods (6 windows
+                minimum). Solves a problem that doesn't exist in amnesiac architecture.
+            </div>
+        </div>
+
+        <div class="decision-card adopted">
+            <div class="decision-verdict">Adopted</div>
+            <div class="decision-name">RBPF Inside SMC²</div>
+            <div class="decision-reason">
+                Rao-Blackwellization gives low-variance likelihoods. Essential for
+                discriminating 1024 θ-particles. BPF inner was tested — signal too noisy.
+            </div>
+        </div>
+
+        <div class="decision-card rejected">
+            <div class="decision-verdict">Rejected</div>
+            <div class="decision-name">Warm-Start from Kalman</div>
+            <div class="decision-reason">
+                +25% RMSE. Creates feedback trap — particles confirm Kalman's early bias.
+                Cold init preserves independence that makes fusion robust.
+            </div>
+        </div>
+    </div>
+</div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     §14 — PRODUCTION STACK
+     ═══════════════════════════════════════════════════════════════ -->
+<section id="stack">
+<div class="container">
+    <span class="section-label">§14</span>
+    <h2>Production Stack</h2>
+    <p>
+        The full production pipeline chains four particle filters at decreasing
+        timescales, plus a liquidity BPF for market microstructure.
+        Total latency budget: <strong>&lt;600μs at 1ms tick rate</strong>.
+    </p>
+
+    <div class="diagram" style="padding: 2rem;">
+        <div class="stack-row">
+            <span class="stack-chip" style="border-color: var(--accent-smc2); color: var(--accent-smc2);">
+                SMC² &nbsp;512×512
+            </span>
+            <span class="stack-arrow">→</span>
+            <span class="stack-chip" style="border-color: var(--accent-bpf); color: var(--accent-bpf);">
+                Vol BPF 2D &nbsp;5K
+            </span>
+            <span class="stack-arrow">→</span>
+            <span class="stack-chip" style="border-color: var(--accent-phased); color: var(--accent-phased);">
+                Liq BPF 3D &nbsp;2K
+            </span>
+            <span class="stack-arrow">→</span>
+            <span class="stack-chip" style="border-color: var(--accent-cpmmh); color: var(--accent-cpmmh);">
+                Noise BPF 1D &nbsp;1K
+            </span>
+        </div>
+        <div class="diagram-caption">Fig. 5 — Production filter stack · total &lt;600μs @ 1ms tick</div>
+    </div>
+
+    <div class="eq-block">
+        <span class="eq-label">Latency budget</span>
+        <code>SMC²(512×512)   — background, every 1500 ticks (~ms)
+Vol BPF 2D(5K)  — per-tick, tracks (h, z̃)
+Liq BPF 3D(2K)  — per-tick, online Kalman for 9 liq params
+Noise BPF 1D(1K) — per-tick, microstructure noise floor</code>
+    </div>
+
+    <p>
+        The liquidity filter uses online Kalman for its 9 parameters
+        (6 means + 3 calm-state AR coefficients) and offline SMC² only
+        for structural parameter changes. The noise filter estimates the
+        observation noise floor for the volatility filter's likelihood.
+    </p>
+</div>
+</section>
+
+</main>
+
+<!-- ═══════════════════════════════════════════════════════════════
+     FOOTER
+     ═══════════════════════════════════════════════════════════════ -->
+<footer>
+    <div class="container">
+        CUDA / SM_120 (Blackwell) &nbsp;·&nbsp; RTX 5080 &nbsp;·&nbsp; NVCC 13.x &nbsp;·&nbsp; C++20
+    </div>
+</footer>
+
+</body>
+</html>
