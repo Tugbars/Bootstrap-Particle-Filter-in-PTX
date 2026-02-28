@@ -1,8 +1,8 @@
 ################################################################################
-# CMakeLists.txt — BPF PTX Educational Project
+# CMakeLists.txt — BPF PTX Project
 #
 # Directory layout:
-#   gpu_bpf/          — Host-side BPF/APF implementations + PTX driver
+#   gpu_bpf/          — PTX BPF library (delegated)
 #   ptx_assembly/     — Hand-written PTX kernels and pre-compiled cubins
 #   smc2/             — SMC² RBPF parameter learner (delegated)
 #   tests/            — BPF test harnesses and diagnostics
@@ -92,25 +92,6 @@ else()
     message(WARNING "ptxas not found — cubin will not be pre-compiled.")
 endif()
 
-# --- Weight-only PTX (7 kernels) ---
-set(PTX_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/ptx_assembly/bpf_kernels.ptx")
-set(CUBIN_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/bpf_kernels.cubin")
-
-if(PTXAS_EXECUTABLE AND EXISTS "${PTX_SOURCE}")
-    add_custom_command(
-        OUTPUT  "${CUBIN_OUTPUT}"
-        COMMAND "${PTXAS_EXECUTABLE}" -arch=sm_120 -o "${CUBIN_OUTPUT}" "${PTX_SOURCE}" --verbose
-        DEPENDS "${PTX_SOURCE}"
-        COMMENT "Compiling bpf_kernels.ptx -> cubin (SM_120)"
-        VERBATIM
-    )
-    add_custom_target(ptx_cubin ALL DEPENDS "${CUBIN_OUTPUT}")
-endif()
-
-if(EXISTS "${PTX_SOURCE}")
-    configure_file("${PTX_SOURCE}" "${CMAKE_CURRENT_BINARY_DIR}/bpf_kernels.ptx" COPYONLY)
-endif()
-
 # --- Full PTX (14 kernels) ---
 set(PTX_FULL_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/ptx_assembly/bpf_kernels_full.ptx")
 set(CUBIN_FULL_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/bpf_kernels_full.cubin")
@@ -131,155 +112,52 @@ if(EXISTS "${PTX_FULL_SOURCE}")
 endif()
 
 # ==============================================================================
-# Library: gpu_bpf (nvcc BPF/APF — legacy)
+# Subdirectories
 # ==============================================================================
 
-add_library(gpu_bpf STATIC gpu_bpf/gpu_bpf.cu)
-
-target_link_libraries(gpu_bpf PRIVATE CUDA::cudart CUDA::curand)
-
-target_include_directories(gpu_bpf PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/gpu_bpf
-    ${CUDAToolkit_INCLUDE_DIRS}
-)
-
-set_target_properties(gpu_bpf PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
-
-# ==============================================================================
-# Library: gpu_bpf_ptx_full (100% PTX BPF — 14 kernels)
-# ==============================================================================
-
-add_library(gpu_bpf_ptx_full STATIC gpu_bpf/gpu_bpf_ptx_full.cu)
-
-target_link_libraries(gpu_bpf_ptx_full
-    PRIVATE CUDA::cuda_driver CUDA::cudart CUDA::curand
-)
-
-target_include_directories(gpu_bpf_ptx_full PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/gpu_bpf
-    ${CUDAToolkit_INCLUDE_DIRS}
-)
-
-set_target_properties(gpu_bpf_ptx_full PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
-
-# ==============================================================================
-# Subdirectory: smc2 (SMC² RBPF parameter learner + all SMC² tests)
-# ==============================================================================
-
+add_subdirectory(gpu_bpf)
 add_subdirectory(smc2)
 
 # ==============================================================================
 # BPF tests (live in tests/)
 # ==============================================================================
 
-# --- test_mix_bands ---
-add_executable(test_mix_bands tests/test_mix_bands.cu)
-target_link_libraries(test_mix_bands PRIVATE gpu_bpf CUDA::cudart CUDA::curand)
-set_target_properties(test_mix_bands PROPERTIES
-    CUDA_SEPARABLE_COMPILATION OFF
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-)
+# Helper for BPF tests
+function(bpf_add_test TARGET_NAME SOURCE)
+    add_executable(${TARGET_NAME} ${SOURCE})
+    target_link_libraries(${TARGET_NAME} PRIVATE
+        gpu_bpf_ptx_full CUDA::cuda_driver CUDA::cudart CUDA::curand
+    )
+    target_include_directories(${TARGET_NAME} PRIVATE
+        ${CMAKE_SOURCE_DIR}/gpu_bpf
+    )
+    set_target_properties(${TARGET_NAME} PROPERTIES
+        CUDA_SEPARABLE_COMPILATION OFF
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+    )
+    if(TARGET ptx_cubin_full)
+        add_dependencies(${TARGET_NAME} ptx_cubin_full)
+    endif()
+endfunction()
 
-# --- test_bpf_ptx_full (matched-DGP accuracy) ---
-add_executable(test_bpf_ptx_full tests/test_bpf_matched_dgp.cu)
-target_link_libraries(test_bpf_ptx_full PRIVATE
-    gpu_bpf_ptx_full CUDA::cuda_driver CUDA::cudart CUDA::curand
-)
-target_include_directories(test_bpf_ptx_full PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/gpu_bpf)
-set_target_properties(test_bpf_ptx_full PROPERTIES
-    CUDA_SEPARABLE_COMPILATION OFF
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-)
-if(TARGET ptx_cubin_full)
-    add_dependencies(test_bpf_ptx_full ptx_cubin_full)
-endif()
+bpf_add_test(test_bpf_ptx_full       tests/test_bpf_matched_dgp.cu)
+bpf_add_test(test_bpf_ptx_stress     tests/test_bpf_ptx_stress.cu)
+bpf_add_test(test_jump_bands         tests/test_jump_bands.cu)
 
-# --- bench_particle_scaling ---
-add_executable(bench_particle_scaling tests/bench_particle_scaling.cu)
+# bench_particle_scaling needs USE_PTX_FULL define
+bpf_add_test(bench_particle_scaling   tests/bench_particle_scaling.cu)
 target_compile_definitions(bench_particle_scaling PRIVATE USE_PTX_FULL=1)
-target_link_libraries(bench_particle_scaling PRIVATE
-    gpu_bpf_ptx_full CUDA::cuda_driver CUDA::cudart CUDA::curand
-)
-target_include_directories(bench_particle_scaling PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/gpu_bpf)
-set_target_properties(bench_particle_scaling PROPERTIES
-    CUDA_SEPARABLE_COMPILATION OFF
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-)
-if(TARGET ptx_cubin_full)
-    add_dependencies(bench_particle_scaling ptx_cubin_full)
-endif()
 
-# --- test_bpf_adaptive_stress ---
-add_executable(test_bpf_adaptive_stress tests/test_bpf_adaptive_stress.cu)
-target_link_libraries(test_bpf_adaptive_stress PRIVATE
-    gpu_bpf_ptx_full smc2_rbpf CUDA::cuda_driver CUDA::cudart CUDA::curand
-)
-set_target_properties(test_bpf_adaptive_stress PROPERTIES
-    CUDA_SEPARABLE_COMPILATION OFF
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-)
+# Tests that also need smc2_rbpf
+bpf_add_test(test_bpf_adaptive_stress tests/test_bpf_adaptive_stress.cu)
+target_link_libraries(test_bpf_adaptive_stress PRIVATE smc2_rbpf)
 
-# --- test_bpf_ptx_stress ---
-add_executable(test_bpf_ptx_stress tests/test_bpf_ptx_stress.cu)
-target_link_libraries(test_bpf_ptx_stress PRIVATE
-    gpu_bpf_ptx_full CUDA::cuda_driver CUDA::cudart CUDA::curand
-)
-set_target_properties(test_bpf_ptx_stress PROPERTIES
-    CUDA_SEPARABLE_COMPILATION OFF
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-)
-if(TARGET ptx_cubin_full)
-    add_dependencies(test_bpf_ptx_stress ptx_cubin_full)
-endif()
+bpf_add_test(test_jump_stress         tests/test_jump_stress.cu)
+target_link_libraries(test_jump_stress PRIVATE smc2_rbpf)
 
-# --- test_cond_resample ---
-add_executable(test_cond_resample tests/test_cond_resample.cu gpu_bpf/gpu_bpf.cu)
-target_include_directories(test_cond_resample PRIVATE gpu_bpf)
-target_link_libraries(test_cond_resample curand)
-set_target_properties(test_cond_resample PROPERTIES
-    CUDA_SEPARABLE_COMPILATION OFF
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-)
-
-# --- bench_grad_overhead ---
-add_executable(bench_grad_overhead tests/bench_grad_overhead.cu)
-target_include_directories(bench_grad_overhead PRIVATE
-    ${CMAKE_SOURCE_DIR}/include ${CUDAToolkit_INCLUDE_DIRS}
-)
-target_link_libraries(bench_grad_overhead PRIVATE
-    gpu_bpf_ptx_full smc2_rbpf CUDA::cuda_driver CUDA::cudart CUDA::curand
-)
-
-# --- test_jump_stress ---
-add_executable(test_jump_stress tests/test_jump_stress.cu)
-target_include_directories(test_jump_stress PRIVATE
-    ${CMAKE_SOURCE_DIR}/gpu_bpf ${CUDAToolkit_INCLUDE_DIRS}
-)
-target_link_libraries(test_jump_stress PRIVATE
-    gpu_bpf_ptx_full smc2_rbpf CUDA::cuda_driver CUDA::cudart CUDA::curand
-)
-set_target_properties(test_jump_stress PROPERTIES
-    CUDA_SEPARABLE_COMPILATION OFF
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-)
-
-# --- test_jump_bands ---
-add_executable(test_jump_bands tests/test_jump_bands.cu)
-target_include_directories(test_jump_bands PRIVATE
-    ${CMAKE_SOURCE_DIR}/gpu_bpf ${CUDAToolkit_INCLUDE_DIRS}
-)
-target_link_libraries(test_jump_bands PRIVATE
-    gpu_bpf_ptx_full CUDA::cuda_driver CUDA::cudart CUDA::curand
-)
-set_target_properties(test_jump_bands PROPERTIES
-    CUDA_SEPARABLE_COMPILATION OFF
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
-)
-if(TARGET ptx_cubin_full)
-    add_dependencies(test_jump_bands ptx_cubin_full)
-endif()
+bpf_add_test(bench_grad_overhead      tests/bench_grad_overhead.cu)
+target_link_libraries(bench_grad_overhead PRIVATE smc2_rbpf)
+target_include_directories(bench_grad_overhead PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
 # ==============================================================================
 # Print summary
@@ -293,7 +171,6 @@ message(STATUS "  CUDA architectures:${CMAKE_CUDA_ARCHITECTURES}")
 message(STATUS "  Build type:        ${CMAKE_BUILD_TYPE}")
 message(STATUS "")
 message(STATUS "  Libraries:")
-message(STATUS "    gpu_bpf           — nvcc BPF/APF (legacy)")
-message(STATUS "    gpu_bpf_ptx_full  — PTX BPF (14 kernels)")
+message(STATUS "    gpu_bpf_ptx_full  — PTX BPF (14 kernels, via gpu_bpf/)")
 message(STATUS "    smc2_rbpf         — SMC² RBPF (8-param, via smc2/)")
 message(STATUS "-------------------------------------------")
