@@ -23,6 +23,14 @@
  * The tracker also evaluates curves at the current z̄ estimate to produce
  * scalar parameters (μ, σ_h, θ) ready for the production BPF.
  *
+ * Warm-start: SHELVED (+25% RMSE, feedback trap). Always cold-starts from prior.
+ *
+ * Convergence gating (v3):
+ *   Per-parameter R̂ diagnostic tracks window agreement. The snapshot
+ *   pushed to BPF uses Kalman estimates only for converged params
+ *   (R̂ < threshold). Non-converged params hold at prior defaults.
+ *   This prevents half-baked curve shapes from corrupting BPF 2D.
+ *
  * Usage:
  *   ParamTracker* t = param_tracker_create(3000, 500, 1024, 512);
  *   // ... per tick:
@@ -98,6 +106,10 @@ typedef struct {
  */
 typedef struct ParamTracker ParamTracker;
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Lifecycle
+ * ═══════════════════════════════════════════════════════════════════════════*/
+
 /**
  * @brief Create a parameter tracker
  * @param window_size   Number of observations per SMC² window (e.g., 3000)
@@ -114,6 +126,10 @@ ParamTracker *param_tracker_create(int window_size, int stride, int N_theta,
  */
 void param_tracker_destroy(ParamTracker *t);
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Per-tick feed + window trigger
+ * ═══════════════════════════════════════════════════════════════════════════*/
+
 /**
  * @brief Feed one observation into the circular buffer
  * @param y_obs  Observation (log(y²) for OCSN, or raw return — match your DGP)
@@ -129,19 +145,28 @@ int param_tracker_window_ready(const ParamTracker *t);
 /**
  * @brief Run SMC² on the current window, then Kalman update
  *
- * Resets the internal SMC² instance, feeds the window of observations,
- * extracts θ̂ and Σ, runs Kalman predict+update, evaluates curves at z̄.
+ * Initializes SMC² from prior, runs on window_size observations,
+ * extracts posterior, updates Kalman, runs convergence diagnostic,
+ * and pushes convergence-gated snapshot.
  *
  * This is the expensive call — runs SMC² on `window_size` observations.
  * Call only when param_tracker_window_ready() returns 1.
  */
 void param_tracker_run_window(ParamTracker *t);
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Output
+ * ═══════════════════════════════════════════════════════════════════════════*/
+
 /**
  * @brief Get the current filtered parameter snapshot
  * @param snap  Output snapshot with filtered params + BPF-ready values
  */
 void param_tracker_get_snapshot(const ParamTracker *t, ParamSnapshot *snap);
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Configuration
+ * ═══════════════════════════════════════════════════════════════════════════*/
 
 /**
  * @brief Set process noise (drift rates) for the Kalman filter
@@ -174,6 +199,10 @@ void param_tracker_set_theta_curve(ParamTracker *t, float base, float scale,
  */
 void param_tracker_set_P_floor(ParamTracker *t, const float *p_floor);
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Internal access + warm-start control
+ * ═══════════════════════════════════════════════════════════════════════════*/
+
 /**
  * @brief Access the internal SMC² state (for custom prior/bounds setup)
  *
@@ -186,6 +215,100 @@ SMC2StateCUDA *param_tracker_get_smc2(ParamTracker *t);
  * @brief Get the full Kalman covariance P (8×8, row-major)
  */
 void param_tracker_get_P(const ParamTracker *t, float *P_out);
+
+/**
+ * @brief Force next window to cold-start from prior (not warm-start)
+ *
+ * Call this after a phase transition unlocks new parameters. The Kalman
+ * has no information about newly-freed dimensions — warm-starting would
+ * place all particles at the same (fixed) value for those params, giving
+ * no diversity and no exploration.
+ *
+ * Resets the Kalman so the next window explores from prior, then
+ * subsequent windows resume warm-starting once the Kalman has
+ * incorporated the new dimensions (after ≥2 updates).
+ */
+void param_tracker_force_cold(ParamTracker *t);
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Diagnostics
+ * ═══════════════════════════════════════════════════════════════════════════*/
+
+/**
+ * @brief Print current tracker state (Kalman estimates + uncertainties)
+ */
+void param_tracker_print(const ParamTracker *t);
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Convergence gating
+ * ═══════════════════════════════════════════════════════════════════════════*/
+
+/* Gate modes — per-parameter convergence strategy */
+#define GATE_KALMAN_MIN  0   /* Push Kalman x after min_windows. No R̂. Fast params. */
+#define GATE_RHAT_LATCH  1   /* R̂ gate with one-way latch. Curve params.            */
+#define GATE_LOCKED      2   /* Always prior default. Param not free.               */
+
+/* Forward-declare from smc2_convergence_diag.h — include that header
+ * for the full struct definition when calling param_tracker_get_conv_report(). */
+struct ConvergenceReport;
+
+/**
+ * @brief Set which parameters are free (1) vs locked (0)
+ *
+ * Called by the phased learning controller after phase transitions.
+ * Locked params get GATE_LOCKED mode and hold at prior_default.
+ * Kalman still updates internally for all params regardless.
+ *
+ * @param mask  Array of N_PARAMS ints: 1 = free, 0 = locked
+ */
+void param_tracker_set_free_mask(ParamTracker *t, const int *mask);
+
+/**
+ * @brief Set gate mode for a specific parameter
+ *
+ * @param param_idx  Parameter index (0-7)
+ * @param mode       GATE_KALMAN_MIN, GATE_RHAT_LATCH, or GATE_LOCKED
+ */
+void param_tracker_set_gate_mode(ParamTracker *t, int param_idx, int mode);
+
+/**
+ * @brief Set minimum window count for GATE_KALMAN_MIN (default: 2)
+ */
+void param_tracker_set_min_windows(ParamTracker *t, int n);
+
+/**
+ * @brief Override prior default values used as fallback for non-converged params
+ */
+void param_tracker_set_prior_defaults(ParamTracker *t, const float *defaults);
+
+/**
+ * @brief Set R̂ threshold for GATE_RHAT_LATCH convergence (default: 1.5)
+ */
+void param_tracker_set_rhat_threshold(ParamTracker *t, float thresh);
+
+/**
+ * @brief Get the full convergence report (R̂, Mahalanobis, P-trace, CV)
+ *
+ * Requires #include "smc2_convergence_diag.h" for the ConvergenceReport struct.
+ */
+void param_tracker_get_conv_report(const ParamTracker *t,
+                                    struct ConvergenceReport *rpt);
+
+/**
+ * @brief Get per-parameter convergence flags
+ *
+ * @param out  Array of N_PARAMS ints: 1=converged, 0=not, -1=locked
+ */
+void param_tracker_get_converged(const ParamTracker *t, int *out);
+
+/**
+ * @brief Get raw Kalman state (bypasses convergence gating)
+ *
+ * Unlike param_tracker_get_snapshot() which returns gated values,
+ * this returns the actual Kalman-filtered estimates regardless of
+ * convergence status. Use for diagnostics and monitoring.
+ */
+void param_tracker_get_kalman_x(const ParamTracker *t, float *x_out);
 
 #ifdef __cplusplus
 }

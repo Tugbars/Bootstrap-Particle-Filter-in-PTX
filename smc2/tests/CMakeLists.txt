@@ -12,7 +12,8 @@
 #   smc2/tests/test_bidirectional_phased.cu
 #   smc2/tests/test_kalman_fair.cu
 #   smc2/tests/test_mu_learning.cu
-#   smc2/tests/test_warm_start.cu
+#   smc2/tests/test_convergence_diag.cu
+#   smc2/tests/test_convergence_gate.cu
 ################################################################################
 
 # ==============================================================================
@@ -63,6 +64,8 @@ endfunction()
 smc2_add_test(test_smc2_rbpf)
 smc2_add_test(test_param_tracker)
 smc2_add_test(test_4param_drift)
+smc2_add_test(test_convergence_diag)
+smc2_add_test(test_convergence_gate      NEEDS_BPF)
 
 # ==============================================================================
 # SMC² + BPF pipeline tests
