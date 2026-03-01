@@ -14,6 +14,7 @@
 #   smc2/tests/test_mu_learning.cu
 #   smc2/tests/test_convergence_diag.cu
 #   smc2/tests/test_convergence_gate.cu
+#   smc2/tests/test_rhat_latch.cu
 ################################################################################
 
 # ==============================================================================
@@ -66,6 +67,7 @@ smc2_add_test(test_param_tracker)
 smc2_add_test(test_4param_drift)
 smc2_add_test(test_convergence_diag)
 smc2_add_test(test_convergence_gate      NEEDS_BPF)
+smc2_add_test(test_rhat_latch            NEEDS_BPF)
 
 # ==============================================================================
 # SMC² + BPF pipeline tests
