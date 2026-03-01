@@ -631,12 +631,19 @@ void param_tracker_print(const ParamTracker* t) {
 
 void param_tracker_set_free_mask(ParamTracker* t, const int* mask) {
     memcpy(t->free_mask, mask, N_PARAMS * sizeof(int));
-    /* Set locked params to GATE_LOCKED */
     for (int i = 0; i < N_PARAMS; i++) {
         if (!mask[i]) {
+            /* Locked: hold at prior default */
             t->gate_mode[i] = GATE_LOCKED;
             t->converged[i] = -1;
+        } else if (t->gate_mode[i] == GATE_LOCKED) {
+            /* Was locked, now free: restore appropriate default mode.
+             * Phase 1 params (0-3) get KALMAN_MIN, Phase 2/3 (4-7) get RHAT_LATCH.
+             * Caller can override with set_gate_mode() after this call. */
+            t->gate_mode[i] = (i < 4) ? GATE_KALMAN_MIN : GATE_RHAT_LATCH;
+            t->converged[i] = 0;  /* not yet converged in new mode */
         }
+        /* If already free and converged (latch=1), don't touch it */
     }
 }
 
