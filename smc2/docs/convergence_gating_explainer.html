@@ -1,0 +1,869 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Convergence Gating — ParamTracker Logic</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=DM+Sans:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0e17;
+    --bg2: #111827;
+    --bg3: #1a2235;
+    --border: #2a3654;
+    --text: #c9d1d9;
+    --text-dim: #6b7b95;
+    --text-bright: #e6edf6;
+    --accent-blue: #58a6ff;
+    --accent-green: #3fb950;
+    --accent-red: #f85149;
+    --accent-amber: #d29922;
+    --accent-purple: #bc8cff;
+    --accent-cyan: #56d4dd;
+    --gate-kalman: #2ea043;
+    --gate-rhat: #9b6dff;
+    --gate-locked: #484f58;
+    --latch-glow: rgba(63, 185, 80, 0.15);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'DM Sans', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+    overflow-x: hidden;
+  }
+
+  .grain {
+    position: fixed; inset: 0; z-index: 999; pointer-events: none;
+    opacity: 0.03;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+
+  /* ── Header ── */
+  header {
+    padding: 5rem 2rem 3rem;
+    text-align: center;
+    background: linear-gradient(180deg, #0d1525 0%, var(--bg) 100%);
+    border-bottom: 1px solid var(--border);
+    position: relative;
+    overflow: hidden;
+  }
+
+  header::before {
+    content: '';
+    position: absolute; inset: 0;
+    background: radial-gradient(ellipse 800px 400px at 50% 0%, rgba(88,166,255,0.06) 0%, transparent 70%);
+  }
+
+  header h1 {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: clamp(1.8rem, 4vw, 3rem);
+    font-weight: 700;
+    color: var(--text-bright);
+    letter-spacing: -0.02em;
+    position: relative;
+  }
+
+  header h1 span { color: var(--accent-blue); }
+
+  header p.subtitle {
+    margin-top: 1rem;
+    font-size: 1.1rem;
+    color: var(--text-dim);
+    max-width: 640px;
+    margin-inline: auto;
+  }
+
+  /* ── Container ── */
+  .container {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 0 2rem;
+  }
+
+  /* ── Sections ── */
+  section {
+    padding: 4rem 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  section:last-child { border-bottom: none; }
+
+  h2 {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 1.5rem;
+    font-weight: 700;
+    color: var(--text-bright);
+    margin-bottom: 1.5rem;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+  }
+
+  h2 .num {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 2rem; height: 2rem;
+    border-radius: 6px;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    font-size: 0.85rem;
+    color: var(--accent-blue);
+  }
+
+  h3 {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 1.1rem;
+    color: var(--accent-cyan);
+    margin: 2rem 0 1rem;
+  }
+
+  p { margin-bottom: 1rem; max-width: 72ch; }
+
+  /* ── The Problem diagram ── */
+  .problem-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.5rem;
+    margin: 2rem 0;
+  }
+
+  @media (max-width: 640px) {
+    .problem-grid { grid-template-columns: 1fr; }
+  }
+
+  .problem-card {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.5rem;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .problem-card.bad { border-color: var(--accent-red); }
+  .problem-card.bad::before {
+    content: '';
+    position: absolute; top: 0; left: 0; right: 0; height: 3px;
+    background: var(--accent-red);
+  }
+
+  .problem-card.good { border-color: var(--accent-green); }
+  .problem-card.good::before {
+    content: '';
+    position: absolute; top: 0; left: 0; right: 0; height: 3px;
+    background: var(--accent-green);
+  }
+
+  .problem-card h4 {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 0.75rem;
+  }
+
+  .problem-card.bad h4 { color: var(--accent-red); }
+  .problem-card.good h4 { color: var(--accent-green); }
+
+  .problem-card p { font-size: 0.95rem; color: var(--text-dim); margin: 0; }
+
+  /* ── Gate mode cards ── */
+  .gate-cards {
+    display: flex;
+    flex-direction: column;
+    gap: 1.5rem;
+    margin: 2rem 0;
+  }
+
+  .gate-card {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 2rem;
+    position: relative;
+    overflow: hidden;
+    transition: border-color 0.3s;
+  }
+
+  .gate-card:hover { border-color: var(--accent-blue); }
+
+  .gate-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; bottom: 0; width: 4px;
+  }
+
+  .gate-card.kalmin::before { background: var(--gate-kalman); }
+  .gate-card.rhat::before { background: var(--gate-rhat); }
+  .gate-card.locked::before { background: var(--gate-locked); }
+
+  .gate-header {
+    display: flex;
+    align-items: baseline;
+    gap: 1rem;
+    margin-bottom: 1rem;
+  }
+
+  .gate-name {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 1.15rem;
+    font-weight: 700;
+    color: var(--text-bright);
+  }
+
+  .gate-card.kalmin .gate-name { color: var(--gate-kalman); }
+  .gate-card.rhat .gate-name { color: var(--gate-rhat); }
+  .gate-card.locked .gate-name { color: var(--gate-locked); }
+
+  .gate-params {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    background: var(--bg);
+    padding: 0.2rem 0.6rem;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+  }
+
+  .gate-body {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.5rem;
+  }
+
+  @media (max-width: 640px) {
+    .gate-body { grid-template-columns: 1fr; }
+  }
+
+  .gate-logic, .gate-why {
+    font-size: 0.95rem;
+  }
+
+  .gate-logic h5, .gate-why h5 {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    margin-bottom: 0.5rem;
+  }
+
+  /* ── Code blocks ── */
+  .pseudocode {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.82rem;
+    line-height: 1.8;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.25rem 1.5rem;
+    overflow-x: auto;
+    margin: 1rem 0;
+  }
+
+  .pseudocode .kw { color: var(--accent-purple); }
+  .pseudocode .fn { color: var(--accent-blue); }
+  .pseudocode .cm { color: var(--text-dim); font-style: italic; }
+  .pseudocode .val { color: var(--accent-green); }
+  .pseudocode .str { color: var(--accent-amber); }
+
+  /* ── Timeline ── */
+  .timeline {
+    position: relative;
+    margin: 2.5rem 0;
+    padding-left: 2.5rem;
+  }
+
+  .timeline::before {
+    content: '';
+    position: absolute;
+    left: 0.75rem; top: 0; bottom: 0;
+    width: 2px;
+    background: var(--border);
+  }
+
+  .tl-event {
+    position: relative;
+    margin-bottom: 2rem;
+    padding: 1.25rem 1.5rem;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+  }
+
+  .tl-event::before {
+    content: '';
+    position: absolute;
+    left: -2.05rem; top: 1.5rem;
+    width: 12px; height: 12px;
+    border-radius: 50%;
+    background: var(--bg3);
+    border: 2px solid var(--accent-blue);
+  }
+
+  .tl-event.latch::before {
+    background: var(--accent-green);
+    border-color: var(--accent-green);
+    box-shadow: 0 0 12px rgba(63,185,80,0.4);
+  }
+
+  .tl-event.danger::before {
+    background: var(--accent-red);
+    border-color: var(--accent-red);
+  }
+
+  .tl-event.transition::before {
+    background: var(--accent-purple);
+    border-color: var(--accent-purple);
+  }
+
+  .tl-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.8rem;
+    color: var(--accent-blue);
+    margin-bottom: 0.25rem;
+  }
+
+  .tl-event.latch .tl-label { color: var(--accent-green); }
+  .tl-event.danger .tl-label { color: var(--accent-red); }
+  .tl-event.transition .tl-label { color: var(--accent-purple); }
+
+  .tl-text { font-size: 0.95rem; color: var(--text); margin: 0; }
+  .tl-detail { font-size: 0.85rem; color: var(--text-dim); margin-top: 0.25rem; }
+
+  /* ── Latch visualization ── */
+  .latch-demo {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 2rem;
+    margin: 2rem 0;
+    text-align: center;
+  }
+
+  .latch-track {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    margin: 1.5rem 0;
+    flex-wrap: wrap;
+  }
+
+  .latch-cell {
+    width: 36px; height: 36px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.65rem;
+    font-weight: 600;
+    transition: all 0.3s;
+    cursor: default;
+    position: relative;
+  }
+
+  .latch-cell.prior {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+  }
+
+  .latch-cell.kalman {
+    background: rgba(46, 160, 67, 0.15);
+    border: 1px solid var(--gate-kalman);
+    color: var(--gate-kalman);
+  }
+
+  .latch-cell.reverted {
+    background: rgba(248, 81, 73, 0.15);
+    border: 1px solid var(--accent-red);
+    color: var(--accent-red);
+  }
+
+  .latch-cell.latch-point {
+    box-shadow: 0 0 12px rgba(63, 185, 80, 0.4);
+  }
+
+  .latch-labels {
+    display: flex;
+    justify-content: center;
+    gap: 2rem;
+    margin-top: 1rem;
+  }
+
+  .latch-label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.8rem;
+    color: var(--text-dim);
+  }
+
+  .latch-label .dot {
+    width: 10px; height: 10px;
+    border-radius: 3px;
+  }
+
+  .latch-label .dot.prior-dot { background: var(--bg3); border: 1px solid var(--border); }
+  .latch-label .dot.kalman-dot { background: var(--gate-kalman); }
+  .latch-label .dot.revert-dot { background: var(--accent-red); }
+
+  /* ── Flow diagram ── */
+  .flow-container {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 2rem;
+    margin: 2rem 0;
+    overflow-x: auto;
+  }
+
+  .flow-svg { width: 100%; max-width: 820px; margin: 0 auto; display: block; }
+
+  /* ── Data table ── */
+  .data-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1.5rem 0;
+    font-size: 0.9rem;
+  }
+
+  .data-table th {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-dim);
+    padding: 0.75rem 1rem;
+    text-align: left;
+    border-bottom: 2px solid var(--border);
+  }
+
+  .data-table td {
+    padding: 0.6rem 1rem;
+    border-bottom: 1px solid rgba(42,54,84,0.5);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.85rem;
+  }
+
+  .data-table tr:hover { background: rgba(88,166,255,0.03); }
+
+  .badge {
+    display: inline-block;
+    padding: 0.1rem 0.5rem;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    font-weight: 600;
+  }
+
+  .badge.kal { background: rgba(46,160,67,0.15); color: var(--gate-kalman); border: 1px solid var(--gate-kalman); }
+  .badge.rhat { background: rgba(155,109,255,0.15); color: var(--gate-rhat); border: 1px solid var(--gate-rhat); }
+  .badge.lock { background: rgba(72,79,88,0.3); color: var(--gate-locked); border: 1px solid var(--gate-locked); }
+
+  /* ── Callout ── */
+  .callout {
+    background: var(--bg3);
+    border-left: 3px solid var(--accent-amber);
+    border-radius: 0 8px 8px 0;
+    padding: 1.25rem 1.5rem;
+    margin: 1.5rem 0;
+    font-size: 0.95rem;
+  }
+
+  .callout.danger { border-left-color: var(--accent-red); }
+  .callout.success { border-left-color: var(--accent-green); }
+
+  .callout strong {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.85rem;
+    color: var(--text-bright);
+  }
+
+  /* ── Footer ── */
+  footer {
+    padding: 3rem 2rem;
+    text-align: center;
+    border-top: 1px solid var(--border);
+    color: var(--text-dim);
+    font-size: 0.85rem;
+  }
+</style>
+</head>
+<body>
+<div class="grain"></div>
+
+<header>
+  <h1>Convergence <span>Gating</span></h1>
+  <p class="subtitle">
+    How ParamTracker decides when to push learned parameters to the BPF — and why the naive approach failed catastrophically.
+  </p>
+</header>
+
+<div class="container">
+
+<!-- ────────────────────── Section 1: The Problem ────────────────────── -->
+<section>
+  <h2><span class="num">1</span> The Problem</h2>
+
+  <p>
+    ParamTracker runs amnesiac SMC² windows — each re-initialized from prior — and fuses their posteriors with a Kalman filter. The 8 estimated parameters control the BPF's volatility model. The question: <strong>when do we start pushing Kalman estimates to the BPF?</strong>
+  </p>
+
+  <div class="problem-grid">
+    <div class="problem-card bad">
+      <h4>Push too early</h4>
+      <p>First window's posterior is noisy. Pushing a half-baked μ_base corrupts the BPF's log-volatility center. Every h-estimate is biased until corrected.</p>
+    </div>
+    <div class="problem-card bad">
+      <h4>Push too late</h4>
+      <p>BPF runs on prior defaults (μ_base = −10) while the Kalman already has −4.5 from window 1. Thousands of ticks of avoidable error.</p>
+    </div>
+    <div class="problem-card bad">
+      <h4>Push a bad curve</h4>
+      <p>BPF 2D evaluates μ(z) at every particle. A wrong μ_rate corrupts estimates across the entire stress distribution — not just one point.</p>
+    </div>
+    <div class="problem-card good">
+      <h4>The goal</h4>
+      <p>Push fast params early (the Kalman handles noise), hold curve params until the data actually identifies them, and never revert once committed.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ────────────────────── Section 2: Why R̂ alone failed ────────────────────── -->
+<section>
+  <h2><span class="num">2</span> Why R̂ Alone Failed</h2>
+
+  <p>
+    First attempt: compute R̂ across the rolling buffer of window posteriors.
+    If windows agree (R̂ &lt; 1.5), push Kalman. Otherwise hold prior default.
+  </p>
+
+  <div class="callout danger">
+    <strong>Result: μ_base stuck at −10.0 for 30K+ ticks</strong><br>
+    The Kalman had −4.08 from window 1 (truth = −4.5). But R̂ never consistently dropped below threshold — amnesiac windows naturally scatter because each explores from prior independently.
+  </div>
+
+  <p>
+    The fundamental contradiction: R̂ measures "do windows agree?" The Kalman's job is to fuse windows that <em>don't</em> agree. Requiring agreement before pushing means "only push when the Kalman is redundant."
+  </p>
+
+  <p>
+    Worse — when R̂ finally did drop (window 19), the calm→crisis transition at window 24 spiked it back, reverting μ_base to −10.0 after 5 good windows:
+  </p>
+
+  <div class="latch-demo">
+    <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.85rem; color: var(--text-dim); margin-bottom: 0.5rem;">
+      μ_base push value per window — Old R̂ design (no latch)
+    </div>
+    <div class="latch-track">
+      <div class="latch-cell prior" title="Win 1-18: prior">−10</div>
+      <div class="latch-cell prior" title="Win 2">−10</div>
+      <div class="latch-cell prior" title="Win 3">−10</div>
+      <div class="latch-cell prior" title="Win 4-17">⋯</div>
+      <div class="latch-cell prior" title="Win 18">−10</div>
+      <div class="latch-cell kalman" title="Win 19: R̂ drops">−5.7</div>
+      <div class="latch-cell kalman" title="Win 20">−5.7</div>
+      <div class="latch-cell kalman" title="Win 21">−5.6</div>
+      <div class="latch-cell kalman" title="Win 22">−5.6</div>
+      <div class="latch-cell kalman" title="Win 23">−5.2</div>
+      <div class="latch-cell reverted" title="Win 24: R̂ spikes → revert!">−10</div>
+      <div class="latch-cell reverted" title="Win 25">−10</div>
+      <div class="latch-cell reverted" title="Win 26">−10</div>
+      <div class="latch-cell reverted" title="Win 27">−10</div>
+      <div class="latch-cell reverted" title="Win 28">−10</div>
+    </div>
+    <div class="latch-labels">
+      <div class="latch-label"><div class="dot prior-dot"></div> Prior default</div>
+      <div class="latch-label"><div class="dot kalman-dot"></div> Kalman estimate</div>
+      <div class="latch-label"><div class="dot revert-dot"></div> Reverted (catastrophic)</div>
+    </div>
+  </div>
+</section>
+
+<!-- ────────────────────── Section 3: Tiered gating ────────────────────── -->
+<section>
+  <h2><span class="num">3</span> Tiered Gating with Latches</h2>
+
+  <p>
+    The 8 parameters have fundamentally different identification requirements. Fast dynamics params (ρ, μ_base) are identifiable from any data. Curve shape params (μ_rate, σ_scale) require stressed data to be identified. The gating must respect this.
+  </p>
+
+  <div class="gate-cards">
+    <div class="gate-card kalmin">
+      <div class="gate-header">
+        <span class="gate-name">GATE_KALMAN_MIN</span>
+        <span class="gate-params">ρ · σ_total · r_split · μ_base</span>
+      </div>
+      <div class="gate-body">
+        <div class="gate-logic">
+          <h5>Logic</h5>
+          <p>Push Kalman estimate after <code>min_windows</code> (default: 2). No R̂ check. One-way latch — once converged, stays converged forever.</p>
+        </div>
+        <div class="gate-why">
+          <h5>Why</h5>
+          <p>Any data identifies these. The Kalman has a useful estimate after 2 windows. Holding at prior default is expensive — μ_base = −10 vs truth = −4.5 is a 5.5 log-vol unit error.</p>
+        </div>
+      </div>
+      <div class="pseudocode">
+<span class="kw">if</span> converged[i] != 1 <span class="kw">and</span> n_windows >= min_windows:
+    converged[i] = <span class="val">1</span>   <span class="cm">// one-way latch, never reverts</span>
+      </div>
+    </div>
+
+    <div class="gate-card rhat">
+      <div class="gate-header">
+        <span class="gate-name">GATE_RHAT_LATCH</span>
+        <span class="gate-params">μ_scale · μ_rate · σ_scale · σ_rate</span>
+      </div>
+      <div class="gate-body">
+        <div class="gate-logic">
+          <h5>Logic</h5>
+          <p>Wait for R̂ to drop below threshold (1.5). When it does, latch converged=1 permanently. Never reverts, even when R̂ spikes later.</p>
+        </div>
+        <div class="gate-why">
+          <h5>Why</h5>
+          <p>Wrong curve shapes systematically corrupt BPF 2D across the entire z-distribution. Worth waiting for window agreement. The latch prevents calm periods from reverting valid crisis-learned estimates.</p>
+        </div>
+      </div>
+      <div class="pseudocode">
+<span class="kw">if</span> converged[i] != 1 <span class="kw">and</span> rhat_report.ready <span class="kw">and</span> rhat[i] < threshold:
+    converged[i] = <span class="val">1</span>   <span class="cm">// one-way latch, never reverts</span>
+      </div>
+    </div>
+
+    <div class="gate-card locked">
+      <div class="gate-header">
+        <span class="gate-name">GATE_LOCKED</span>
+        <span class="gate-params">any param not freed by phased ratchet</span>
+      </div>
+      <div class="gate-body">
+        <div class="gate-logic">
+          <h5>Logic</h5>
+          <p>Always push prior default. Set automatically by <code>set_free_mask()</code> for locked params. When a param becomes free, it transitions to the appropriate mode.</p>
+        </div>
+        <div class="gate-why">
+          <h5>Why</h5>
+          <p>SMC² isn't estimating this parameter yet — it's fixed internally. Pushing a default is the only safe option. The phased ratchet decides when to free params based on z-range.</p>
+        </div>
+      </div>
+      <div class="pseudocode">
+converged[i] = <span class="val">-1</span>   <span class="cm">// always locked, push prior_default[i]</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ────────────────────── Section 4: The snapshot push ────────────────────── -->
+<section>
+  <h2><span class="num">4</span> The Snapshot Push</h2>
+
+  <p>After each window, the gating logic builds the parameter vector that the BPF actually sees:</p>
+
+  <div class="pseudocode">
+<span class="kw">for each</span> param i:
+    <span class="kw">switch</span> gate_mode[i]:
+
+        <span class="fn">GATE_KALMAN_MIN</span>:
+            <span class="kw">if</span> not converged <span class="kw">and</span> n_windows >= min_windows:
+                converged[i] = <span class="val">1</span>          <span class="cm">// latch</span>
+
+        <span class="fn">GATE_RHAT_LATCH</span>:
+            <span class="kw">if</span> not converged <span class="kw">and</span> R̂[i] < <span class="val">1.5</span>:
+                converged[i] = <span class="val">1</span>          <span class="cm">// latch</span>
+
+        <span class="fn">GATE_LOCKED</span>:
+            converged[i] = <span class="val">-1</span>            <span class="cm">// always locked</span>
+
+<span class="cm">// Build gated vector</span>
+<span class="kw">for each</span> param i:
+    gated[i] = converged[i] == <span class="val">1</span>
+        ? <span class="fn">kalman.x</span>[i]               <span class="cm">// learned</span>
+        : <span class="str">prior_default</span>[i]          <span class="cm">// safe fallback</span>
+
+<span class="cm">// BPF sees gated[], Kalman sees raw posteriors (always)</span>
+snap.theta = gated
+  </div>
+
+  <div class="callout success">
+    <strong>Key invariant:</strong> The Kalman always updates internally, regardless of gate state. It accumulates information silently. The gate only controls what the BPF <em>sees</em> — it never blocks learning.
+  </div>
+</section>
+
+<!-- ────────────────────── Section 5: Phase transitions ────────────────────── -->
+<section>
+  <h2><span class="num">5</span> Phase Transitions</h2>
+
+  <p>
+    The phased ratchet monitors z-range and unlocks params as more of the stress distribution becomes observable. Each <code>set_free_mask()</code> call triggers gate mode transitions:
+  </p>
+
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Param</th>
+        <th>Phase 1</th>
+        <th>Phase 2</th>
+        <th>Phase 3</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>ρ</td>
+        <td><span class="badge kal">KALMAN_MIN</span> → latch at win 2</td>
+        <td style="color:var(--text-dim)">latched ✓</td>
+        <td style="color:var(--text-dim)">latched ✓</td>
+      </tr>
+      <tr>
+        <td>σ_total</td>
+        <td><span class="badge kal">KALMAN_MIN</span> → latch at win 2</td>
+        <td style="color:var(--text-dim)">latched ✓</td>
+        <td style="color:var(--text-dim)">latched ✓</td>
+      </tr>
+      <tr>
+        <td>r_split</td>
+        <td><span class="badge kal">KALMAN_MIN</span> → latch at win 2</td>
+        <td style="color:var(--text-dim)">latched ✓</td>
+        <td style="color:var(--text-dim)">latched ✓</td>
+      </tr>
+      <tr>
+        <td>μ_base</td>
+        <td><span class="badge kal">KALMAN_MIN</span> → latch at win 2</td>
+        <td style="color:var(--text-dim)">latched ✓</td>
+        <td style="color:var(--text-dim)">latched ✓</td>
+      </tr>
+      <tr>
+        <td>μ_scale</td>
+        <td><span class="badge lock">LOCKED</span> prior default</td>
+        <td><span class="badge rhat">RHAT_LATCH</span> wait for R̂ &lt; 1.5</td>
+        <td style="color:var(--text-dim)">latched ✓</td>
+      </tr>
+      <tr>
+        <td>μ_rate</td>
+        <td><span class="badge lock">LOCKED</span> prior default</td>
+        <td><span class="badge rhat">RHAT_LATCH</span> wait for R̂ &lt; 1.5</td>
+        <td style="color:var(--text-dim)">latched ✓</td>
+      </tr>
+      <tr>
+        <td>σ_scale</td>
+        <td><span class="badge lock">LOCKED</span> prior default</td>
+        <td><span class="badge lock">LOCKED</span> prior default</td>
+        <td><span class="badge rhat">RHAT_LATCH</span> wait for R̂ &lt; 1.5</td>
+      </tr>
+      <tr>
+        <td>σ_rate</td>
+        <td><span class="badge lock">LOCKED</span> prior default</td>
+        <td><span class="badge lock">LOCKED</span> prior default</td>
+        <td><span class="badge rhat">RHAT_LATCH</span> wait for R̂ &lt; 1.5</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>
+    When <code>set_free_mask()</code> frees a previously locked param, it automatically sets the gate mode: KALMAN_MIN for indices 0–3, RHAT_LATCH for indices 4–7.
+    Already-latched params are never touched — the latch is permanent.
+  </p>
+</section>
+
+<!-- ────────────────────── Section 6: Production timeline ────────────────────── -->
+<section>
+  <h2><span class="num">6</span> Production Timeline</h2>
+
+  <div class="timeline">
+    <div class="tl-event">
+      <div class="tl-label">Window 1 — Cold start</div>
+      <p class="tl-text">All 8 params gated. BPF runs on prior defaults. Kalman initializes from first SMC² posterior.</p>
+      <p class="tl-detail">μ_base pushed = −10.0 (prior) · Kalman internal = −4.08 · truth = −4.5</p>
+    </div>
+
+    <div class="tl-event latch">
+      <div class="tl-label">Window 2 — KALMAN_MIN latch</div>
+      <p class="tl-text">Phase 1 params (ρ, σ_total, r, μ_base) latch. BPF immediately improves.</p>
+      <p class="tl-detail">μ_base pushed = −4.59 (Kalman) · one-way latch: never reverts</p>
+    </div>
+
+    <div class="tl-event">
+      <div class="tl-label">Windows 3–8 — Learning continues</div>
+      <p class="tl-text">Kalman fuses more windows, estimates tighten. R̂ fluctuates but doesn't matter — KALMAN_MIN ignores it.</p>
+      <p class="tl-detail">R̂[μ_base] = 3.97 at window 9 — would have reverted under old design. Latch holds.</p>
+    </div>
+
+    <div class="tl-event transition">
+      <div class="tl-label">Window 8 — Phase 2 transition</div>
+      <p class="tl-text">Phased ratchet sees z_max > threshold. Frees μ_scale, μ_rate in SMC² and gating. Gate mode: LOCKED → RHAT_LATCH.</p>
+      <p class="tl-detail">converged[4] = 0, converged[5] = 0 · BPF still uses prior defaults for these</p>
+    </div>
+
+    <div class="tl-event">
+      <div class="tl-label">Windows 9–10 — Curve exploration</div>
+      <p class="tl-text">SMC² explores μ_scale, μ_rate with stressed data. Windows scatter — R̂ is high (8.14, 3.20). Gate holds prior defaults. Safe.</p>
+    </div>
+
+    <div class="tl-event latch">
+      <div class="tl-label">Window 11 — RHAT_LATCH fires</div>
+      <p class="tl-text">R̂ drops below 1.5 for both curve params (0.94, 0.76). Latch fires. BPF 2D starts using learned curve shape.</p>
+      <p class="tl-detail">μ_scale: gated=3.066 (truth=3.0) · μ_rate: gated=0.516 (truth=0.5)</p>
+    </div>
+
+    <div class="tl-event danger">
+      <div class="tl-label">Windows 20+ — Calm period</div>
+      <p class="tl-text">R̂ for μ_scale spikes to 2.36 (no stressed data to identify it). Old design would revert to prior defaults. Latch holds — 6/6 converged throughout.</p>
+      <p class="tl-detail">Kalman continues tracking internally. Curve estimate from crisis persists.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ────────────────────── Section 7: The latch principle ────────────────────── -->
+<section>
+  <h2><span class="num">7</span> The Latch Principle</h2>
+
+  <p>
+    Both gate modes use one-way latches. Once <code>converged[i] = 1</code>, it stays 1 forever.
+    This is the same principle as the phased learning ratchet: information, once gained, is never discarded.
+  </p>
+
+  <div class="latch-demo">
+    <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.85rem; color: var(--text-dim); margin-bottom: 0.5rem;">
+      μ_base push value per window — Tiered design (with latch)
+    </div>
+    <div class="latch-track">
+      <div class="latch-cell prior" title="Win 1: prior">−10</div>
+      <div class="latch-cell kalman latch-point" title="Win 2: LATCH">−4.6</div>
+      <div class="latch-cell kalman" title="Win 3">−4.1</div>
+      <div class="latch-cell kalman" title="Win 4">−4.6</div>
+      <div class="latch-cell kalman" title="Win 5">−4.6</div>
+      <div class="latch-cell kalman" title="Win 6">−4.4</div>
+      <div class="latch-cell kalman" title="Win 7">−4.6</div>
+      <div class="latch-cell kalman" title="Win 8">−4.3</div>
+      <div class="latch-cell kalman" title="Win 9: R̂=3.97, latch holds">−4.5</div>
+      <div class="latch-cell kalman" title="Win 10">−4.5</div>
+      <div class="latch-cell kalman" title="Win 11">−4.5</div>
+      <div class="latch-cell kalman" title="Win 12">−4.3</div>
+      <div class="latch-cell kalman" title="Win 13-28">⋯</div>
+      <div class="latch-cell kalman" title="Win 28">−4.1</div>
+    </div>
+    <div class="latch-labels">
+      <div class="latch-label"><div class="dot prior-dot"></div> Prior default (1 window)</div>
+      <div class="latch-label"><div class="dot kalman-dot"></div> Kalman estimate (permanent)</div>
+    </div>
+  </div>
+
+  <p>
+    The only way to re-gate a param is an explicit <code>force_cold()</code> call from the phased controller — a deliberate decision, not an automatic reaction to R̂ noise.
+  </p>
+</section>
+
+</div>
+
+<footer>
+  ParamTracker Convergence Gating · SMC² Pipeline · 2026
+</footer>
+
+</body>
+</html>
