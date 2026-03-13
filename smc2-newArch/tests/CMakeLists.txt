@@ -1,11 +1,11 @@
 ################################################################################
 # smc2-newArch/tests/CMakeLists.txt — SMC² test targets
 #
-# Tests link against smc2_rbpf (new arch) and gpu_bpf (sibling module).
-# The gpu_bpf target must exist in the parent project for BPF-dependent tests.
+# Host compiler flags come from the root CMakeLists.txt.
+# gpu_bpf target comes from add_subdirectory(gpu_bpf) in root.
 ################################################################################
 
-# ── test_smc2: Smoke test (SMC² engine + param tracker, no BPF dependency) ──
+# ── test_smc2: Smoke test (SMC² engine + param tracker) ──────────────────────
 
 add_executable(test_smc2 test_smc2.cu)
 
@@ -27,45 +27,36 @@ target_compile_options(test_smc2 PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
         --expt-relaxed-constexpr
         --expt-extended-lambda
-        $<$<CONFIG:Debug>:-O0 -G -g>
-        $<$<CONFIG:Release>:-O2>
     >
 )
 
 add_test(NAME smc2_smoke COMMAND test_smc2)
 
-# ── test_kalman_fair: Accuracy test (requires gpu_bpf target from parent) ────
+# ── test_kalman_fair: Accuracy test (requires gpu_bpf) ───────────────────────
 
-if(TARGET gpu_bpf)
-    add_executable(test_kalman_fair test_kalman_fair.cu)
+add_executable(test_kalman_fair test_kalman_fair.cu)
 
-    target_link_libraries(test_kalman_fair PRIVATE
-        smc2_rbpf
-        gpu_bpf
-        CUDA::cudart
-        CUDA::curand
-    )
+target_link_libraries(test_kalman_fair PRIVATE
+    smc2_rbpf
+    gpu_bpf_ptx_full
+    CUDA::cudart
+    CUDA::curand
+)
 
-    target_include_directories(test_kalman_fair PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/..
-        ${CMAKE_SOURCE_DIR}/gpu_bpf
-    )
+target_include_directories(test_kalman_fair PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_SOURCE_DIR}/gpu_bpf
+)
 
-    set_target_properties(test_kalman_fair PROPERTIES
-        CUDA_ARCHITECTURES "120"
-    )
+set_target_properties(test_kalman_fair PROPERTIES
+    CUDA_ARCHITECTURES "120"
+)
 
-    target_compile_options(test_kalman_fair PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:
-            --expt-relaxed-constexpr
-            --expt-extended-lambda
-            -std=c++17
-            $<$<CONFIG:Debug>:-O0 -G -g>
-            $<$<CONFIG:Release>:-O3>
-        >
-    )
+target_compile_options(test_kalman_fair PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+        --expt-relaxed-constexpr
+        --expt-extended-lambda
+    >
+)
 
-    add_test(NAME smc2_kalman_fair COMMAND test_kalman_fair)
-else()
-    message(STATUS "[smc2/tests] gpu_bpf target not found — skipping test_kalman_fair")
-endif()
+add_test(NAME smc2_kalman_fair COMMAND test_kalman_fair)
