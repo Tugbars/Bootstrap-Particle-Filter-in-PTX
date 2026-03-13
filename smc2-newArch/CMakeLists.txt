@@ -1,5 +1,5 @@
 ################################################################################
-# smc2/CMakeLists.txt — SMC² RBPF Parameter Learner
+# smc2-newArch/CMakeLists.txt — SMC² RBPF Parameter Learner (restructured)
 #
 # Library:
 #   smc2_rbpf — SMC² engine + Kalman param tracker (with phased learning)
@@ -16,7 +16,7 @@
 # Host compiler: Intel ICX (icpx) from oneAPI
 # Device target: sm_120 (Blackwell — RTX 5080)
 #
-# Tests delegated to smc2/tests/
+# Tests: smc2-newArch/tests/
 ################################################################################
 
 # ==============================================================================
@@ -73,63 +73,70 @@ target_compile_options(smc2_rbpf PRIVATE
     >
 )
 
-# ── ICX host flags (passed through -Xcompiler) ───────────────────────────────
+# ── Host compiler flags (passed through -Xcompiler) ──────────────────────────
 #
-# Detection: CMAKE_CUDA_HOST_COMPILER or CMAKE_CXX_COMPILER may be icpx.
-# We check for "Intel" in the compiler ID to set ICX-specific flags.
-# If the host compiler is GCC/Clang, we still set AVX-512 flags but skip
-# the ICX-only options like -qopt-zmm-usage and -fp-model.
+# Three-way detection:
+#   1. MSVC (cl.exe) — Windows default. Uses /W4, /O2, /arch:AVX512, /fp:precise
+#   2. Intel ICX (icpx) — Best for AVX-512 host code. Uses -march, -qopt-zmm-usage
+#   3. GCC/Clang — Linux/WSL fallback. Uses -march, -mavx512f etc.
+#
+# The detection uses CMAKE_CXX_COMPILER_ID which CMake resolves during
+# project() — this is the compiler nvcc delegates host compilation to.
 
-# Collect host flags based on detected compiler
-set(SMC2_HOST_FLAGS_COMMON
-    -fno-strict-aliasing
-    -Wall -Wextra -Wno-unused-parameter
-)
+if(MSVC)
+    # ── MSVC (cl.exe) ────────────────────────────────────────────────────
+    message(STATUS "[smc2] MSVC detected as CUDA host compiler")
+    set(SMC2_ICX_HOST FALSE)
 
-# Check if host compiler is ICX
-# CMAKE_CUDA_HOST_COMPILER is what nvcc actually uses
-get_property(_cuda_host_compiler TARGET smc2_rbpf PROPERTY CUDA_HOST_COMPILER)
-if(NOT _cuda_host_compiler)
-    set(_cuda_host_compiler "${CMAKE_CUDA_HOST_COMPILER}")
-endif()
-
-# Probe for Intel compiler
-set(SMC2_ICX_HOST FALSE)
-if(_cuda_host_compiler)
-    execute_process(
-        COMMAND ${_cuda_host_compiler} --version
-        OUTPUT_VARIABLE _host_version
-        ERROR_QUIET
-        OUTPUT_STRIP_TRAILING_WHITESPACE
+    set(SMC2_HOST_RELEASE_FLAGS
+        /W4
+        /O2
+        /fp:precise
+        /arch:AVX512
     )
-    if(_host_version MATCHES "Intel")
-        set(SMC2_ICX_HOST TRUE)
-    endif()
-endif()
+    set(SMC2_HOST_DEBUG_FLAGS
+        /W4
+        /Od
+        /Zi
+    )
 
-# Also check CMAKE_CXX_COMPILER_ID as fallback
-if(NOT SMC2_ICX_HOST AND CMAKE_CXX_COMPILER_ID MATCHES "Intel")
-    set(SMC2_ICX_HOST TRUE)
-endif()
-
-if(SMC2_ICX_HOST)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Intel")
+    # ── Intel ICX (icpx) ─────────────────────────────────────────────────
     message(STATUS "[smc2] ICX detected as CUDA host compiler")
-    set(SMC2_HOST_ARCH_FLAGS
+    set(SMC2_ICX_HOST TRUE)
+
+    set(SMC2_HOST_RELEASE_FLAGS
+        -fno-strict-aliasing
+        -Wall -Wextra -Wno-unused-parameter
         -march=icelake-server
         -qopt-zmm-usage=high
         -fp-model=precise
+        -O3 -fomit-frame-pointer
     )
+    set(SMC2_HOST_DEBUG_FLAGS
+        -fno-strict-aliasing
+        -Wall -Wextra -Wno-unused-parameter
+        -O0 -g -fno-omit-frame-pointer
+    )
+
 else()
-    message(STATUS "[smc2] Non-ICX host compiler (${CMAKE_CXX_COMPILER_ID}) — using GCC/Clang AVX-512 flags")
-    set(SMC2_HOST_ARCH_FLAGS
+    # ── GCC / Clang ──────────────────────────────────────────────────────
+    message(STATUS "[smc2] ${CMAKE_CXX_COMPILER_ID} detected as CUDA host compiler")
+    set(SMC2_ICX_HOST FALSE)
+
+    set(SMC2_HOST_RELEASE_FLAGS
+        -fno-strict-aliasing
+        -Wall -Wextra -Wno-unused-parameter
         -march=icelake-server
         -mavx512f -mavx512bw -mavx512dq -mavx512vl
+        -O3 -fomit-frame-pointer
+    )
+    set(SMC2_HOST_DEBUG_FLAGS
+        -fno-strict-aliasing
+        -Wall -Wextra -Wno-unused-parameter
+        -O0 -g -fno-omit-frame-pointer
     )
 endif()
-
-# Assemble -Xcompiler string
-set(SMC2_HOST_RELEASE_FLAGS ${SMC2_HOST_FLAGS_COMMON} ${SMC2_HOST_ARCH_FLAGS} -O3 -fomit-frame-pointer)
-set(SMC2_HOST_DEBUG_FLAGS   ${SMC2_HOST_FLAGS_COMMON} -O0 -g -fno-omit-frame-pointer)
 
 # Convert list to comma-separated for -Xcompiler
 list(JOIN SMC2_HOST_RELEASE_FLAGS "," _release_joined)
@@ -167,7 +174,7 @@ endif()
 
 # ── Status summary ────────────────────────────────────────────────────────────
 message(STATUS "[smc2] GPU arch: sm_120 (Blackwell)")
-message(STATUS "[smc2] ICX host: ${SMC2_ICX_HOST}")
+message(STATUS "[smc2] Host compiler: ${CMAKE_CXX_COMPILER_ID} (ICX=${SMC2_ICX_HOST})")
 message(STATUS "[smc2] Sources: smc2_engine.cu, smc2_param_tracker.cu")
 
 # ==============================================================================

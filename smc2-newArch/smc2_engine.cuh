@@ -477,7 +477,11 @@ void block_inclusive_scan(volatile float* data, int n) {
         float temp = 0.0f;
         if (tid >= offset && tid < n) temp = data[tid - offset];
         __syncthreads();
-        if (tid >= offset && tid < n) data[tid] += temp;
+        if (tid >= offset && tid < n) {
+            float val = data[tid];
+            val += temp;
+            data[tid] = val;
+        }
         __syncthreads();
     }
 }

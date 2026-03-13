@@ -81,7 +81,7 @@ find_package(CUDAToolkit REQUIRED)
 
 add_subdirectory(gpu_bpf)
 #add_subdirectory(smc2)
-#add_subdirectory(smc2-newArch)
+add_subdirectory(smc2-newArch)
 
 # ==============================================================================
 # Print summary
